@@ -1,0 +1,12 @@
+# Third-party notices
+
+CoopSolver's original source and documentation are licensed under Apache-2.0. This document identifies separately licensed dependencies.
+
+| Component | Distribution and terms |
+| --- | --- |
+| CoopBots.Kernel.dll | Unmodified binary from [Co-op Bots v0.40.0](https://github.com/imbalilang/STS2-Co-op_Bots/releases/tag/v0.40.0). CoopBots' own code is MIT. Its [license](third-party/CoopBots/LICENSE) and [complete upstream notices](third-party/CoopBots/THIRD_PARTY_NOTICES.md) accompany the binary. |
+| CombatSolver and Random Foreseer | Upstream imports CombatSolver 0.41.0, which includes work derived from Random Foreseer, and portions of Random Foreseer 0.13.14. See the included [CombatSolver MIT license](third-party/CoopBots/licenses/CombatSolver-0.41.0-MIT.txt) and [Random Foreseer MIT license](third-party/CoopBots/licenses/RandomForeseer-0.13.14-MIT.txt) for the respective copyrights and terms. |
+| Spire Codex | Upstream identifies its baked archetype, card-affinity and event tables in the separate CoopBots bot project. CoopSolver ships the kernel DLL. The upstream distribution's [PolyForm Noncommercial license and required notice](third-party/CoopBots/licenses/PolyForm-Noncommercial-1.0.0.md) are preserved. Required Notice: Copyright © 2025-present Peter Lord and Spire Codex contributors. |
+| Slay the Spire 2, Godot, Harmony, RitsuLib | Game and modding assemblies are referenced from the user's installation. Their respective rights and terms apply. |
+
+The release archive includes this file, the project LICENSE, and the upstream notices and license texts under third-party/CoopBots/.
