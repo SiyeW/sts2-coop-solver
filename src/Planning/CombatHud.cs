@@ -11,106 +11,399 @@ internal sealed class CombatHud
     private const string Layout="user://coop-solver-hud.cfg";
     private static readonly Color TextColor=new("#f4f3e9"), Dim=new("#b7c9bd"), Accent=new("#efcc8e");
     private readonly Control root=new(){Name="CoopSolverHUD",MouseFilter=Control.MouseFilterEnum.Ignore};
-    private readonly VBoxContainer bar=new(){Name="HudBar",MouseFilter=Control.MouseFilterEnum.Stop};
+    private readonly PanelContainer bar=new(){Name="HudBar",MouseFilter=Control.MouseFilterEnum.Stop};
     private readonly HBoxContainer openingRow=new(){Name="HudOpeningBest",MouseFilter=Control.MouseFilterEnum.Ignore};
     private readonly HBoxContainer liveRow=new(){Name="HudLiveBest",MouseFilter=Control.MouseFilterEnum.Ignore};
-    private readonly Label[] openingNumbers=new Label[4],liveNumbers=new Label[4];
-    private readonly HFlowContainer searchOptions=new();
-    private readonly OptionButton policy=new(){Name="HudPolicy",Flat=true};
+    private sealed class LossFlash
+    {
+        internal readonly StyleBoxFlat[] Fields=new StyleBoxFlat[3];
+        private long seen=-1,end;
+        private float lastAlpha;
+        internal void Update(long revision,bool visible,long now)
+        {
+            if(visible && seen>=0 && revision>seen)end=now+1000;
+            if(!visible || revision<seen)end=0;
+            seen=visible?revision:-1;
+            float remaining=Math.Clamp((end-now)/1000f,0,1);
+            float alpha=.42f*remaining*remaining;
+            if(alpha==lastAlpha)return;
+            lastAlpha=alpha;
+            foreach(var field in Fields)field.BgColor=new Color(.48f,.85f,.68f,alpha);
+        }
+    }
+    private readonly LossFlash openingFlash=new(),liveFlash=new();
+    private bool? previousController;
+
+    private readonly Label[] openingNumbers=new Label[7],liveNumbers=new Label[7];
+    private readonly HBoxContainer allocation=new(),resources=new();
+    private readonly HSlider openingShare=new(){Name="HudOpeningShare",MinValue=0,MaxValue=100,Step=1};
+    private readonly Label opacityValue=Caption("",Dim,true);
+    private readonly Label openingCaption=Caption("",Dim,true),liveCaption=Caption("",Dim,true);
+    private readonly Window? nativeWindow;
+    private readonly HudCanvas canvas;
+    private readonly SceneTree tree;
+    private MegaCrit.Sts2.Core.Nodes.CommonUi.NTopBar? topBar;
+    private long findTopBarAt;
+    private readonly Font bodyFace,boldFace;
+    private readonly PanelContainer tip=new(){Name="MetricDetail",Visible=false,MouseFilter=Control.MouseFilterEnum.Ignore};
+    private readonly Label tipText=Caption("",TextColor,true);
+    private readonly Dictionary<Control,string> metricHints=new();
+    private readonly PanelContainer settingsPanel=new(){Name="HudSettingsPanel",Visible=false};
+    private readonly Button memoryPolicy=new(){Name="HudMemory",Flat=true};
 
 
-    private readonly PanelContainer pop=new(){Name="HudDetails"};
-    private readonly Dictionary<Label,List<Label>> lossCells=new();
-    private readonly Dictionary<Label,Label[]> counters=new();
-    private readonly SystemFont[] fonts=new SystemFont[4];
-    private readonly Label status=Caption("",Dim,small:true), outcome=Caption("",TextColor),choice=Caption("",Accent);
-    private HFlowContainer roster=>route.Roster;
+
+    private readonly Panel pop=new(){Name="HudDetails",ClipContents=true};
+    private readonly Dictionary<Label,List<Label>> seatCells=new();
+    private readonly Dictionary<Label,Label> proofSlots=new();
+    private readonly Label connectionStatus=Caption("",Dim,small:true);
+    private readonly HSeparator beforeActions=ActionDivider(),afterActions=ActionDivider();
+    private static HSeparator ActionDivider()
+    {
+        var line=new HSeparator{CustomMinimumSize=new(0,5)};
+        line.AddThemeStyleboxOverride("separator",new StyleBoxLine{Thickness=1,Color=new Color("#9aafb83e")});
+        return line;
+    }
+    private readonly RouteOutcomeView outcome=new();
+    private readonly SearchProgressView progress;
+    private readonly Action? historyChanged;
+    private bool chartsOpen;
+    private float chartWidth,chartHeaderHeight;
+    private Vector2 backSize;
+    internal bool WantsHistory {get;private set;}
+    private void RequestHistory(bool value)
+    {
+        if(WantsHistory==value)return;
+        WantsHistory=value;historyChanged?.Invoke();
+    }
+    private VBoxContainer roster=>route.Roster;
     private readonly HudRouteView route=new();
+    private readonly HudDependencyView graph=new();
+    private readonly Action<int?>? requestGraph;
+    private bool graphPreferenceKnown;
+    private int? lastGraphRound;
     private readonly VBoxContainer col=new();
     private readonly HBoxContainer head=new();
-    private readonly HFlowContainer footer=new(),extras=new();
-    private readonly Button solve,mode,less,more,guard,windowButton,settings,opacityButton;
-    private readonly Button hideResults,ownOnly;
-    private readonly OptionButton openingShare=new(){Name="HudOpeningShare",Flat=true};
-    private readonly Label cpu=Caption("",Dim,small:true),indicator=Caption("▾",Dim,small:true);
-    private readonly StyleBoxFlat panelStyle,deathBorder,emptyBorder;
+    private readonly SearchWarnings warnings=new();
+    private readonly Control switchRow=new(){Name="HudSwitches",MouseFilter=Control.MouseFilterEnum.Ignore};
+    private readonly HBoxContainer actionRow=new(){Name="HudActions",Alignment=BoxContainer.AlignmentMode.End};
+    private readonly Button mode=new(){Name="HudMode",Flat=true,FocusMode=Control.FocusModeEnum.None,IconAlignment=HorizontalAlignment.Right};
+    private readonly InlineMenus menus;
+    private readonly Button openingPots=new(){Name="HudOpeningPotions",Flat=true},livePots=new(){Name="HudLivePotions",Flat=true};
+    private readonly Button autoplay,restart,solve,less,more,windowButton,settings,sourceButton,broadcastButton;
+    private bool broadcastEnabled;
+    private readonly Button hideResults,ownOnly,prevRound,nextRound;
+    private Button? ownColumn,hideColumn;
+
+    private readonly Label cpu=Caption("",Dim,small:true);
+    private readonly TextureRect indicator=new(){MouseFilter=Control.MouseFilterEnum.Ignore,StretchMode=TextureRect.StretchModeEnum.KeepCentered};
+    private readonly StyleBoxFlat panelStyle,shell;
     private bool pinned,held,ignoreHover,options;
-    private float opacity=.68f;
+    private float opacity=.75f;
+    private readonly HSlider opacitySlider=new(){Name="HudOpacity",MinValue=50,MaxValue=100,Step=1,CustomMinimumSize=new(78,20)};
+    private readonly Label opacityCaption=Caption("",Dim,small:true);
+    private bool adjustingSlider;
     private Vector2 pressAt;
     private HudPlan? lastDetail;
-    private bool detailInitialized;
+    private HudGraph? lastDetailGraph;
+    private HudExecuted? lastDetailExecuted;
+    private bool detailInitialized,lastDetailLive;
+    private readonly Label graphStatus=Caption(Ui.T("更新中","Updating"),Dim,small:true);
     private HudFrame? last;
+    private HudBest? stableLiveNumbers,displayedLiveNumbers;
+    internal void ResetLiveDisplay()
+    {
+        displayedLiveNumbers=stableLiveNumbers=null;last=null;lastDetail=null;lastDetailGraph=null;lastDetailExecuted=null;detailInitialized=false;
+        route.Reset();graph.Clear();outcome.Set(null);graphPreferenceKnown=false;
+        chartsOpen=false;outcome.Button.SetPressedNoSignal(false);progress.HideTip();progress.Set(null,null);RequestHistory(false);
+    }
+    internal void SuspendGraphRequest()
+    {
+        if(lastGraphRound==null)return;
+        lastGraphRound=null;graphPreferenceKnown=false;requestGraph?.Invoke(null);
+    }
+    private int currentCombatRound;
+    private const float DetailsWidth=475,PanelGap=9;
+    // Keep the pin in the same viewport-relative position as numbers and plans change.
+    // Reserve room to its right for a four-seat strip; this is not the rendered panel width.
+    private const float PinRightMargin=720;
+    private Vector2 PinTravel=>(root.Size-new Vector2(PinRightMargin,68)).Max(Vector2.Zero);
     private int fontSize=17;
-    private long hoverUntil;
-    private Vector2 anchor=new(.98f,.12f),dragDelta;
+    private Vector2? anchor;
+    private Vector2 dragDelta;
     private bool dragging;
     private ulong localId;
     internal bool Visible=>root.Visible;
     internal bool Expanded=>pop.Visible;
-    internal CombatHud(SceneTree tree,Action start,Action switchMode,Action alternate,Action window,Action hide)
+    internal CombatHud(SceneTree tree,Action start,Action switchMode,Action window,Action hide,Action<bool>? selectLocal=null,Action? restartSearch=null,Action<bool,PotionCost?>? choosePotion=null,Action? playRoute=null,Window? nativeWindow=null,Action<bool>? setBroadcast=null,Action<int?>? requestGraph=null,Action? historyChanged=null)
     {
+        this.requestGraph=requestGraph;this.historyChanged=historyChanged;
+        this.nativeWindow=nativeWindow;this.tree=tree;
         var config=new ConfigFile();
         if(config.Load(Layout)==Error.Ok)
-        {fontSize=Math.Clamp(config.GetValue("hud","font",17).AsInt32(),11,30);anchor=config.GetValue("hud","anchor",anchor).AsVector2().Clamp(Vector2.Zero,Vector2.One);pinned=config.GetValue("hud","pinned",false).AsBool();opacity=Math.Clamp(config.GetValue("hud","opacity",.68f).AsSingle(),.4f,.9f);}
-        for(int i=0;i<4;i++)fonts[i]=new SystemFont{FontNames=new[]{"Microsoft YaHei UI","Microsoft YaHei","Segoe UI"},FontItalic=(i&1)!=0,FontWeight=(i&2)!=0?750:500};
-        var layer=new CanvasLayer{Layer=92};tree.Root.AddChild(layer);layer.AddChild(root);root.SetAnchorsAndOffsetsPreset(Control.LayoutPreset.TopLeft);
-        root.Theme=new Theme{DefaultFont=fonts[0],DefaultFontSize=16};root.Hide();root.AddChild(bar);
-        bar.AddThemeConstantOverride("separation",2);
-        deathBorder=Stroke();emptyBorder=Box("#00000000",0,0);
-        bar.TooltipText="点击固定或收起　·　拖动移位　·　滚轮缩放\n计算：全部 / 推荐首手分支　　扣血：至路线末累计";
-        bar.AddChild(openingRow);bar.AddChild(liveRow);
-        BuildRow(openingRow,openingNumbers,"开局最优");
-        BuildRow(liveRow,liveNumbers,"实战最优");
-        indicator.CustomMinimumSize=new(28,0);indicator.HorizontalAlignment=HorizontalAlignment.Center;
-        indicator.AddThemeFontSizeOverride("font_size",23);indicator.AddThemeStyleboxOverride("normal",Box("#182838da",3,0));
-        openingRow.AddChild(indicator);bar.GuiInput+=BarInput;
-        bar.MouseEntered+=()=>{if(!ignoreHover)hoverUntil=System.Environment.TickCount64+650;};
-        root.AddChild(pop);panelStyle=Box("#111c28",10,7);ApplyOpacity();
-        pop.AddThemeStyleboxOverride("panel",panelStyle);pop.Hide();
-        pop.AddChild(col);col.AddThemeConstantOverride("separation",5);
-        col.AddChild(head);head.AddChild(route.Round);head.AddChild(outcome);outcome.SizeFlagsHorizontal=Control.SizeFlags.ExpandFill;
-        outcome.HorizontalAlignment=HorizontalAlignment.Right;outcome.ClipText=true;
-        ownOnly=Btn("HudOwnOnly","只看自己",()=>{route.Filter(!route.OwnOnly);Save();},head);
-        route.Filter(config.GetValue("hud","own_only",false).AsBool());
-        col.AddChild(roster);
-        col.AddChild(choice);choice.AutowrapMode=TextServer.AutowrapMode.WordSmart;
-        col.AddChild(route.Scroll);col.AddChild(footer);col.AddChild(searchOptions);col.AddChild(extras);
-        solve=Btn("HudSolve","开始",start,footer);
-        mode=Btn("HudMode","开局",switchMode,footer);
-        mode.TooltipText="切换查看开局或实战路线，计算比例保持不变";
-        status.SizeFlagsHorizontal=Control.SizeFlags.ExpandFill;status.ClipText=true;footer.AddChild(status);
-        hideResults=Btn("HudHide","隐藏结果",hide,footer);
-        settings=Btn("HudOptions","设置",()=>options=!options,footer);
-        less=Btn("HudCpuLess","−",()=>SearchCapacity.SetAndSave(SearchCapacity.Limit-1),extras);
-        extras.AddChild(cpu);more=Btn("HudCpuMore","+",()=>SearchCapacity.SetAndSave(SearchCapacity.Limit+1),extras);
-        guard=Btn("HudGuard","保血起手",alternate,extras);windowButton=Btn("HudWindow","副屏",window,extras);
-        searchOptions.AddChild(policy);policy.AddItem("只搜开局",1);policy.AddItem("搜实战",0);
-        policy.ItemSelected+=i=>{
-            SearchCapacity.SetOpeningPercent(i==0?100:SearchCapacity.LiveOpeningPercent);
+        {fontSize=Math.Clamp(config.GetValue("hud","font",17).AsInt32(),11,30);var savedAnchor=config.GetValue("hud","anchor",new Vector2(.98f,.12f)).AsVector2();
+            if(!savedAnchor.IsEqualApprox(new(.98f,.12f)))anchor=savedAnchor.Clamp(Vector2.Zero,Vector2.One);pinned=config.GetValue("hud","pinned",false).AsBool();float legacy=config.GetValue("hud","opacity",.68f).AsSingle();
+            int initial=Mathf.IsEqualApprox(legacy,.68f)?75:Mathf.RoundToInt(legacy*100);
+            opacity=Math.Clamp(config.GetValue("hud","opacity_percent",initial).AsInt32(),50,100)/100f;}
+        canvas=new HudCanvas(nativeWindow??tree.Root,root,bar,pop);root.SetAnchorsAndOffsetsPreset(Control.LayoutPreset.TopLeft);
+        bodyFace=HudTypography.Face();boldFace=HudTypography.Face(true);
+        root.Theme=HudTypography.Theme(bodyFace);root.Hide();root.AddChild(bar);
+        shell=Box("#101c23ce",7,2);
+        shell.SetCornerRadiusAll(7);shell.SetBorderWidthAll(1);shell.BorderColor=new("#839a9c66");
+        bar.AddThemeStyleboxOverride("panel",shell);
+        var band=new HBoxContainer{MouseFilter=Control.MouseFilterEnum.Ignore};
+        band.AddThemeConstantOverride("separation",5);bar.AddChild(band);
+        var rows=new VBoxContainer{MouseFilter=Control.MouseFilterEnum.Ignore};
+        rows.AddThemeConstantOverride("separation",1);band.AddChild(rows);
+        rows.AddChild(openingRow);rows.AddChild(liveRow);
+        BuildRow(openingRow,openingNumbers,openingFlash,Ui.T("开局最优","Opening"));
+        BuildRow(liveRow,liveNumbers,liveFlash,Ui.T("实战最优","Live"));
+        var pinPanel=new PanelContainer{Name="HudPin",MouseFilter=Control.MouseFilterEnum.Ignore};
+        pinPanel.AddThemeStyleboxOverride("panel",Box("#00000000",4,1));
+        indicator.Texture=HudIcons.Pin;indicator.CustomMinimumSize=new(24,0);
+        pinPanel.AddChild(indicator);band.AddChild(pinPanel);band.MoveChild(pinPanel,0);
+        var ruleInk=new Color("#9aafb867");
+        band.Draw+=()=>HudTypography.DrawVerticalRule(band,
+            (pinPanel.GetRect().End.X+rows.Position.X)/2,band.Size.Y,ruleInk);
+        band.SortChildren+=band.QueueRedraw;
+        rows.Draw+=()=>{
+            var first=openingRow.Visible?openingRow:liveRow;
+            var totals=first.GetChild<Control>(4);
+            if(totals.Visible)HudTypography.DrawVerticalRule(rows,totals.Position.X+2,rows.Size.Y,ruleInk);
         };
-        searchOptions.AddChild(openingShare);
-        foreach(int value in new[]{0,10,20,30,50,75})openingShare.AddItem($"开局 {value}%",value);
-        openingShare.Select(openingShare.GetItemIndex(SearchCapacity.OpeningPercent));
-        openingShare.TooltipText="分给战斗开局的计算时间，其余用于实战";
-        openingShare.ItemSelected+=i=>SearchCapacity.SetOpeningPercent(openingShare.GetItemId((int)i));
-        opacityButton=Btn("HudOpacity","",()=>{opacity=opacity<.55f?.68f:opacity<.8f?.86f:.48f;ApplyOpacity();Save();},extras);
+        openingRow.SortChildren+=rows.QueueRedraw;liveRow.SortChildren+=rows.QueueRedraw;
+        if(nativeWindow==null)bar.GuiInput+=BarInput;
+        else
+        {
+            pinPanel.GuiInput+=e=>{
+                if(e is InputEventMouseButton {ButtonIndex:MouseButton.Left,Pressed:false})
+                {
+                    nativeWindow.AlwaysOnTop=!nativeWindow.AlwaysOnTop;
+                    var cfg=new ConfigFile();cfg.Load("user://coop-solver-window.cfg");
+                    cfg.SetValue("window","always_on_top",nativeWindow.AlwaysOnTop);cfg.Save("user://coop-solver-window.cfg");
+                }
+            };
+            pinPanel.MouseFilter=Control.MouseFilterEnum.Stop;pinPanel.MouseDefaultCursorShape=Control.CursorShape.PointingHand;
+        }
+        root.AddChild(pop);panelStyle=Framed("#111c28","#657985",8,5);ApplyOpacity();
+        progress=new SearchProgressView(root,()=>panelStyle.BgColor);
+        pop.AddThemeStyleboxOverride("panel",panelStyle);pop.Hide();
+        // The layout pass owns the shell rectangle. A queued minimum-size update
+        // from new content must not resize the shell between two layout passes.
+        pop.AddChild(col);col.SetAnchorsAndOffsetsPreset(Control.LayoutPreset.FullRect);
+        col.OffsetLeft=panelStyle.GetMargin(Side.Left);col.OffsetTop=panelStyle.GetMargin(Side.Top);
+        col.OffsetRight=-panelStyle.GetMargin(Side.Right);col.OffsetBottom=-panelStyle.GetMargin(Side.Bottom);
+        col.AddThemeConstantOverride("separation",3);
+        col.AddChild(head);
+        solve=Btn("HudSolve","",start,head);solve.Icon=HudIcons.Start;solve.IconAlignment=HorizontalAlignment.Center;solve.CustomMinimumSize=new(30,HudTypography.ControlHeight);
+        head.AddChild(mode);
+        menus=new InlineMenus(root);
+        void BindPots(Button button,bool live)
+        {
+            HudBest? Row()=>live?displayedLiveNumbers:last?.Opening;
+            var row=live?liveRow:openingRow;
+            menus.BindOptions(button,row.GetChild<Control>(1),row.GetChild<Control>(2),bar,()=>Array.FindIndex(Row()?.Options??Array.Empty<PotionCost>(),o=>o.Key==Row()?.PotionKey),
+                item=>{pinned=true;choosePotion?.Invoke(live,Row()?.Options?.FirstOrDefault(o=>o.Key==item.Key));});
+        }
+        BindPots(openingPots,false);BindPots(livePots,true);
+        menus.Bind(mode,"HudViewMenu",new InlineMenus.Item[]{
+            new(0,Ui.T("开局最优","Opening"),"HudViewOpening"),new(1,Ui.T("实战最优","Live"),"HudViewLive")},
+            ()=>last?.Live==true?1:0,id=>{if(last!=null && (id==1)!=last.Live)switchMode();});
+        var roundSlot=new Control{CustomMinimumSize=new(114,30),MouseFilter=Control.MouseFilterEnum.Ignore};
+        head.AddChild(roundSlot);roundSlot.AddChild(route.Round);route.Round.SetAnchorsAndOffsetsPreset(Control.LayoutPreset.FullRect);
+        prevRound=Btn("HudPrevRound","",()=>route.MoveRound(-1),head);prevRound.Icon=HudIcons.Previous;prevRound.IconAlignment=HorizontalAlignment.Center;
+        nextRound=Btn("HudNextRound","",()=>route.MoveRound(1),head);nextRound.Icon=HudIcons.Next;nextRound.IconAlignment=HorizontalAlignment.Center;
+        prevRound.CustomMinimumSize=nextRound.CustomMinimumSize=new(30,HudTypography.ControlHeight);
+        route.Picked+=_=>{
+            if(lastDetail?.Party.Length<=1)return;
+            lastDetailGraph=null;
+            graph.Panel.Hide();
+            graph.Clear();
+            route.Scroll.Hide();
+        };
+        head.AddChild(outcome.Container);outcome.Container.SizeFlagsHorizontal=Control.SizeFlags.ExpandFill;
+        outcome.Container.Alignment=BoxContainer.AlignmentMode.End;
+        outcome.Button.Pressed+=()=>{
+            chartsOpen=outcome.Button.ButtonPressed;
+            if(chartsOpen)
+            {
+                chartWidth=pop.Size.X;
+                chartHeaderHeight=head.Size.Y;
+                backSize=outcome.Button.Size;
+            }
+            route.CloseOverview();
+            RequestHistory(chartsOpen);
+        };
+        autoplay=Btn("HudAutoplay",Ui.T("自动打牌","Auto play"),()=>playRoute?.Invoke(),switchRow,HudIcons.Play);
+        autoplay.Hide();
+        ownOnly=Btn("HudOwnOnly",Ui.T("只看自己","My moves"),()=>{route.Filter(!route.OwnOnly);Save(filter:true);},switchRow,HudIcons.Filter);
+        ownOnly.ToggleMode=true;
+        route.Filter(config.GetValue("hud","own_only",false).AsBool());
+        hideResults=Btn("HudHide",Ui.T("隐藏结果","Hide"),hide,switchRow,HudIcons.EyeClosed);
+        col.AddChild(roster);
+        col.AddChild(route.Overview.Panel);
+        col.AddChild(connectionStatus);col.AddChild(warnings.Panel);
+        col.AddChild(beforeActions);col.AddChild(route.Scroll);col.AddChild(graph.Panel);col.AddChild(progress.Panel);
+        graphStatus.Name="HudGraphStatus";graphStatus.Hide();col.AddChild(graphStatus);
+        col.AddChild(switchRow);col.AddChild(afterActions);col.AddChild(actionRow);
+        switchRow.Resized+=PlaceSwitches;
+        actionRow.AddThemeConstantOverride("separation",4);
+        actionRow.SortChildren+=PlaceSwitches;
+        col.AddChild(settingsPanel);settingsPanel.AddThemeStyleboxOverride("panel",HudSurface.Box("#242c3240","#839da755",7,3));
+        var optionsList=new VBoxContainer();optionsList.AddThemeConstantOverride("separation",2);
+        settingsPanel.AddChild(optionsList);optionsList.AddChild(allocation);optionsList.AddChild(resources);
+        sourceButton=new Button{Name="HudSource"};
+        actionRow.AddChild(sourceButton);sourceButton.AddThemeFontSizeOverride("font_size",HudTypography.Detail);
+        menus.Bind(sourceButton,"HudSourceMenu",new InlineMenus.Item[]{
+            new(0,Ui.T("跟随主机","Follow host"),"HudSourceHost"),
+            new(1,Ui.T("本机搜索","Search locally"),"HudSourceLocal")},
+            ()=>previousController==true?1:0,id=>{
+                bool local=id==1;
+                if(local!=previousController)selectLocal?.Invoke(local);
+            });
+        broadcastButton=new Button{Name="HudBroadcast"};
+        actionRow.AddChild(broadcastButton);broadcastButton.AddThemeFontSizeOverride("font_size",HudTypography.Detail);
+        menus.Bind(broadcastButton,"HudBroadcastMenu",new InlineMenus.Item[]{
+            new(1,Ui.T("同步到全队","Share with team"),"HudBroadcastOn"),
+            new(0,Ui.T("不同步","Do not share"),"HudBroadcastOff")},
+            ()=>broadcastEnabled?1:0,id=>setBroadcast?.Invoke(id==1));
+        windowButton=Btn("HudWindow",Ui.T("独立窗口","Window"),window,actionRow,HudIcons.External);
+        settings=Btn("HudOptions",Ui.T("设置","Settings"),()=>options=!options,actionRow,HudIcons.Settings);settings.ToggleMode=true;
+        restart=Btn("HudRestart",Ui.T("重新搜索","Restart search"),()=>restartSearch?.Invoke(),actionRow,HudIcons.Restart);
+        actionRow.MoveChild(restart,0);
+        foreach(var child in actionRow.GetChildren().OfType<Control>())child.SizeFlagsHorizontal=Control.SizeFlags.ExpandFill;
+        var allocationTitle=Caption(Ui.T("算力分配","Search split"),TextColor,true);allocation.AddChild(allocationTitle);
+        opacityCaption.Text=Ui.T("浮层透明度","Opacity");
+
+
+        allocation.AddChild(openingCaption);allocation.AddChild(openingShare);allocation.AddChild(liveCaption);
+        StyleSlider(openingShare);ReserveCaption(openingCaption,Ui.T("开局100%","Opening 100%"));
+        ReserveCaption(liveCaption,Ui.T("100%实战","100% live"));
+        openingShare.ValueChanged+=value=>SearchCapacity.SetOpeningPercent((int)value,persist:!adjustingSlider);
+        openingShare.DragStarted+=()=>adjustingSlider=true;
+        openingShare.DragEnded+=changed=>{adjustingSlider=false;if(changed)SearchCapacity.SetOpeningPercent((int)openingShare.Value);};
+        resources.AddChild(cpu);less=Btn("HudCpuLess","",()=>SearchCapacity.SetAndSave(SearchCapacity.Limit-1),resources);
+        more=Btn("HudCpuMore","",()=>SearchCapacity.SetAndSave(SearchCapacity.Limit+1),resources);
+        less.Icon=HudIcons.Minus;more.Icon=HudIcons.Plus;
+        less.IconAlignment=more.IconAlignment=HorizontalAlignment.Center;
+        less.CustomMinimumSize=more.CustomMinimumSize=new(HudTypography.ControlHeight,HudTypography.ControlHeight);
+        resources.AddSpacer(false);
+        resources.AddChild(Caption(Ui.T("搜索树上限","Tree limit"),TextColor,true));resources.AddChild(memoryPolicy);
+        memoryPolicy.AddThemeFontSizeOverride("font_size",HudTypography.Detail);
+        SearchCapacity.BindMemory(menus,memoryPolicy);
+        var opacityGroup=new HBoxContainer();optionsList.AddChild(opacityGroup);
+        opacityGroup.AddChild(opacityCaption);opacityGroup.AddChild(opacityValue);
+        ReserveCaption(opacityValue,"100%");
+        foreach(var row in new[]{allocation,resources,opacityGroup})
+        {
+            row.AddThemeConstantOverride("separation",4);
+            foreach(var child in row.GetChildren().OfType<Label>())
+            {
+                child.VerticalAlignment=VerticalAlignment.Center;child.SizeFlagsVertical=Control.SizeFlags.Fill;
+            }
+        }
+        opacityGroup.AddChild(opacitySlider);StyleSlider(opacitySlider);
+        tip.AddThemeStyleboxOverride("panel",HudSurface.Box("#101c23ff","#839a9c88",7,3));
+        tip.AddChild(tipText);root.AddChild(tip);
+        opacitySlider.SetValueNoSignal(Math.Round(opacity*100));
+        opacitySlider.DragStarted+=()=>adjustingSlider=true;
+        opacitySlider.DragEnded+=changed=>{adjustingSlider=false;if(changed)Save(tone:true);};
+        opacitySlider.ValueChanged+=value=>{
+            opacity=(float)value/100;ApplyOpacity();if(!adjustingSlider)Save(tone:true);
+        };
     }
-    private void ApplyOpacity()=>panelStyle.BgColor=new Color(.054f,.083f,.11f,opacity);
+    private void AlignFooter()
+    {
+        Button? previous=windowButton.Visible?windowButton:broadcastButton.Visible?broadcastButton:
+            sourceButton.Visible?sourceButton:restart.Visible?restart:null;
+        Button? own=ownOnly.Visible?(hideResults.Visible?previous:settings):null;
+        Button? hide=hideResults.Visible?settings:null;
+        void ClearColumn(Button? column)
+        {
+            if(column!=null && column!=own && column!=hide)
+                column.CustomMinimumSize=new(0,column.CustomMinimumSize.Y);
+        }
+        ClearColumn(ownColumn);ClearColumn(hideColumn);
+        ownColumn=own;hideColumn=hide;
+        if(own!=null && own!=restart)own.CustomMinimumSize=new(ownOnly.GetMinimumSize().X,own.CustomMinimumSize.Y);
+        if(hide!=null)hide.CustomMinimumSize=new(hideResults.GetMinimumSize().X,hide.CustomMinimumSize.Y);
+        restart.CustomMinimumSize=new(Math.Max(autoplay.Visible?autoplay.GetMinimumSize().X:0,
+            own==restart?ownOnly.GetMinimumSize().X:0),restart.CustomMinimumSize.Y);
+        float height=Math.Max(autoplay.Visible?autoplay.GetCombinedMinimumSize().Y:0,
+            Math.Max(ownOnly.Visible?ownOnly.GetCombinedMinimumSize().Y:0,hideResults.Visible?hideResults.GetCombinedMinimumSize().Y:0));
+        switchRow.CustomMinimumSize=new(0,Math.Max(HudTypography.ControlHeight,height));
+        PlaceSwitches();
+    }
+
+    private void PlaceSwitches()
+    {
+        void Place(Button button,Button? column)
+        {
+            if(column==null || !button.Visible)return;
+            button.Position=new(column.Position.X,0);
+            button.Size=new(column.Size.X,switchRow.Size.Y);
+        }
+        Place(autoplay,restart);Place(ownOnly,ownColumn);Place(hideResults,hideColumn);
+    }
+
+    private static void ReserveCaption(Label label,string widest)
+    {
+        var font=HudTypography.Face();
+        label.CustomMinimumSize=new(Mathf.Ceil(font.GetStringSize(widest,fontSize:HudTypography.Detail).X),0);
+    }
+    private static void StyleSlider(HSlider slider)
+    {
+        slider.SizeFlagsVertical=Control.SizeFlags.ShrinkCenter;
+        slider.SizeFlagsHorizontal=Control.SizeFlags.ExpandFill;
+        slider.CustomMinimumSize=new(65,18);
+        slider.AddThemeIconOverride("grabber",HudIcons.Thumb);slider.AddThemeIconOverride("grabber_highlight",HudIcons.Thumb);
+        foreach(var (state,color) in new[]{("slider","#79919cab"),("grabber_area","#92bfb5e8"),("grabber_area_highlight","#afd2c9ff")})
+        {
+            var track=Box(color,0,2);track.SetCornerRadiusAll(2);
+            slider.AddThemeStyleboxOverride(state,track);
+        }
+    }
+    internal void SetPlayback(bool solo,bool active,bool available)
+    {
+        autoplay.Visible=solo;autoplay.Disabled=!active && !available;
+        autoplay.Text=active?Ui.T("停止打牌","Stop auto play"):Ui.T("自动打牌","Auto play");
+        autoplay.Icon=active?HudIcons.Stop:HudIcons.Play;
+    }
+    private void ApplyOpacity()
+    {
+        panelStyle.BgColor=new Color(.054f,.083f,.11f,opacity);
+        shell.BgColor=new Color(.063f,.11f,.137f,opacity);
+        HudSurface.SetOpacity(opacity);
+        opacityValue.Text=Math.Round(opacity*100)+"%";
+    }
     internal static Label Caption(string text,Color color,bool small=false)
     {
-        var label=new Label{Text=text,MouseFilter=Control.MouseFilterEnum.Ignore};
-        label.AddThemeColorOverride("font_color",color);label.AddThemeColorOverride("font_shadow_color",new Color(0,0,0,.7f));
-        label.AddThemeConstantOverride("shadow_offset_y",1);
-        if(small)label.AddThemeFontSizeOverride("font_size",14);
+        var label=new Label{Text=Ui.Punctuation(text),MouseFilter=Control.MouseFilterEnum.Ignore};
+        label.CustomMinimumSize=new(0,small?HudTypography.DetailHeight:HudTypography.BodyHeight);label.VerticalAlignment=VerticalAlignment.Center;
+        label.AddThemeColorOverride("font_color",color);
+        label.AddThemeFontSizeOverride("font_size",small?HudTypography.Detail:HudTypography.Body);
         return label;
     }
-    private static Button Btn(string name,string text,Action act,Control parent)
+    private static Button Btn(string name,string text,Action act,Control parent,Texture2D? icon=null)
     {
-        var b=new Button{Name=name,Text=text,Flat=true,FocusMode=Control.FocusModeEnum.None};
-        b.AddThemeFontSizeOverride("font_size",14);foreach(string state in new[]{"normal","hover","pressed","hover_pressed","disabled"})
-            b.AddThemeStyleboxOverride(state,Box(state=="hover"?"#385266b0":"#1c2b3640",8,3));
+        var b=new Button{Name=name,Text=text,Icon=icon,IconAlignment=HorizontalAlignment.Right,Flat=true,FocusMode=Control.FocusModeEnum.None};
+        b.AddThemeFontSizeOverride("font_size",HudTypography.Detail);StyleButton(b);
         b.ClipText=false;b.TextOverrunBehavior=TextServer.OverrunBehavior.NoTrimming;
         b.Pressed+=act;parent.AddChild(b);return b;
+    }
+    internal static StyleBoxFlat Framed(string fill,string border,int x,int y)
+    {
+        var box=Box(fill,x,y);box.SetBorderWidthAll(1);box.BorderColor=new(border);return box;
+    }
+    internal static void StyleButton(Button button,bool compact=false)
+    {
+        int x=compact?3:6,y=1;
+        button.Flat=false;button.CustomMinimumSize=new(button.CustomMinimumSize.X,compact?20:HudTypography.ControlHeight);
+        button.AddThemeStyleboxOverride("normal",HudSurface.Box("#80979b25","#93a9b087",x,y));
+        button.AddThemeStyleboxOverride("hover",HudSurface.Box("#91b4bc48","#aec6cdbe",x,y));
+        var selected=HudSurface.Box("#72bba758","#a4d2c3c4",x,y);
+        button.AddThemeStyleboxOverride("pressed",selected);button.AddThemeStyleboxOverride("hover_pressed",selected);
+        button.AddThemeStyleboxOverride("disabled",HudSurface.Box("#5d6c7318","#82939855",x,y));
     }
     private static StyleBoxFlat Stroke()
     {
@@ -118,16 +411,44 @@ internal sealed class CombatHud
     }
     internal static PanelContainer Outline(Label label,string tip)
     {
-        var p=new PanelContainer{Name="HudKill",TooltipText=tip,MouseFilter=Control.MouseFilterEnum.Pass};
+        var p=new PanelContainer{Name="HudKill",MouseFilter=Control.MouseFilterEnum.Pass};
         p.AddThemeStyleboxOverride("panel",Stroke());p.AddChild(label);return p;
     }
     internal static StyleBoxFlat Box(string color,int x,int y)
     {
-        var s=new StyleBoxFlat{BgColor=new Color(color)};s.SetCornerRadiusAll(5);
+        var s=new StyleBoxFlat{BgColor=new Color(color),AntiAliasing=true,AntiAliasingSize=1.0f,CornerDetail=12};s.SetCornerRadiusAll(5);
         s.SetContentMargin(Side.Left,x);s.SetContentMargin(Side.Right,x);s.SetContentMargin(Side.Top,y);s.SetContentMargin(Side.Bottom,y);return s;
     }
-    private void Save()
-    {var cfg=new ConfigFile();cfg.SetValue("hud","font",fontSize);cfg.SetValue("hud","anchor",anchor);cfg.SetValue("hud","pinned",pinned);cfg.SetValue("hud","opacity",opacity);cfg.SetValue("hud","own_only",route.OwnOnly);cfg.Save(Layout);}
+    private void Save(bool filter=false,bool tone=false)
+    {
+        var cfg=new ConfigFile();cfg.Load(Layout);
+        if(filter)cfg.SetValue("hud","own_only",route.OwnOnly);
+        else if(tone)cfg.SetValue("hud","opacity_percent",Mathf.RoundToInt(opacity*100));
+        else
+        {
+            cfg.SetValue("hud","font",fontSize);
+            if(anchor is {} preferred)cfg.SetValue("hud","anchor",preferred);
+            cfg.SetValue("hud","pinned",pinned);
+        }
+        cfg.Save(Layout);
+    }
+    private Vector2 DefaultAnchor()
+    {
+        long now=System.Environment.TickCount64;
+        if((topBar==null || !GodotObject.IsInstanceValid(topBar) || !topBar.IsVisibleInTree()) && now>=findTopBarAt)
+        {
+            findTopBarAt=now+1000;
+            topBar=tree.Root.FindChildren("*","",true,false)
+                .OfType<MegaCrit.Sts2.Core.Nodes.CommonUi.NTopBar>().FirstOrDefault(node=>node.IsVisibleInTree());
+        }
+        if(topBar!=null && GodotObject.IsInstanceValid(topBar) && topBar.BossIcon is { } boss && boss.IsVisibleInTree())
+        {
+            var rect=root.GetGlobalTransform().AffineInverse()*boss.GetGlobalRect();
+            return new(rect.End.X+12,Math.Max(0,rect.GetCenter().Y-bar.Size.Y/2));
+        }
+        return new(root.Size.X*.444f,9);
+    }
+
     private void BarInput(InputEvent e)
     {
         if(e is InputEventMouseButton b)
@@ -139,7 +460,7 @@ internal sealed class CombatHud
                 if(b.Pressed){held=true;dragging=false;pressAt=b.GlobalPosition/root.Scale;dragDelta=pressAt-bar.Position;}
                 else if(held)
                 {
-                    if(!dragging){pinned=!pinned;ignoreHover=!pinned;hoverUntil=0;pop.Visible=pinned;}
+                    if(!dragging){pinned=!pinned;ignoreHover=!pinned;pop.Visible=pinned;}
                     held=dragging=false;Save();
                 }
                 bar.AcceptEvent();
@@ -149,137 +470,437 @@ internal sealed class CombatHud
         {
             if((motion.GlobalPosition/root.Scale).DistanceTo(pressAt)>=5)dragging=true;
             if(!dragging)return;
-            var area=(root.Size-bar.Size).Max(Vector2.One);
+            var area=PinTravel.Max(Vector2.One);
             anchor=((motion.GlobalPosition/root.Scale-dragDelta)/area).Clamp(Vector2.Zero,Vector2.One);bar.AcceptEvent();
         }
     }
-    private void BuildRow(HBoxContainer container,Label[] numbers,string title)
+    private void BuildRow(HBoxContainer container,Label[] numbers,LossFlash flash,string title)
     {
         container.AddThemeConstantOverride("separation",2);
         for(int i=0;i<numbers.Length;i++)
         {
             var box=new PanelContainer{MouseFilter=Control.MouseFilterEnum.Ignore};
-            box.AddThemeStyleboxOverride("panel",Box("#111c28b8",6,2));container.AddChild(box);
-            var label=Caption(i==0?title:"",TextColor);
-            label.AddThemeFontSizeOverride("font_size",16);numbers[i]=label;
-            if(i==0)
+            var field=Box("#00000000",4,0);
+            if(i is >=1 and <=3)
             {
+                flash.Fields[i-1]=field;
+                if(i<3){field.ExpandMarginRight=2;field.CornerRadiusTopRight=field.CornerRadiusBottomRight=0;}
+                if(i>1)field.CornerRadiusTopLeft=field.CornerRadiusBottomLeft=0;
+            }
+            if(i==4)field.SetContentMargin(Side.Left,10);
+            box.AddThemeStyleboxOverride("panel",field);container.AddChild(box);
+            var label=Caption(i==0?title:"",TextColor);
+            numbers[i]=label;
+            if(i>=4)
+            {
+                // Keep the caption beside its value. Spare space belongs at the end of the cell.
                 var strip=new HBoxContainer{MouseFilter=Control.MouseFilterEnum.Ignore};
-                strip.AddThemeConstantOverride("separation",2);box.AddChild(strip);strip.AddChild(label);
-                var figures=new Label[3];counters[label]=figures;
-                for(int n=0;n<figures.Length;n++)
+                strip.AddThemeConstantOverride("separation",HudTypography.FieldGap);box.AddChild(strip);
+                label.HorizontalAlignment=HorizontalAlignment.Right;
+                if(i==4)
                 {
-                    var value=Caption("",TextColor);value.HorizontalAlignment=HorizontalAlignment.Right;
-                    value.CustomMinimumSize=new(n==2?88:62,0);strip.AddChild(value);figures[n]=value;
+                    var marker=Caption("",Dim,small:true);
+                    marker.Name="LossProof";marker.MouseFilter=Control.MouseFilterEnum.Pass;
+                    marker.Hide();strip.AddChild(marker);proofSlots.Add(numbers[0],marker);
                 }
+                if(i<6)strip.AddChild(Caption(i==4?Ui.T("总量","Total"):Ui.T("发现","Found"),Dim,small:true));
+                strip.AddChild(label);
+                if(i==6)
+                {
+                    label.HorizontalAlignment=HorizontalAlignment.Right;
+                    strip.AddChild(Caption(Ui.T("次/秒","actions/s"),Dim,small:true));
+                }
+                metricHints[strip]=i==4?Ui.T("总搜索量","Total simulated actions"):i==5?Ui.T("发现分支时的搜索量","Search count at discovery"):Ui.T("实时搜索速度（模拟动作/秒）","Live search speed (actions/s)");
             }
             else if(i==1)
             {
-                var strip=new HBoxContainer{MouseFilter=Control.MouseFilterEnum.Ignore};strip.AddThemeConstantOverride("separation",0);
-                box.AddChild(strip);strip.AddChild(label);lossCells.Add(label,new());
+                var strip=new HBoxContainer{MouseFilter=Control.MouseFilterEnum.Ignore};strip.AddThemeConstantOverride("separation",3);
+                box.AddChild(strip);strip.AddChild(label);seatCells.Add(label,new());
+            }
+            else if(i==2)
+            {
+                var strip=new HBoxContainer{MouseFilter=Control.MouseFilterEnum.Ignore};strip.AddThemeConstantOverride("separation",3);
+                box.AddChild(strip);strip.AddChild(label);seatCells.Add(label,new());strip.AddChild(container==openingRow?openingPots:livePots);
             }
             else box.AddChild(label);
-
         }
     }
-    private void FormatRow(Label[] row,HudBest? best,string name,bool hidden)
+    private void FormatRow(Label[] row,HudBest? best,string name,bool hidden,int? round=null)
     {
-        row[0].Text=name;var figures=counters[row[0]];
-        figures[0].Text=Advisor.Compact(best?.Visits??0);
-        figures[1].Visible=!hidden;figures[1].Text=best?.Pv is {} pv?Advisor.Compact(pv):"—";
-        figures[2].Text=Advisor.Compact(best?.Rate??0)+" v/s";
+        row[0].Text=name;
+        // Older peers may include a preview endpoint even with no terminal outcome.
+        if(best!=null && best.Outcome is not ("胜" or "败"))
+            best=best with {Outcome="",End=null,Party=Array.Empty<HudSeat>(),Discovered=null,MinimumLossProven=false,ProofPercent=null};
+        var marker=proofSlots[row[0]];
+        bool proven=!hidden && best?.MinimumLossProven==true;
+        int? percent=hidden?null:best?.ProofPercent;
+        double? coverage=!hidden && best?.Outcome=="胜"?best.ProofCoverage:null;
+        string checkedText=coverage switch
+        {
+            null or <=0.001=>"",
+            _=>(Math.Min(999,Math.Floor(coverage.Value*1000))/10).ToString("0.#",System.Globalization.CultureInfo.InvariantCulture)+"%"
+        };
+        marker.Text=proven?"✓":percent is >0 and <=99?$"≈{percent}%":percent==0?"":checkedText;
+        marker.Visible=marker.Text.Length!=0;
+        marker.AddThemeColorOverride("font_color",proven?new Color("#a6edbd"):Dim);
+        row[4].Text=best==null?Ui.Missing:Advisor.Compact(best.Visits);
+        row[5].Text=string.IsNullOrEmpty(best?.Discovered)?Ui.Missing:best.Discovered;
+        row[6].Text=Advisor.Compact(best?.Rate??0);
         for(int i=1;i<4;i++)
             ((Control)(i==1?row[i].GetParent().GetParent():row[i].GetParent())).Visible=!hidden;
+        var button=row==openingNumbers?openingPots:livePots;
+        var options=best?.Options??Array.Empty<PotionCost>();
+        button.Visible=!hidden && options.Length>0;
+        if(button.Visible)
+        {
+            var items=options.Select((o,i)=>{
+                var seats=best!.Party;
+                InlineMenus.Value Chip(string value,int i)=>new(value,i<0 || seats.Length<2?null:HudRouteView.SeatColor(seats[i]).ToHtml(false),
+                    i>=0 && seats.Length>1 && seats[i].Id==localId,
+                    Prefix:seats.Length<2?null:i>=0?$"P{i+1}":Ui.T("归属未记录","Unknown player"));
+                var losses=new List<InlineMenus.Value>();
+                if(o.EnemyHp is int hp)losses.Add(new(Ui.T($"敌人剩{hp}血",$"Enemy HP {hp}")));
+                else
+                {
+                    losses.Add(new(Ui.T("扣血","HP loss"),Ink:TextColor,Padding:0));
+                    if(o.SeatLoss is {} perSeat && perSeat.Length==seats.Length && seats.Length>0)
+                        for(int seat=0;seat<seats.Length;seat++)
+                        {
+                            int loss=perSeat[seat];
+                            losses.Add(new(loss.ToString(),seats.Length>1?HudRouteView.SeatColor(seats[seat]).ToHtml(false):null,
+                                seats.Length>1 && seats[seat].Id==localId,HudTypography.LossInk(loss,HudTypography.Ink),Padding:6));
+                        }
+                    else losses.Add(new(o.Loss.ToString(),Ink:HudTypography.LossInk(o.Loss,HudTypography.Ink)));
+                }
+                var drugs=new List<InlineMenus.Value>();
+                string BottleName(IGrouping<string,SpentPotion> group)
+                {
+                    var name=MegaCrit.Sts2.Core.Models.ModelDb.GetByIdOrNull<MegaCrit.Sts2.Core.Models.PotionModel>(
+                        new MegaCrit.Sts2.Core.Models.ModelId("POTION",group.Key.Length==0?"UNKNOWN":group.Key))?.Title.GetFormattedText()??group.Key;
+                    return (string.IsNullOrEmpty(name)?Ui.T("药水","Potion"):name)+(group.Count()>1?" ×"+group.Count():"");
+                }
+                var byOwner=o.Bottles.ToLookup(b=>b.Id.Length==0?-1:Array.FindIndex(seats,s=>s.Id==b.Seat));
+                foreach(int owner in Enumerable.Range(0,seats.Length).Append(-1))
+                {
+                    var names=byOwner[owner].GroupBy(b=>b.Id).Select(BottleName).ToArray();
+                    if(names.Length==0)continue;
+                    var text=string.Join(Ui.T("、",", "),names);
+                    drugs.Add(Chip(text,owner));
+                }
+                if(drugs.Count==0)drugs.Add(new(Ui.T("无用药","No potions")));
+                if(o.Goal!=null)drugs.Add(new(o.Goal.Label()));
+                if(o.VictoryReturn>0)drugs.Add(new(Ui.T($"胜后复活+{o.VictoryReturn}",$"Revive +{o.VictoryReturn}")));
+                return new InlineMenus.Item(i,"",Key:o.Key,Left:losses.ToArray(),Right:drugs.ToArray());
+            }).OrderBy(item=>options[item.Id].EnemyHp??options[item.Id].Loss).Prepend(new(-1,options[0].EnemyHp.HasValue?Ui.T("自动（最接近胜利）","Auto (closest to victory)"):Ui.T("自动（最少扣血）","Auto (least HP loss)"),row==openingNumbers?"HudPotionAutoOpening":"HudPotionAutoLive",
+                Left:null,Right:null)).ToArray();
+            menus.Items(button,items);
+        }
         if(hidden)return;
         var party=best?.Party??Array.Empty<HudSeat>();
-        row[1].Text=party.Length==0?"扣血 —":"扣血 ";
-        var labels=lossCells[row[1]];
-        for(int i=0;i<Math.Max(party.Length,labels.Count);i++)
+        row[1].Text=party.Length==0?Ui.T("扣血…","HP loss —"):Ui.T("扣血","HP loss ");
+        SetSeatValues(row[1],party,false);
+        row[2].Text=party.Length==0?Ui.T("用药…","Pots —"):Ui.T("用药","Pots ");
+        SetSeatValues(row[2],party,true);
+        row[3].Text=Ui.T("回合","Turn ")+$"{round??currentCombatRound}/{best?.End?.ToString()??Ui.Missing} "+(best?.Goal is {Kind:CombatGoal.Training,Escaped:true}?Ui.T("超时","Timeout"):Ui.Outcome(best?.Outcome));
+    }
+    private void SetSeatValues(Label heading,HudSeat[] party,bool potions)
+    {
+        var labels=seatCells[heading];
+        var strip=heading.GetParent<HBoxContainer>();
+        for(int i=0;i<Math.Max(labels.Count,party.Length);i++)
         {
             if(i==labels.Count)
             {
-                var label=Caption("",TextColor);
-                var wrap=new PanelContainer{MouseFilter=Control.MouseFilterEnum.Ignore};
-                row[1].GetParent().AddChild(wrap);wrap.AddChild(label);labels.Add(label);
+                var cell=Caption("",TextColor);cell.HorizontalAlignment=HorizontalAlignment.Center;
+                var panel=new PanelContainer{MouseFilter=Control.MouseFilterEnum.Ignore,SizeFlagsVertical=Control.SizeFlags.ShrinkCenter};
+                strip.AddChild(panel);strip.MoveChild(panel,i+1);panel.AddChild(cell);labels.Add(cell);
             }
-            var cell=labels[i];var panel=(PanelContainer)cell.GetParent();panel.Visible=i<party.Length;
-            if(i>=party.Length)continue;
-            var seat=party[i];cell.Text=(i==0?"":"·")+(seat.ToEnd?.ToString()??"—");
-            panel.AddThemeStyleboxOverride("panel",seat.DiesAtEnd?deathBorder:emptyBorder);
-            cell.AddThemeFontOverride("font",fonts[(seat.Id==localId?0:1)+(seat.DiesAtEnd?2:0)]);
-            cell.AddThemeColorOverride("font_color",HudRouteView.SeatColor(seat));
+            var value=labels[i];var wrap=value.GetParent<PanelContainer>();
+            wrap.Visible=i<party.Length;
+            if(!wrap.Visible)continue;
+            var seat=party[i];value.Text=(potions?seat.Potions:seat.ToEnd)?.ToString()??Ui.Missing;
+            bool lethal=!potions && seat.DiesAtEnd;
+            wrap.AddThemeStyleboxOverride("panel",party.Length>1?HudRouteView.SeatBox(seat,6,0,lethal):
+                HudSurface.Box("#00000000",lethal?"#ffe0a5":"",6,0));
+            value.AddThemeFontOverride("font",bodyFace);
+            var ink=potions?HudTypography.Ink:HudTypography.LossInk(seat.ToEnd,HudTypography.Ink);
+            value.AddThemeColorOverride("font_color",ink);
+            SeatUnderline(wrap,party.Length>1 && seat.Id==localId,ink);
         }
-        row[2].Text=$"回合 {best?.Round.ToString()??"—"}/{best?.End?.ToString()??"—"} {best?.Outcome}";
-        row[3].Text="药水 "+(party.Length==0?"—":string.Join("·",party.Select(s=>s.Potions?.ToString()??"—")));
+    }
+    internal static void SeatUnderline(PanelContainer box,bool local,Color ink)
+    {
+        const string key="coop_local_underline";
+        if(!box.HasMeta(key))
+        {
+            if(!local)return;
+            box.Draw+=()=>{
+                if(!box.GetMeta(key).AsBool())return;
+                float inset=box.GetThemeStylebox("panel") is StyleBoxFlat style?
+                    Math.Max(style.CornerRadiusBottomLeft,style.CornerRadiusBottomRight):4;
+                if(box.Size.X>2*inset)
+                    box.DrawLine(new(inset,box.Size.Y-1),new(box.Size.X-inset,box.Size.Y-1),
+                        box.GetMeta("coop_local_edge_ink").AsColor(),1);
+            };
+        }
+        box.SetMeta(key,local);box.SetMeta("coop_local_edge_ink",ink);box.QueueRedraw();
     }
     private void Format(HudFrame f)
     {
-        var single=new HudBest(f.Visits,f.Pv,f.Rate,f.Round,f.Plan?.End,f.Plan?.Party??Array.Empty<HudSeat>(),"");
-        FormatRow(openingNumbers,f.Hidden?single:f.Opening??(!f.Live?single:null),f.Hidden?"计算":"开局最优",f.Hidden);
-        liveRow.Visible=!f.Hidden;
-        if(!f.Hidden)FormatRow(liveNumbers,f.Realtime??(f.Live?single:null),"实战最优",false);
+        var single=f.State=="等待房主共享"?null:new HudBest(f.Visits,f.Pv,f.Rate,f.Round,f.Plan?.End,f.Plan?.Party??Array.Empty<HudSeat>(),f.Plan?.Outcome??"");
+        FormatRow(openingNumbers,f.Hidden?single:f.Opening??(!f.Live?single:null),f.Hidden?Ui.T("搜索","Visits"):Ui.T("开局最优","Opening"),f.Hidden);
+        int percent=f.OpeningShare??SearchCapacity.OpeningPercent;
+        openingRow.Visible=f.Hidden || percent!=0;
+        liveRow.Visible=!f.Hidden && percent!=100;
+        if(!f.Hidden)
+        {
+            var realtime=f.Realtime??(f.Live?single:null);
+            if(f.RouteDiverged)realtime=realtime?.WithoutRoute();
+            if(f.RouteDiverged || f.State is "主机已关闭广播" or "等待房主共享")stableLiveNumbers=null;
+            int? frozenRound=null;
+            if(realtime?.End!=null && realtime.Outcome is "胜" or "败")
+            {
+                if(f.LiveSettling && realtime.Options==null && stableLiveNumbers is {Options:{} retained} prior)
+                    realtime=realtime with {Options=retained,PotionKey=prior.PotionKey};
+                stableLiveNumbers=realtime;
+            }
+            else if(stableLiveNumbers is {} previous)
+            {
+                frozenRound=previous.Round;
+                realtime=previous with {Rate=realtime?.Rate??0,Visits=realtime?.Visits is >0 and var visits?visits:previous.Visits,
+                    Checking=false};
+            }
+            displayedLiveNumbers=realtime;
+            FormatRow(liveNumbers,realtime,Ui.T("实战最优","Live"),false,frozenRound);
+        }
+        bool dual=openingRow.Visible && liveRow.Visible;
+        for(int field=1;field<=2;field++)
+        {
+            var a=seatCells[openingNumbers[field]];var b=seatCells[liveNumbers[field]];
+            int count=Math.Max(a.Count,b.Count);
+            for(int seat=0;seat<count;seat++)
+            {
+                var left=seat<a.Count && a[seat].GetParent<PanelContainer>().Visible?a[seat]:null;
+                var right=seat<b.Count && b[seat].GetParent<PanelContainer>().Visible?b[seat]:null;
+                float width=dual?Math.Max(left?.GetMinimumSize().X??0,right?.GetMinimumSize().X??0):0;
+                if(left!=null)left.CustomMinimumSize=new(width,0);
+                if(right!=null)right.CustomMinimumSize=new(width,0);
+            }
+        }
+        for(int i=0;i<openingNumbers.Length;i++)
+        {
+            var a=openingRow.GetChild<Control>(i);var b=liveRow.GetChild<Control>(i);
+            float width=dual?Math.Max(a.GetMinimumSize().X,b.GetMinimumSize().X):0;
+            a.CustomMinimumSize=b.CustomMinimumSize=new(width,0);
+        }
+        float height=Math.Max(openingRow.GetMinimumSize().Y,liveRow.GetMinimumSize().Y);
+        openingRow.CustomMinimumSize=liveRow.CustomMinimumSize=new(0,height);
         bar.ResetSize();
     }
+    internal void TrackHover(Vector2 mouse,bool hidden)
+    {
+        var strip=bar.GetRect();var details=pop.GetRect();
+        bool over=strip.HasPoint(mouse);
+        if(!over)ignoreHover=false;
+        bool within=over || pop.Visible && (details.HasPoint(mouse) || InlineMenus.InGap(mouse,strip,details) || menus.Contains(mouse));
+        bool expand=nativeWindow!=null || !dragging && (pinned || adjustingSlider || !ignoreHover && within);
+        pop.Visible=expand;
+        bool resized=false;
+        for(int i=4;i<7;i++)
+        {
+            bool visible=expand && (i!=5 || !hidden);
+            var opening=openingRow.GetChild<Control>(i);
+            var live=liveRow.GetChild<Control>(i);
+            if(opening.Visible==visible && live.Visible==visible)continue;
+            opening.Visible=live.Visible=visible;resized=true;
+        }
+        if(resized)bar.ResetSize();
+    }
+    internal void Remove(){RequestHistory(false);root.Hide();canvas.Remove();}
     internal void Hide()
     {
-        root.Hide();pop.Hide();held=dragging=ignoreHover=false;hoverUntil=0;last=null;lastDetail=null;detailInitialized=false;route.Reset();
+        root.Hide();canvas.Hide();pop.Hide();menus.Close();held=dragging=ignoreHover=false;previousController=null;ResetLiveDisplay();
     }
-    internal void Update(HudFrame f,ulong me,bool host,bool canStart,bool hasGuard,bool showGuard)
+    internal void Update(HudFrame f,ulong me,bool host,bool canStart,int combatRound,bool guest=false,bool? broadcasting=null,
+        IReadOnlyDictionary<uint,string>? enemyNames=null)
     {
         root.Show();localId=me;
+        if(opacity!=HudSurface.Opacity){opacity=HudSurface.Opacity;opacitySlider.SetValueNoSignal(Math.Round(opacity*100));ApplyOpacity();}
         root.Scale=Vector2.One*(fontSize/17f);
-        root.Size=root.GetViewportRect().Size/root.Scale;
-        if(f.Hidden && last?.Hidden!=true){route.Round.GetPopup().Hide();lastDetail=null;detailInitialized=false;route.Reset();choice.Text=outcome.TooltipText="";}
-        if(last!=f){Format(f);last=f;}
-        var area=(root.Size-bar.Size).Max(Vector2.Zero);bar.Position=anchor*area;
-        var mouse=root.GetLocalMousePosition();long now=System.Environment.TickCount64;
-        bool over=bar.GetRect().HasPoint(mouse);
-        if(!over)ignoreHover=false;
-        if(!ignoreHover && (over || pop.Visible && (pop.GetRect().HasPoint(mouse) || policy.GetPopup().Visible || openingShare.GetPopup().Visible || route.Round.GetPopup().Visible)))hoverUntil=now+220;
-        pop.Visible=!dragging && (pinned || !ignoreHover && now<hoverUntil);
-        indicator.Text=pinned?"▲":"▼";indicator.Modulate=pinned?Accent:Dim;
-        if(f.Hidden && !host)pop.Hide();
-        if(!pop.Visible)return;
-        var p=f.Plan;
-        if(!ReferenceEquals(p,lastDetail) || !detailInitialized)
+        var viewport=root.GetViewport();
+        var logical=root.GetViewportRect().Size;
+        var screenScale=root.Scale*HudCanvas.DeviceTransform(viewport).Scale;
+        Vector2 PixelPosition(Vector2 point)=>screenScale.X>0 && screenScale.Y>0?(point*screenScale).Round()/screenScale:point;
+        root.Size=logical/root.Scale;
+        if(previousController!=host)
         {
-            detailInitialized=true;lastDetail=p;
-            route.Set(p,f.Round,me);
-            string title=p?.Steps.Split('\n',2)[0]??"等待路线";
-            string result=title.Contains("供对照")?"开局路线供对照":title.Contains("倒下")?"全队倒下":title.Contains("胜利")?"胜利":title.Contains("保血")?"保血起手":title.Contains("待复算")?"更新中":p==null?"等待路线":"胜负未定";
-            outcome.Text=result;outcome.Modulate=result=="胜利"?new("#a6edbd"):Colors.White;
-            outcome.TooltipText=(p?.Result??"").Replace("模拟胜利","胜利").Replace("发现时模拟","发现时计算")+(string.IsNullOrEmpty(p?.Risks)?"":"\n"+p.Risks);
-            outcome.MouseFilter=Control.MouseFilterEnum.Pass;
+            long resetAt=System.Environment.TickCount64;
+            openingFlash.Update(0,false,resetAt);liveFlash.Update(0,false,resetAt);
+            previousController=host;ResetLiveDisplay();
         }
-        ownOnly.Visible=p?.Party.Length>1;ownOnly.Text=route.OwnOnly?"显示全队":"只看自己";
-        head.Visible=!f.Hidden;
-        roster.Visible=!f.Hidden && roster.GetChildCount()>0;route.Scroll.Visible=!f.Hidden && route.Count>0;
-        hideResults.Visible=host;hideResults.Text=f.Hidden?"显示结果":"隐藏结果";
-        choice.Text=f.Choice;choice.Visible=f.Choice.Length>0;
-        solve.Visible=host;mode.Visible=host && !f.Hidden;
-        solve.Text=f.Running?"暂停搜索":SearchCapacity.OpeningPercent==100?"开始搜开局":"开始搜实战";
+        if(f.Hidden && last?.Hidden!=true){route.CloseOverview();lastDetail=null;detailInitialized=false;route.Reset();outcome.Set(null);chartsOpen=false;outcome.Button.SetPressedNoSignal(false);}
+        if(last!=f || combatRound!=currentCombatRound)
+        {
+            currentCombatRound=combatRound;
+            Format(f);warnings.Set(f);
+            last=f;
+        }
+        bar.Position=nativeWindow!=null?Vector2.Zero:PixelPosition(anchor is {} position?position*PinTravel:DefaultAnchor());
+        var mouse=root.GetLocalMousePosition();long now=System.Environment.TickCount64;
+        openingFlash.Update(f.Opening?.LossRevision??0,!f.Hidden && openingRow.Visible && f.Opening!=null,now);
+        liveFlash.Update(f.Realtime?.LossRevision??0,!f.Hidden && liveRow.Visible && f.Realtime!=null,now);
+        TrackHover(mouse,f.Hidden);
+        indicator.Modulate=(nativeWindow?.AlwaysOnTop??pinned)?Accent:new Color(.69f,.75f,.77f,.75f);
+        if(!pop.Visible)menus.Close();
+        if(!pop.Visible){tip.Hide();progress.HideTip();RequestHistory(false);graph.HideExpansion();SuspendGraphRequest();canvas.Update(root,menus);return;}
+        bool departed=f.Live && !f.Hidden && f.RouteDiverged;
+        bool hostUnavailable=f.State is "主机已关闭广播" or "等待房主共享";
+        // Older hosts omit their plan during native action settlement.
+        bool keepLegacy=f.Live && !departed && !f.Hidden && !hostUnavailable && f.Plan==null &&
+            (f.Realtime?.Checking==true || f.State.StartsWith("等待实战结算",StringComparison.Ordinal));
+        var p=departed?null:f.Plan??(keepLegacy && lastDetailLive?lastDetail:null);
+        if(departed && lastDetail!=null)
+        {
+            route.CloseOverview();graph.Clear();
+        }
+        bool showCharts=chartsOpen && !f.Hidden;
+        head.CustomMinimumSize=new(0,showCharts?chartHeaderHeight:0);
+        bool promptToStart=host && canStart && !f.Running && !f.Hidden && !departed &&
+            p==null && f.SearchError==null && f.Warnings is not {Length:>0};
+        string? status=departed?Ui.T("偏离路线","Off route"):
+            promptToStart?Ui.T("请启动搜索以显示路线","Start search to show a route"):null;
+        RequestHistory(showCharts);
+        progress.Panel.Visible=showCharts;
+        progress.Set(showCharts?f.History:null,p?.Party);
+        bool multiplayer=guest || broadcasting.HasValue || (p?.Party.Length??0)>1;
+        int graphRound=route.RoundFor(p,f.Round);
+        int? wantedGraph=multiplayer && p!=null && !f.Hidden?graphRound:null;
+        if(!graphPreferenceKnown || wantedGraph!=lastGraphRound)
+        {
+            graphPreferenceKnown=true;lastGraphRound=wantedGraph;requestGraph?.Invoke(wantedGraph);
+        }
+        var report=wantedGraph.HasValue?f.Graphs?.FirstOrDefault(entry=>entry.Round==graphRound):null;
+        bool building=report?.Updating==true && f.Plan!=null;
+        bool graphPending=wantedGraph.HasValue && f.Graphs!=null && report==null;
+        var certified=report?.Graph is {Conservative:false} proof?proof:null;
+        bool waitForGraph=building || graphPending;
+        if(certified==null && waitForGraph && lastDetail!=null && lastDetailLive==f.Live && lastDetailGraph?.Round==graphRound)
+        {
+            // Keep the plan and its verified graph together while replacing this round.
+            p=lastDetail;
+            certified=lastDetailGraph;
+        }
+        outcome.Set(p,status,showCharts,backSize);
+        outcome.Button.Disabled=p==null && !showCharts;
+        var executed=f.Live?(ReferenceEquals(p,f.Plan)?f.Executed:
+            ReferenceEquals(p,lastDetail) && lastDetailLive?lastDetailExecuted:null):null;
+        lastDetailExecuted=executed;
+        var liveNames=f.Live?enemyNames:null;
+        route.SetTargetNames(liveNames);
+        if(!ReferenceEquals(p,lastDetail) || !detailInitialized || lastDetailLive!=f.Live)
+        {
+            detailInitialized=true;lastDetail=p;lastDetailLive=f.Live;
+            route.Set(p,f.Round,me);
+        }
+        lastDetailGraph=certified;
+        ulong[] ended=f.Live?f.ReadyEnds??Array.Empty<ulong>():Array.Empty<ulong>();
+        route.SetReadyEnds(f.Live?f.ReadyRound:0,ended,executed);
+        route.SetWaits(certified);
+        bool overview=route.Overview.Panel.Visible;
+        bool details=!showCharts && !f.Hidden && !departed;
+        bool navigation=details && route.RoundCount>0;
+        prevRound.Disabled=route.RoundIndex<=0;
+        nextRound.Disabled=route.RoundIndex+1>=route.RoundCount;
+        ownOnly.Visible=details && (p?.Party.Length??stableLiveNumbers?.Party.Length??0)>1;
+        ownOnly.SetPressedNoSignal(route.OwnOnly);
+        head.Visible=!f.Hidden || host;
+        prevRound.Visible=nextRound.Visible=route.Round.GetParent<Control>().Visible=navigation;
+        outcome.Container.Visible=!f.Hidden;
+        restart.Visible=host;hideResults.Visible=host;
+        hideResults.Text=f.Hidden?Ui.T("显示结果","Reveal"):Ui.T("隐藏结果","Hide");
+        hideResults.Icon=f.Hidden?HudIcons.EyeOpen:HudIcons.EyeClosed;
+        roster.Visible=details && !overview && roster.GetChildCount()>0;
+        route.Scroll.Visible=details && !overview && route.Count>0 &&
+            (!multiplayer || route.OwnOnly && certified!=null);
+        bool showGraph=details && wantedGraph.HasValue && !route.OwnOnly && !overview && certified!=null;
+        graph.Update(certified,p,graphRound,me,readyRound:f.Live?f.ReadyRound:0,ready:ended,enemyNames:liveNames,progress:executed);
+        graph.Panel.Visible=showGraph && graph.HasActions;
+        bool endedTurn=f.Live && f.ReadyRound==graphRound && p is {Party.Length:>0} && p.Party.All(seat=>ended.Contains(seat.Id));
+        graphStatus.Visible=details && !overview && waitForGraph && !endedTurn;
+        beforeActions.Visible=afterActions.Visible=showCharts || route.Scroll.Visible || graph.Panel.Visible || graphStatus.Visible;
+        solve.Visible=host;mode.Visible=!f.Hidden;mode.Disabled=!host;
+        solve.Icon=f.Running?HudIcons.Pause:HudIcons.Start;
         solve.Disabled=!canStart && !f.Running;
-        mode.Text=f.Live?"看开局操作":"看实战操作";
-        bool changing=f.State.Contains("复核余线") || f.State.Contains("正在重算") || f.State.Contains("试接余线") || f.State.Contains("等待实战结算");
-        status.Text=changing?"更新中":f.Choice.Length>0?"选牌中":host?"":f.Live?"房主 · 实战":"房主 · 开局";
-        if(!changing && f.State.Contains("已恢复"))status.Text="已接回路线";
-        status.TooltipText=f.State;
-        searchOptions.Visible=host && (options || !f.Running);
-        policy.Select(SearchCapacity.OpeningPercent==100?0:1);
-        openingShare.Visible=SearchCapacity.OpeningPercent!=100;
-        if(openingShare.Visible && openingShare.GetSelectedId()!=SearchCapacity.OpeningPercent)
-            openingShare.Select(openingShare.GetItemIndex(SearchCapacity.OpeningPercent));
-        extras.Visible=options;less.Visible=cpu.Visible=more.Visible=host;windowButton.Visible=host && !f.Hidden;
+        sourceButton.Visible=guest;broadcastButton.Visible=broadcasting.HasValue;broadcastEnabled=broadcasting==true;
+        switchRow.Visible=autoplay.Visible || ownOnly.Visible || hideResults.Visible;
+        connectionStatus.Text=f.State switch {
+            "主机已关闭广播"=>Ui.T("主机未同步路线","Host is not sharing"),
+            "等待房主共享"=>Ui.T("等待主机同步","Waiting for host"),_=>""};
+        connectionStatus.Visible=connectionStatus.Text.Length>0;
+        settingsPanel.Visible=options;settings.SetPressedNoSignal(options);
+        allocation.Visible=resources.Visible=host;
+        windowButton.Visible=nativeWindow==null;
+        AlignFooter();
+        int opening=SearchCapacity.OpeningPercent;openingShare.SetValueNoSignal(opening);
+        openingCaption.Text=Ui.T($"开局{opening}%",$"Opening {opening}%");
+        liveCaption.Text=Ui.T($"{100-opening}%实战",$"{100-opening}% live");
         cpu.Text=$"CPU {SearchCapacity.Limit}/{SearchCapacity.Available}";
         less.Disabled=SearchCapacity.Limit<=1;more.Disabled=SearchCapacity.Limit>=SearchCapacity.Available;
-        guard.Visible=host && !f.Hidden && hasGuard;guard.Text=showGuard?"主路线":"保血起手";
-        opacityButton.Text=$"底色 {Math.Round(opacity*100)}%";opacityButton.TooltipText="点击调整面板底色深浅";
-        float above=bar.Position.Y,below=root.Size.Y-bar.GetRect().End.Y;
-        float available=Math.Max(above,below);
-        float width=Math.Min(root.Size.X,Math.Max(440,bar.Size.X));
-        float desired=col.GetCombinedMinimumSize().Y+(route.Scroll.Visible?route.ContentHeight:0)+17;
-        pop.Size=new(width,Math.Min(available,desired));
-        float x=anchor.X>.5f?bar.GetRect().End.X-pop.Size.X:bar.Position.X;
-        pop.Position=new(Math.Clamp(x,0,Math.Max(0,root.Size.X-pop.Size.X)),below>=pop.Size.Y || below>=above?bar.GetRect().End.Y:Math.Max(0,above-pop.Size.Y));
+        if(nativeWindow!=null)
+        {
+            var usable=DisplayServer.ScreenGetUsableRect(nativeWindow.CurrentScreen);
+            var need=Mathf.CeilToInt(Math.Max(bar.Size.X,col.GetCombinedMinimumSize().X+20)*root.Scale.X);
+            var minimum=new Vector2I(Math.Min(usable.Size.X,Math.Max(500,need)),Math.Min(usable.Size.Y,390));
+            if(!showCharts && nativeWindow.MinSize!=minimum)nativeWindow.MinSize=minimum;
+            pop.Position=new(0,bar.GetRect().End.Y+PanelGap);
+            route.SizeForWidth(root.Size.X-panelStyle.GetMinimumSize().X);
+            pop.Size=new(showCharts?Math.Min(root.Size.X,chartWidth):root.Size.X,Math.Max(0,root.Size.Y-pop.Position.Y));
+        }
+        else
+        {
+            float above=bar.Position.Y,below=root.Size.Y-bar.GetRect().End.Y;
+            float available=Math.Max(0,Math.Max(above,below)-PanelGap);
+            float contentWidth=graph.Panel.Visible?graph.IdealWidth:route.IdealWidth;
+            float desiredWidth=Math.Max(DetailsWidth,Math.Max(col.GetCombinedMinimumSize().X,contentWidth)+20);
+            float roomToRight=root.Size.X-bar.Position.X;
+            float width=Math.Min(root.Size.X,showCharts?chartWidth:Math.Min(desiredWidth,Math.Max(DetailsWidth,roomToRight)));
+            route.SizeForWidth(width-panelStyle.GetMinimumSize().X);
+            var items=col.GetChildren().OfType<Control>().Where(control=>control.Visible).ToArray();
+            float desired=items.Sum(control=>ReferenceEquals(control,graph.Panel)?graph.ContentHeight:
+                ReferenceEquals(control,route.Scroll)?route.ContentHeight:ReferenceEquals(control,progress.Panel)?
+                SearchProgressView.PreferredHeight:control.GetCombinedMinimumSize().Y)
+                +Math.Max(0,items.Length-1)*col.GetThemeConstant("separation")+panelStyle.GetMinimumSize().Y;
+            if(waitForGraph && details && !overview && !endedTurn)
+                desired=Math.Max(desired,pop.Size.Y);
+            if(graph.Panel.Visible)graph.SetScrollOverflow(desired>available);
+            if(route.Scroll.Visible)route.Scroll.VerticalScrollMode=desired>available?
+                ScrollContainer.ScrollMode.Reserve:ScrollContainer.ScrollMode.Disabled;
+            float fullHeight=screenScale.Y>0?Mathf.Ceil(desired*screenScale.Y)/screenScale.Y:desired;
+            pop.Size=new(PixelPosition(new(width,0)).X,Math.Min(available,fullHeight));
+            bool belowBar=below>=above;
+            int headerIndex=belowBar?0:col.GetChildCount()-1;
+            if(head.GetIndex()!=headerIndex)col.MoveChild(head,headerIndex);
+            pop.Position=PixelPosition(new(Math.Clamp(bar.Position.X,0,Math.Max(0,root.Size.X-pop.Size.X)),
+                belowBar?bar.GetRect().End.Y+PanelGap:Math.Max(0,above-pop.Size.Y-PanelGap)));
+        }
+        menus.Refresh();graph.UpdateHover(root,mouse,graph.Panel.Visible && !menus.Visible);progress.Hover(root,mouse,showCharts && !menus.Visible);UpdateHint(mouse);canvas.Update(root,menus);
+    }
+    internal void UpdateHint(Vector2 mouse)
+    {
+        if(menus.Visible || !pop.Visible){tip.Hide();return;}
+        Rect2 Rect(Control c)=>root.GetGlobalTransform().AffineInverse()*c.GetGlobalRect();
+        foreach(var (strip,message) in metricHints)
+        {
+            if(!strip.IsVisibleInTree() || !Rect(strip).HasPoint(mouse))continue;
+            if(strip.FindChild("LossProof",false,false) is Label {Visible:true} proof &&
+                Rect(proof).HasPoint(mouse))continue;
+            if(!tip.Visible || tipText.Text!=message){tipText.Text=message;tip.Show();tip.ResetSize();tip.MoveToFront();}
+            var r=bar.GetRect();
+            float above=r.Position.Y-tip.Size.Y-2;
+            tip.Position=new(Math.Clamp(Rect(strip).Position.X,0,Math.Max(0,root.Size.X-tip.Size.X)),
+                Math.Clamp(above>=0?above:r.End.Y+2,0,Math.Max(0,root.Size.Y-tip.Size.Y)));
+            return;
+        }
+        tip.Hide();
     }
 }

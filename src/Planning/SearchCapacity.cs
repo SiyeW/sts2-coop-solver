@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Threading;
+using System.Linq;
 
 namespace CoopSolver;
 
@@ -36,14 +37,32 @@ internal static class SearchCapacity
         Limit=limit;var cfg=new Godot.ConfigFile();cfg.Load("user://coop-solver-window.cfg");
         cfg.SetValue("search","cores",Limit);cfg.Save("user://coop-solver-window.cfg");
     }
+    private static readonly int[] memoryLimits={0,25,50,75,100,250,500,750,1000,2500,5000};
+    private const int DefaultLimitMb=500;
+    private static int memoryLimitMb=DefaultLimitMb;
+    internal static int MemoryLimitMb=>Volatile.Read(ref memoryLimitMb);
+    internal static void SetMemoryLimit(int mb)
+    {
+        if(!memoryLimits.Contains(mb))throw new ArgumentOutOfRangeException(nameof(mb));
+        Volatile.Write(ref memoryLimitMb,mb);
+        var cfg=new Godot.ConfigFile();cfg.Load("user://coop-solver-window.cfg");
+        cfg.SetValue("search","tree_limit_mb",mb);cfg.Save("user://coop-solver-window.cfg");
+    }
+    internal static void BindMemory(InlineMenus menus,Godot.Button memory)
+    {
+        var items=memoryLimits.Select(mb=>new InlineMenus.Item(mb,mb==0?Ui.T("无限制","Unlimited"):
+            mb<1000?$"{mb} MB":(mb/1000d).ToString("0.0",System.Globalization.CultureInfo.InvariantCulture)+" GB")).ToArray();
+        menus.Bind(memory,memory.Name+"Menu",items,()=>MemoryLimitMb,SetMemoryLimit);
+    }
     private static int openingPercent=20;
     internal static int LiveOpeningPercent {get;private set;}=20;
     internal static int OpeningPercent=>Volatile.Read(ref openingPercent);
-    internal static void SetOpeningPercent(int value)
+    internal static void SetOpeningPercent(int value,bool persist=true)
     {
         Volatile.Write(ref openingPercent,Math.Clamp(value,0,100));
-        var cfg=new Godot.ConfigFile();cfg.Load("user://coop-solver-window.cfg");
         if(OpeningPercent<100)LiveOpeningPercent=OpeningPercent;
+        if(!persist)return;
+        var cfg=new Godot.ConfigFile();cfg.Load("user://coop-solver-window.cfg");
         cfg.SetValue("search","live_opening_percent",LiveOpeningPercent);
         cfg.SetValue("search","opening_percent",OpeningPercent);cfg.Save("user://coop-solver-window.cfg");
     }
@@ -51,6 +70,9 @@ internal static class SearchCapacity
     {
         var cfg=new Godot.ConfigFile();if(cfg.Load("user://coop-solver-window.cfg")==Godot.Error.Ok)
         {
+            int initial=cfg.GetValue("search","memory_reserve_percent",1).AsInt32()==0?0:DefaultLimitMb;
+            int mb=cfg.GetValue("search","tree_limit_mb",initial).AsInt32();
+            Volatile.Write(ref memoryLimitMb,memoryLimits.Contains(mb)?mb:DefaultLimitMb);
             Limit=cfg.GetValue("search","cores",1).AsInt32();
             openingPercent=Math.Clamp(cfg.GetValue("search","opening_percent",20).AsInt32(),0,100);
             LiveOpeningPercent=openingPercent<100?openingPercent:Math.Clamp(cfg.GetValue("search","live_opening_percent",20).AsInt32(),0,99);

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
+using System.Linq;
 using System.Text;
 
 namespace CoopSolver;
@@ -15,12 +16,31 @@ internal sealed class RoundAgenda : IDisposable
     private readonly BinaryWriter writer;
     private readonly MemoryStream buffer=new();
     private readonly BinaryWriter payload;
-    private long oldest;
+    private long oldest,prefixCursor;
+    private int previousCutoff;
+    private readonly SortedSet<(double Score,int Tie,long Offset,int Turn)> byPrefixQuality=new();
+    private readonly SortedDictionary<int,int> pendingByTurn=new();
     private const int IndexCapacity=256;
-    private readonly SortedSet<(double Score,int Tie,long Offset)> byScore=new();
+    private readonly SortedSet<(double Score,int Tie,long Offset,int Turn)> byScore=new();
     private readonly SortedSet<(int Round,double Score,int Tie,long Offset)> byRound=new();
     internal long Pending {get;private set;}
-    internal long Bytes=>file.Length;
+    internal long Bytes {get;private set;}
+    // Only resident stream buffers and queue indexes are charged here; Bytes is the disk arena.
+    internal long ResidentBytes=>buffer.Capacity+4096+72L*(byPrefixQuality.Count+byScore.Count+byRound.Count)+48L*pendingByTurn.Count;
+    private long nextSpaceCheck;
+    private bool spaceLow;
+    internal bool HasDiskSpace()
+    {
+        if(Bytes<48L*1024*1024)return true;
+        if(Environment.TickCount64>=nextSpaceCheck)
+        {
+            nextSpaceCheck=Environment.TickCount64+5000;
+            try {spaceLow=new DriveInfo(Path.GetPathRoot(file.Name)!).AvailableFreeSpace<512L*1024*1024;}
+            catch(IOException){spaceLow=true;}
+            catch(UnauthorizedAccessException){spaceLow=true;}
+        }
+        return !spaceLow;
+    }
 
     internal RoundAgenda()
     {
@@ -33,7 +53,7 @@ internal sealed class RoundAgenda : IDisposable
         payload=new BinaryWriter(buffer,Encoding.UTF8,true);
     }
 
-    internal long Append(long parent,TreeStep step,bool pending,int round,double score,int tie)
+    internal long Append(long parent,TreeStep step,bool pending,int round,double score,int tie,double? prefixScore=null)
     {
         buffer.Position=0;
         payload.Write(pending);
@@ -51,7 +71,7 @@ internal sealed class RoundAgenda : IDisposable
             compressed.Write(Encoding.UTF8.GetBytes(step.MenuEvidence));
         }
         else payload.Write(step.MenuEvidence);
-        return Commit(pending,round,score,tie);
+        return Commit(pending,round,score,tie,prefixScore);
     }
 
     internal void DeferCursor(long path,ActionFrontier frontier,int firstSeat,int round,double score,int tie)
@@ -69,23 +89,31 @@ internal sealed class RoundAgenda : IDisposable
     {
         firstSeat=null;
         if(id<0)return null;
-        file.Position=id+sizeof(int)+sizeof(byte);
+        file.Position=id+2*sizeof(int)+sizeof(byte);
         if(!reader.ReadBoolean())return null;
         id=reader.ReadInt64();
         firstSeat=reader.ReadInt32();
         return ActionFrontier.Load(reader);
     }
 
-    private long Commit(bool pending,int round,double score,int tie)
+    private long Commit(bool pending,int round,double score,int tie,double? prefixScore=null)
     {
         int size=checked((int)buffer.Position);
         long start=file.Seek(0,SeekOrigin.End);
-        writer.Write(checked(sizeof(int)+size));
+        writer.Write(checked(2*sizeof(int)+size));
+        writer.Write(round);
         writer.Write(buffer.GetBuffer(),0,size);
+        Bytes=start+2*sizeof(int)+size;
         if(pending)
         {
             Pending++;
-            byScore.Add((score,tie,start));
+            pendingByTurn[round]=pendingByTurn.GetValueOrDefault(round)+1;
+            if(prefixScore.HasValue)
+            {
+                byPrefixQuality.Add((prefixScore.Value,tie,start,round));
+                if(byPrefixQuality.Count>IndexCapacity)byPrefixQuality.Remove(byPrefixQuality.Min);
+            }
+            byScore.Add((score,tie,start,round));
             if(byScore.Count>IndexCapacity)byScore.Remove(byScore.Min);
             byRound.Add((round,score,tie,start));
             if(byRound.Count>IndexCapacity)byRound.Remove(byRound.Min);
@@ -96,8 +124,10 @@ internal sealed class RoundAgenda : IDisposable
     private bool Claim(long offset)
     {
         file.Position=offset+sizeof(int);
+        int turn=reader.ReadInt32();
         if(!reader.ReadBoolean())return false;
-        file.Position=offset+sizeof(int);
+        file.Position=offset+2*sizeof(int);
+        if(--pendingByTurn[turn]==0)pendingByTurn.Remove(turn);
         writer.Write(false);
         Pending--;
         return true;
@@ -129,6 +159,44 @@ internal sealed class RoundAgenda : IDisposable
         return false;
     }
 
+    internal bool HasPrefix(int cutoff)=>pendingByTurn.Count!=0 && pendingByTurn.First().Key<=cutoff;
+
+    // These are the same pending rows as the unrestricted queue. Both readers
+    // claim the same bit, so advancing either reader cannot duplicate a job.
+    internal bool TakePrefix(int lane,int cutoff,out long offset)
+    {
+        offset=-1;
+        if(!HasPrefix(cutoff))return false;
+        if(previousCutoff!=cutoff){previousCutoff=cutoff;prefixCursor=oldest;}
+        if(lane!=0)
+        {
+            var option=byPrefixQuality.Reverse().FirstOrDefault(x=>x.Turn<=cutoff);
+            if(option!=default){byPrefixQuality.Remove(option);offset=option.Offset;if(Claim(offset))return true;}
+        }
+        if(lane==1)
+        {
+            var candidate=byScore.Reverse().FirstOrDefault(x=>x.Turn<=cutoff);
+            if(candidate!=default){byScore.Remove(candidate);offset=candidate.Offset;if(Claim(offset))return true;}
+        }
+        if(lane==2)
+        {
+            var eligible=byRound.GetViewBetween((int.MinValue,double.NegativeInfinity,int.MinValue,long.MinValue),
+                (cutoff,double.PositiveInfinity,int.MaxValue,long.MaxValue));
+            if(eligible.Count!=0)
+            {
+                var item=eligible.Max;byRound.Remove(item);offset=item.Offset;if(Claim(offset))return true;
+            }
+        }
+        prefixCursor=Math.Max(prefixCursor,oldest);
+        for(int i=0;i<64 && prefixCursor<Bytes;i++)
+        {
+            offset=prefixCursor;file.Position=offset;
+            prefixCursor+=reader.ReadInt32();
+            if(reader.ReadInt32()<=cutoff && Claim(offset))return true;
+        }
+        return false;
+    }
+
     internal IEnumerable<(long Id,long Parent,bool Cursor,bool Pending)> Rows()
     {
         long end=file.Length;
@@ -136,6 +204,7 @@ internal sealed class RoundAgenda : IDisposable
         {
             file.Position=offset;
             int size=reader.ReadInt32();
+            reader.ReadInt32(); // scheduling turn
             bool pending=reader.ReadBoolean(),cursor=reader.ReadBoolean();
             long parent=reader.ReadInt64();
             yield return (offset,parent,cursor,pending);
@@ -147,6 +216,7 @@ internal sealed class RoundAgenda : IDisposable
     {
         file.Position=offset;
         long end=offset+reader.ReadInt32();
+        reader.ReadInt32(); // scheduling turn
         reader.ReadBoolean();
         if(reader.ReadBoolean())throw new InvalidDataException("Cursor used as a path");
         parent=reader.ReadInt64();

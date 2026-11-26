@@ -1,0 +1,660 @@
+diff --git a/src/CoopBots.Kernel/KernelPlanningState.Facts.cs b/src/CoopBots.Kernel/KernelPlanningState.Facts.cs
+index 08e6a8b..156d5a7 100644
+--- a/src/CoopBots.Kernel/KernelPlanningState.Facts.cs
++++ b/src/CoopBots.Kernel/KernelPlanningState.Facts.cs
+@@ -1,3 +1,4 @@
++using System.Collections.Concurrent;
+ using System.Collections;
+ using System.Globalization;
+ using System.Reflection;
+@@ -23,9 +24,9 @@ public sealed partial class KernelSession
+     // in that text. Multiplayer cache reuse records those captured facts too.
+     // Owner's 2026-10-09 architecture plan: unavailable facts prevent reuse only;
+     // they never refuse a native action or substitute a numeric hash for evidence.
+-    internal bool AppendPlanningMechanismFacts(StringBuilder text)
++    internal bool AppendPlanningMechanismFacts(StringBuilder text, bool includeVictoryPlayPile = false)
+     {
+-        try { return new PlanningMechanismWriter(this, text).Append(); }
++        try { return new PlanningMechanismWriter(this, text, includeVictoryPlayPile).Append(); }
+         catch (Exception error) when (error is InvalidOperationException or MissingMemberException
+             or ArgumentException or TargetInvocationException or InvalidCastException)
+         {
+@@ -60,9 +61,12 @@ public sealed partial class KernelSession
+             BindingFlags.Instance | BindingFlags.NonPublic) ?? throw new MissingMethodException(name))
+             .Invoke(Combat, [simulator, player]);
+ 
+-    private sealed class PlanningMechanismWriter(KernelSession session, StringBuilder text)
++    private sealed class PlanningMechanismWriter(KernelSession session, StringBuilder text, bool includeVictoryPlayPile = false)
+     {
+         private const BindingFlags Fields = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
++        private static readonly ConcurrentDictionary<Type, FieldInfo[]> OrderedFields = new();
++        private static readonly ConcurrentDictionary<(Type Type, string Name), FieldInfo> CapturedFields = new();
++        private static readonly ConcurrentDictionary<(Type Type, string Name), PropertyInfo> CapturedProperties = new();
+         private static readonly Dictionary<Type, Type> RequiredPowerStates = new()
+         {
+             [typeof(AfterimagePower)] = typeof(CardPlayPairPredictionState),
+@@ -93,9 +97,10 @@ public sealed partial class KernelSession
+                 var state = session.simulator.State.GetPlayerCombatState(player);
+                 AddPile(state.Hand.Cards, player, "H"); AddPile(state.DrawPile.Cards, player, "D");
+                 AddPile(state.DiscardPile.Cards, player, "C"); AddPile(state.ExhaustPile.Cards, player, "X");
+-                // An occupied PlayPile is a transaction rather than a settled
+-                // planning boundary, even if a permissive fork happens to exist.
+-                if (state.PlayPile.Cards.Count > 0) Unavailable("occupied-play-pile");
++                // A verified victory can stop the simulator before moving the
++                // winning card. Record its actual pile for terminal comparison.
++                if (includeVictoryPlayPile) AddPile(state.PlayPile.Cards, player, "P");
++                else if (state.PlayPile.Cards.Count > 0) Unavailable("occupied-play-pile");
+             }
+             foreach (var (player, current, previous) in session.PlanningHistoryCourseAttacks())
+             {
+@@ -154,6 +159,11 @@ public sealed partial class KernelSession
+                     if (!stored.Any(entry => ReferenceEquals(entry.Model, power) && entry.StateType == required))
+                         Unavailable("missing-captured-power-state:" + power.GetType().Name);
+                 }
++                else if (power is GigantificationPower or SubroutinePower or StranglePower)
++                {
++                    // These mirrors keep only an in-flight attack/card-play receipt.
++                    // Their settled effect amount is already captured above.
++                }
+                 else if (power is OrbitPower orbit)
+                     text.Append(";orbit=").Append(session.Combat.GetOrbitEnergyRemainder(orbit));
+                 else if (power is PaleBlueDotPower pale)
+@@ -182,6 +192,13 @@ public sealed partial class KernelSession
+                 // Amount is already the canonical effective amount in P=.
+                 // Lazy creation of its redundant wrapper is not semantic state.
+                 if (entry.StateType.Name == "PowerAmountPredictionState") continue;
++                if (entry.Model is GigantificationPower && GigantificationPowerMirrors.IsSettledState(entry.Value)) continue;
++                if (entry.Model is SubroutinePower or StranglePower
++                    && entry.Value is CardPlayPairPredictionState pair)
++                {
++                    if (pair.Amounts.Count != 0) Unavailable("pending-card-play-pair:" + entry.Model.GetType().Name);
++                    continue;
++                }
+                 // Upstream lazily mirrors Withering's integer CardsLeft in a
+                 // CounterPredictionState; native roots retain only DynamicVars.
+                 // Our full canonical facts keep P=/PT= and skip only an exact
+@@ -220,7 +237,7 @@ public sealed partial class KernelSession
+                     && RequiredPowerStates.TryGetValue(retired.GetType(), out var retiredState)
+                     && entry.StateType == retiredState) continue;
+                 var address = ModelAddress(entry.Model);
+-                if (address is null) { Unavailable("detached-captured-state"); continue; }
++                if (address is null) { Unavailable("detached-captured-state:" + entry.Model.GetType().Name); continue; }
+                 text.Append(";captured-state=").Append(address).Append('/').Append(entry.StateType.FullName).Append('{');
+                 if (entry.StateType.Assembly != typeof(KernelSession).Assembly
+                     || !typeof(IPredictionStateForkable).IsAssignableFrom(entry.StateType))
+@@ -367,7 +384,7 @@ public sealed partial class KernelSession
+                 "_swordSageReplayBonuses",
+                 "_dampenCasters", "_dampenOriginalUpgrades", "_deathPhases",
+                 "_stolenStrength", "_stolenDexterity", "_statefulRelicStates",
+-                "_simulatedOsties", "_simulatedOstyMaxHp", "_monsterIntStates",
++                "_monsterIntStates",
+                 "_knowledgeDemonCurseCounters", "_enemiesIntendingAttack",
+                 "_hasPredictedEnemyIntents", "_nextCreatureId", "_currentSide",
+                 "_escapedCreatures", "_knownEnemies", "_allies", "_enemies",
+@@ -399,6 +416,12 @@ public sealed partial class KernelSession
+                 }
+                 else AppendValue(ReadField(session.Combat, name), 0);
+             }
++            // Native captures and simulated summons store this information
++            // differently. Compare each owner's effective pet and max HP.
++            foreach (var player in session.Combat.Players)
++                text.Append(";osty=").Append(player.NetId).Append('/')
++                    .Append(CreatureAddress(session.Combat.GetOsty(player))).Append('/')
++                    .Append(session.Combat.GetOstyMaxHp(session.simulator, player));
+             foreach (var (player, current, previous) in session.PlanningHistoryCourseAttacks())
+             {
+                 // null and an empty backing dictionary have the same effective
+@@ -545,8 +568,13 @@ public sealed partial class KernelSession
+         private void AppendObjectFields(object value, Type type, int depth)
+         {
+             if (depth > 32) { Unavailable("cyclic-captured-state"); return; }
+-            foreach (var field in type.GetFields(Fields | BindingFlags.DeclaredOnly).Where(f => !f.IsStatic)
+-                .OrderBy(f => f.Name, StringComparer.Ordinal))
++            foreach (var field in OrderedFields.GetOrAdd(type, static valueType =>
++                valueType.GetFields(Fields | BindingFlags.DeclaredOnly)
++                    .Where(field => !field.IsStatic &&
++                        // Native AfterCloned clears this flag. Its only reader
++                        // selects the forge animation when the blade changes piles.
++                        (valueType != typeof(SovereignBlade) || field.Name != "_createdThroughForge"))
++                    .OrderBy(field => field.Name, StringComparer.Ordinal).ToArray()))
+             {
+                 text.Append('/').Append(type.Name).Append('.').Append(field.Name).Append('=');
+                 AppendValue(field.GetValue(value), depth + 1);
+@@ -609,15 +637,17 @@ public sealed partial class KernelSession
+             { AppendObjectFields(value, type, depth + 1); return; }
+             Unavailable("unqualified-field:" + type.FullName);
+         }
+-        private static object? ReadField(object value, string name)
+-        {
+-            for (var type = value.GetType(); type is not null; type = type.BaseType)
+-                if (type.GetField(name, Fields | BindingFlags.DeclaredOnly) is { } field) return field.GetValue(value);
+-            throw new MissingFieldException(value.GetType().FullName, name);
+-        }
+-        private static object? CapturedProperty(object value, string name)
+-            => (value.GetType().GetProperty(name, Fields)
+-                ?? throw new MissingMemberException(value.GetType().FullName, name)).GetValue(value);
++        private static object? ReadField(object value, string name) =>
++            CapturedFields.GetOrAdd((value.GetType(), name), static key =>
++            {
++                for (var type = key.Type; type is not null; type = type.BaseType)
++                    if (type.GetField(key.Name, Fields | BindingFlags.DeclaredOnly) is { } field) return field;
++                throw new MissingFieldException(key.Type.FullName, key.Name);
++            }).GetValue(value);
++
++        private static object? CapturedProperty(object value, string name) =>
++            CapturedProperties.GetOrAdd((value.GetType(), name), static key => key.Type.GetProperty(key.Name, Fields)
++                ?? throw new MissingMemberException(key.Type.FullName, key.Name)).GetValue(value);
+         private static bool IsStatefulRelic(RelicModel relic)
+             => (bool)(typeof(SimulatedCombatState).GetMethod("IsStatefulRelic", BindingFlags.Static | BindingFlags.NonPublic)
+                 ?? throw new MissingMethodException(typeof(SimulatedCombatState).FullName, "IsStatefulRelic"))
+diff --git a/src/CoopBots.Kernel/KernelPlanningState.cs b/src/CoopBots.Kernel/KernelPlanningState.cs
+index 304a73f..97d03c8 100644
+--- a/src/CoopBots.Kernel/KernelPlanningState.cs
++++ b/src/CoopBots.Kernel/KernelPlanningState.cs
+@@ -29,13 +29,21 @@ public sealed class KernelPlanningState
+     /// </summary>
+     public string SearchMetadata { get; internal init; } = "";
+     public bool Reusable { get; }
+-    public bool Matches(KernelPlanningState other)
++    public bool Matches(KernelPlanningState other) => Matches(other, null);
++
++    internal HashSet<CardModel> CardIdentities() => new(physicalCards, ReferenceEqualityComparer.Instance);
++
++    // Independent replays allocate their own copies of newly generated cards.
++    // For route verification, preserve every pre-existing card's identity.
++    internal bool Matches(KernelPlanningState other, IReadOnlySet<CardModel>? priorCards)
+     {
+         if (!Reusable || !other.Reusable || !ReferenceEquals(battle, other.battle)
+             || !string.Equals(Semantics, other.Semantics, StringComparison.Ordinal)
+             || physicalCards.Length != other.physicalCards.Length) return false;
+         for (var i = 0; i < physicalCards.Length; i++)
+-            if (!ReferenceEquals(physicalCards[i], other.physicalCards[i])) return false;
++            if (!ReferenceEquals(physicalCards[i], other.physicalCards[i])
++                && (priorCards is null || priorCards.Contains(physicalCards[i]) || priorCards.Contains(other.physicalCards[i])))
++                return false;
+         return true;
+     }
+ 
+@@ -141,10 +149,15 @@ public sealed partial class KernelSession
+     // Multiplayer also binds seat control and original physical cards. Owner
+     // 2026-10-09: exact supported-state equality permits bounded continuation
+     // reuse after human input; equal hand/HP alone must never authorize reuse.
+-    public KernelPlanningState PlanningState(IEnumerable<ulong> controlledPlayers)
++    public KernelPlanningState PlanningState(IEnumerable<ulong> controlledPlayers) =>
++        PlanningState(controlledPlayers, includeVictoryPlayPile: false);
++
++    internal KernelPlanningState PlanningState(IEnumerable<ulong> controlledPlayers, bool includeVictoryPlayPile)
+     {
++        includeVictoryPlayPile &= HasTerminal && HasWon;
+         if (liveRoot is null) throw new InvalidOperationException("Planning evidence needs a battle identity.");
+-        var text = new StringBuilder(PartyStateText());
++        var text = new StringBuilder();
++        AppendPredictedPartyText(text);
+         text.Append("\nplanning-round=").Append(Combat.RoundNumber)
+             .Append(";enemy-phase=").Append(EnemyPhaseCompleted)
+             .Append(";horizon-closed=").Append(HorizonClosed)
+@@ -160,8 +173,10 @@ public sealed partial class KernelSession
+                 .Append('/').Append(Combat.GetPlayerTurnNumber(player))
+                 .Append('/').Append(CardsPlayedThisTurn(player))
+                 .Append('/').Append(Combat.GetEnergySpentThisTurn(player));
+-            cards.AddRange(Hand(player)); cards.AddRange(DrawPile(player));
+-            cards.AddRange(Discard(player)); cards.AddRange(Exhaust(player));
++            var state = simulator.State.GetPlayerCombatState(player);
++            AddOriginalCards(state.Hand.Cards); AddOriginalCards(state.DrawPile.Cards);
++            AddOriginalCards(state.DiscardPile.Cards); AddOriginalCards(state.ExhaustPile.Cards);
++            if (includeVictoryPlayPile) AddOriginalCards(state.PlayPile.Cards);
+         }
+         foreach (var creature in Combat.Creatures)
+             text.Append(";attacks=").Append(creature.CombatId).Append('/')
+@@ -173,7 +188,7 @@ public sealed partial class KernelSession
+         }
+         foreach (var (_, pending) in PlanningHistoryCoursePendingAttacks())
+             if (pending is not null) cards.Add(pending.Original);
+-        var mechanismsAvailable = AppendPlanningMechanismFacts(text);
++        var mechanismsAvailable = AppendPlanningMechanismFacts(text, includeVictoryPlayPile);
+         // A pending native selector or prepared answer is part of an action,
+         // not a settled root. This qualifies reuse evidence only; it does not
+         // refuse a legal game action or change native choice resolution.
+@@ -189,6 +204,11 @@ public sealed partial class KernelSession
+             && Qualify(preparedAfterStartChoices is not { Count: > 0 }, "prepared-after-start-answers", ref reuseFailure),
+             reuseFailure) { SearchMetadata = PlanningSearchMetadata() };
+ 
++        void AddOriginalCards(IReadOnlyList<Vendor.Engine.Common.PredictedCard> pile)
++        {
++            foreach (var card in pile) cards.Add(card.Original);
++        }
++
+         static bool Qualify(bool condition, string reason, ref string? failure)
+         {
+             if (!condition) failure = reason;
+diff --git a/src/CoopBots.Kernel/KernelSession.Evaluation.cs b/src/CoopBots.Kernel/KernelSession.Evaluation.cs
+index c0258ca..e202fef 100644
+--- a/src/CoopBots.Kernel/KernelSession.Evaluation.cs
++++ b/src/CoopBots.Kernel/KernelSession.Evaluation.cs
+@@ -199,23 +199,8 @@ public sealed partial class KernelSession
+     public string StateText(Player player)
+     {
+         if (player.PlayerCombatState is null) throw new InvalidOperationException("Player has no combat state.");
+-        IntentForecast forecast;
+-        try { forecast = IntentForecaster.Build(liveRoot ?? throw new InvalidOperationException(), 1); }
+-        catch
+-        {
+-            forecast = new IntentForecast
+-            {
+-                Rounds = [], HasUnsupportedIntent = true, IsExactForModeledDamage = false,
+-                UnsupportedDetails = [], ApproximationDetails = [], MonsterAiCountersByRound = [],
+-            };
+-        }
+-        // The branch's OWN turn number, never the live PlayerCombatState's. This render
+-        // happens right after the search finishes, while the live board is still on the
+-        // old turn, and deployment compares it after the boundary has been crossed — so
+-        // reading the live value here guaranteed `field=turn` drift on the first step past
+-        // every crossing. See KernelSession.TurnNumber.
+         return ContinuationStamp.CapturePredicted(
+-            player, simulator, Combat.GetPlayerTurnNumber(player), forecast, Combat.GetRootPlayerTurnNumber(player)).StateText;
++            player, simulator, Combat.GetPlayerTurnNumber(player)).StateText;
+     }
+     public bool SandpitDeath(Creature target) => Combat.EffectivePowers().OfType<SandpitPower>()
+         .Any(p => p.Target == target && p.Amount <= 1 && Hp(p.Owner) > 0);
+diff --git a/src/CoopBots.Kernel/KernelSession.cs b/src/CoopBots.Kernel/KernelSession.cs
+index 81a1492..a99176b 100644
+--- a/src/CoopBots.Kernel/KernelSession.cs
++++ b/src/CoopBots.Kernel/KernelSession.cs
+@@ -86,11 +86,25 @@ public sealed partial class KernelSession
+     /// </summary>
+     public string PartyStateText()
+     {
+-        // The live root supplies the party ORDER on both sides. Without it a branch would
+-        // have to invent an order, and an order difference would read as a state
+-        // difference — the same class of bug this method exists to remove.
++        var text = new StringBuilder();
++        AppendPredictedPartyText(text);
++        return text.ToString();
++    }
++
++    private void AppendPredictedPartyText(StringBuilder text)
++    {
+         if (liveRoot is null) throw new InvalidOperationException("Branch has no live root to order the party by.");
+-        return PartyText(liveRoot.Players, StateText);
++        var players = liveRoot.Players;
++        var shared = players.Count > 1
++            ? ContinuationStamp.CapturePredictedPartyFields(simulator)
++            : ((string Enemies, string Mechanics)?)null;
++        foreach (var player in players)
++        {
++            if (player.PlayerCombatState is null) throw new InvalidOperationException("Player has no combat state.");
++            text.Append('p').Append(player.NetId).Append('{');
++            ContinuationStamp.AppendPredictedPlayer(text, player, simulator, Combat.GetPlayerTurnNumber(player), shared);
++            text.Append("}\n");
++        }
+     }
+ 
+     /// <summary>
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Attack/GigantificationPowerMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Attack/GigantificationPowerMirrors.cs
+index cd44525..6609878 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Attack/GigantificationPowerMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Attack/GigantificationPowerMirrors.cs
+@@ -51,6 +51,10 @@ internal static class GigantificationPowerMirrors
+         return commandToModify is null || context.CardSource.References(commandToModify.ModelSource) ? 3 : 1;
+     }
+ 
++    // The attack command is the only field in this state, including after
++    // the final charge is consumed and the power leaves the effective list.
++    internal static bool IsSettledState(object value) => value is State { CommandToModify: null };
++
+     private static State GetState(GigantificationPower power, CombatMirrorContext context)
+     {
+         return context.StateStore.Get<State>(power);
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.Attack.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.Attack.cs
+index 84ed2a6..680ed63 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.Attack.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.Attack.cs
+@@ -62,16 +62,20 @@ internal sealed partial class CombatPredictionSimulator
+         return flattened;
+     }
+ 
+-    public void EndAttackContext(AttackCommand attackContext, bool completed = true)
++    public void EndAttackContext(AttackCommand attackContext, bool completed = true, bool recordAttack = true)
+     {
+         try
+         {
+             if (!completed) { HookMirrors.AbortAttack(this, attackContext); return; }
+-            Creature attacker = attackContext.Attacker
+-                ?? throw new InvalidOperationException("Attack context must have an attacker.");
+-            History.CreatureAttacked(attacker, FlattenAttackResults(attackContext));
+-            if (State.CombatState is ICombatPredictionCardEventSink eventSink)
+-                eventSink.RecordCreatureAttacked(attacker);
++            if (recordAttack)
++            {
++                Creature attacker = attackContext.Attacker
++                    ?? throw new InvalidOperationException("Attack context must have an attacker.");
++                History.CreatureAttacked(attacker, FlattenAttackResults(attackContext));
++                if (State.CombatState is ICombatPredictionCardEventSink eventSink)
++                    eventSink.RecordCreatureAttacked(attacker);
++            }
++
+             HookMirrors.AfterAttack(this, attackContext);
+         }
+         finally
+diff --git a/src/CoopBots.Kernel/Vendor/Prediction/CardEffectSpecRegistry.cs b/src/CoopBots.Kernel/Vendor/Prediction/CardEffectSpecRegistry.cs
+index 90708c0..e52ce3c 100644
+--- a/src/CoopBots.Kernel/Vendor/Prediction/CardEffectSpecRegistry.cs
++++ b/src/CoopBots.Kernel/Vendor/Prediction/CardEffectSpecRegistry.cs
+@@ -98,6 +98,7 @@ internal static class CardEffectSpecRegistry
+         // (AfterCardPlayed/AfterBlockGained), only the OnPlay application was missing.
+         [typeof(Sneaky)] = [Owner<SneakyPower>("SneakyPower")],
+         [typeof(BeaconOfHope)] = [Owner<BeaconOfHopePower>(_ => 1)],
++        [typeof(HammerTime)] = [Owner<HammerTimePower>(_ => 1)],
+         [typeof(Scourge)] = [Target<DoomPower>(card => card.DynamicVars.Doom.IntValue)],
+         [typeof(SetupStrike)] = [Owner<SetupStrikePower>(card => card.DynamicVars.Strength.IntValue)],
+         [typeof(SicEm)] = [Target<SicEmPower>("SicEmPower")],
+diff --git a/src/CoopBots.Kernel/Vendor/Prediction/CardOnPlaySupport.Batch042.cs b/src/CoopBots.Kernel/Vendor/Prediction/CardOnPlaySupport.Batch042.cs
+index 389eb49..52d04a7 100644
+--- a/src/CoopBots.Kernel/Vendor/Prediction/CardOnPlaySupport.Batch042.cs
++++ b/src/CoopBots.Kernel/Vendor/Prediction/CardOnPlaySupport.Batch042.cs
+@@ -202,7 +202,8 @@ internal static partial class CardOnPlaySupport
+         }
+         finally
+         {
+-            simulator.EndAttackContext(attackContext, completed);
++            // Native AttackContext runs the hooks without adding a CreatureAttacked history entry.
++            simulator.EndAttackContext(attackContext, completed, recordAttack: false);
+         }
+     }
+ 
+@@ -308,7 +309,8 @@ internal static partial class CardOnPlaySupport
+         }
+         finally
+         {
+-            simulator.EndAttackContext(attackContext, completed);
++            // Native AttackContext runs the hooks without adding a CreatureAttacked history entry.
++            simulator.EndAttackContext(attackContext, completed, recordAttack: false);
+         }
+     }
+ 
+diff --git a/src/CoopBots.Kernel/Vendor/Prediction/CorePowerSupport.cs b/src/CoopBots.Kernel/Vendor/Prediction/CorePowerSupport.cs
+index 68d31f5..513ff66 100644
+--- a/src/CoopBots.Kernel/Vendor/Prediction/CorePowerSupport.cs
++++ b/src/CoopBots.Kernel/Vendor/Prediction/CorePowerSupport.cs
+@@ -256,6 +256,8 @@ internal static class CorePowerSupport
+                 break;
+             case DarkEmbrace:
+                 combat.Apply<DarkEmbracePower>(owner, 1, owner);
++                if (combat.GetPower<DarkEmbracePower>(owner) is { } darkEmbrace)
++                    PowerPredictionStateSupport.CaptureRootState(simulator, darkEmbrace, darkEmbrace);
+                 break;
+             case Defragment:
+                 combat.Apply<FocusPower>(owner, card.DynamicVars["FocusPower"].IntValue, owner);
+diff --git a/src/CoopBots.Kernel/Vendor/Prediction/PersistentPowerSupport.cs b/src/CoopBots.Kernel/Vendor/Prediction/PersistentPowerSupport.cs
+index 41c2c4a..2abaf62 100644
+--- a/src/CoopBots.Kernel/Vendor/Prediction/PersistentPowerSupport.cs
++++ b/src/CoopBots.Kernel/Vendor/Prediction/PersistentPowerSupport.cs
+@@ -277,6 +277,20 @@ internal static class PersistentPowerSupport
+         CombatPredictionSimulator simulator,
+         Player player,
+         int amount)
++    {
++        ForgeBlade(simulator, player, amount);
++        if (simulator.HasPendingChoice || simulator.State.CombatState is not SimulatedCombatState combat
++            || combat.GetAmount<HammerTimePower>(player.Creature) <= 0)
++            return;
++
++        // Native Hammer Time copies the same forge to other living players.
++        // Those copies carry Hammer Time as their source and cannot trigger it again.
++        foreach (Player ally in combat.Players)
++            if (!ReferenceEquals(ally, player) && simulator.State.GetCreature(ally.Creature).IsAlive)
++                ForgeBlade(simulator, ally, amount);
++    }
++
++    private static void ForgeBlade(CombatPredictionSimulator simulator, Player player, int amount)
+     {
+         if (simulator.HasPendingChoice)
+             return;
+diff --git a/src/CoopBots.Kernel/Vendor/Runtime/ContinuationStamp.cs b/src/CoopBots.Kernel/Vendor/Runtime/ContinuationStamp.cs
+index c25ffd1..8e3d0fe 100644
+--- a/src/CoopBots.Kernel/Vendor/Runtime/ContinuationStamp.cs
++++ b/src/CoopBots.Kernel/Vendor/Runtime/ContinuationStamp.cs
+@@ -118,17 +118,34 @@ internal sealed record ContinuationStamp(string StateText)
+         return new ContinuationStamp(text.ToString());
+     }
+ 
+-    public static ContinuationStamp CapturePredicted(
+-        Player player,
+-        CombatPredictionSimulator simulator,
+-        int turn,
+-        IntentForecast forecast,
+-        int startTurnNumber)
++    public static ContinuationStamp CapturePredicted(Player player, CombatPredictionSimulator simulator,
++        int turn, IntentForecast forecast, int startTurnNumber)
++        => CapturePredicted(player, simulator, turn);
++
++    internal static ContinuationStamp CapturePredicted(Player player, CombatPredictionSimulator simulator, int turn)
++    {
++        var text = new StringBuilder();
++        AppendPredictedPlayer(text, player, simulator, turn);
++        return new ContinuationStamp(text.ToString());
++    }
++
++    internal static (string Enemies, string Mechanics) CapturePredictedPartyFields(CombatPredictionSimulator simulator)
++    {
++        var combat = (SimulatedCombatState)simulator.State.CombatState;
++        var enemies = new StringBuilder();
++        AppendPredictedEnemies(enemies, simulator, combat);
++        var mechanics = new StringBuilder();
++        AppendPredictedMechanics(mechanics, simulator, combat);
++        return (enemies.ToString(), mechanics.ToString());
++    }
++
++    internal static void AppendPredictedPlayer(StringBuilder text, Player player, CombatPredictionSimulator simulator,
++        int turn, (string Enemies, string Mechanics)? shared = null)
+     {
+         SimPlayerCombatState pcs = simulator.State.GetPlayerCombatState(player);
+         SimCreatureState simulatedPlayer = simulator.State.GetCreature(player.Creature);
+         SimulatedCombatState combat = (SimulatedCombatState)simulator.State.CombatState;
+-        StringBuilder text = Begin(
++        AppendBegin(text,
+             turn,
+             simulatedPlayer.CurrentHp,
+             simulatedPlayer.MaxHp,
+@@ -141,16 +158,8 @@ internal sealed record ContinuationStamp(string StateText)
+             combat.GetOsty(player),
+             combat.GetOsty(player) is { } osty ? simulator.State.GetCreature(osty).CurrentHp : 0,
+             combat.GetOstyMaxHp(simulator, player));
+-        IReadOnlyList<Creature> predictedEnemies = combat.Enemies;
+-        AppendEnemies(text, predictedEnemies,
+-            enemy => simulator.State.GetCreature(enemy).CurrentHp,
+-            enemy => simulator.State.GetCreature(enemy).MaxHp,
+-            enemy => simulator.State.GetCreature(enemy).Block,
+-            enemy => combat.TryGetForcedMoveId(enemy, out string forcedMove)
+-                ? forcedMove
+-                : combat.GetPredictedMoveId(enemy));
+-        combat.AppendPredictedMonsterAiContinuation(text);
+-        combat.AppendPredictedMonsterStateContinuation(text);
++        if (shared is { } fields) text.Append(fields.Enemies);
++        else AppendPredictedEnemies(text, simulator, combat);
+         AppendPredictedPile(text, pcs.Hand, 'H');
+         AppendPredictedPile(text, pcs.DrawPile, 'D');
+         AppendPredictedPile(text, pcs.DiscardPile, 'C');
+@@ -163,6 +172,26 @@ internal sealed record ContinuationStamp(string StateText)
+             text,
+             simulator,
+             combat.RelicsOf(player));
++        if (shared is { } tail) text.Append(tail.Mechanics);
++        else AppendPredictedMechanics(text, simulator, combat);
++    }
++
++    private static void AppendPredictedEnemies(StringBuilder text, CombatPredictionSimulator simulator, SimulatedCombatState combat)
++    {
++        IReadOnlyList<Creature> predictedEnemies = combat.Enemies;
++        AppendEnemies(text, predictedEnemies,
++            enemy => simulator.State.GetCreature(enemy).CurrentHp,
++            enemy => simulator.State.GetCreature(enemy).MaxHp,
++            enemy => simulator.State.GetCreature(enemy).Block,
++            enemy => combat.TryGetForcedMoveId(enemy, out string forcedMove)
++                ? forcedMove
++                : combat.GetPredictedMoveId(enemy));
++        combat.AppendPredictedMonsterAiContinuation(text);
++        combat.AppendPredictedMonsterStateContinuation(text);
++    }
++
++    private static void AppendPredictedMechanics(StringBuilder text, CombatPredictionSimulator simulator, SimulatedCombatState combat)
++    {
+         StateFingerprintBuilder adapterFingerprint = new();
+         ModelPredictionStateMirrors.AppendPredicted(ref adapterFingerprint, text, simulator, combat);
+         // CoopBots multiplayer port: always emit, same reason as the live branch above.
+@@ -180,11 +209,13 @@ internal sealed record ContinuationStamp(string StateText)
+             simulator.Rng.CombatOrbGenerationState,
+             simulator.Rng.MonsterAiState,
+             simulator.Rng.NicheState);
+-        return new ContinuationStamp(text.ToString());
+     }
+ 
+     private static StringBuilder Begin(int turn, int hp, int maxHp, int block, int energy, int stars, int gold)
+-        => new StringBuilder().Append("turn=").Append(turn)
++        => AppendBegin(new StringBuilder(), turn, hp, maxHp, block, energy, stars, gold);
++
++    private static StringBuilder AppendBegin(StringBuilder text, int turn, int hp, int maxHp, int block, int energy, int stars, int gold)
++        => text.Append("turn=").Append(turn)
+             .Append(";hp=").Append(hp).Append(";max_hp=").Append(maxHp).Append(";block=").Append(block)
+             .Append(";energy=").Append(energy).Append(";stars=").Append(stars)
+             .Append(";gold=").Append(gold);
+diff --git a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.CardLifecycle.cs b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.CardLifecycle.cs
+index 1d63180..b35397e 100644
+--- a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.CardLifecycle.cs
++++ b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.CardLifecycle.cs
+@@ -18,7 +18,6 @@ internal sealed partial class SimulatedCombatState
+     private List<PowerModel>? _addedPowerInstances;
+     private Dictionary<NightmarePower, PredictedCard>? _nightmareSelections;
+     private ForkableDictionary<Player, Creature>? _simulatedOsties;
+-    private ForkableDictionary<Creature, int>? _simulatedOstyMaxHp;
+     private HashSet<PredictedCard>? _returnToHandNextTurn;
+     private ForkableDictionary<Creature, int>? _cardsPlayedThisTurn;
+     private ForkableDictionary<Creature, int>? _manualCardsPlayedThisTurn;
+@@ -100,20 +99,16 @@ internal sealed partial class SimulatedCombatState
+             osty = existingOsty!;
+         }
+         SimCreatureState state = simulator.State.GetCreature(osty);
+-        int currentMax = _simulatedOstyMaxHp?.GetValueOrDefault(osty) ?? state.MaxHp;
+         if (!created && state.IsAlive)
+         {
+-            currentMax += amount;
+-            state.SetMaxHp(currentMax);
+-            state.CurrentHp = Math.Min(currentMax, state.CurrentHp + amount);
++            state.SetMaxHp(state.MaxHp + amount);
++            state.CurrentHp = Math.Min(state.MaxHp, state.CurrentHp + amount);
+         }
+         else
+         {
+-            currentMax = amount;
+-            state.SetMaxHp(currentMax);
+-            state.CurrentHp = amount;
++            state.SetMaxHp(amount);
++            state.CurrentHp = state.MaxHp;
+         }
+-        (_simulatedOstyMaxHp ??= [])[osty] = currentMax;
+     }
+ 
+     public void HealOsty(CombatPredictionSimulator simulator, Player player, int amount)
+@@ -121,8 +116,7 @@ internal sealed partial class SimulatedCombatState
+         Creature osty = GetOsty(player)
+             ?? throw new InvalidOperationException("治疗奥斯蒂时，玩家没有可供模拟的奥斯蒂实例。");
+         SimCreatureState state = simulator.State.GetCreature(osty);
+-        int maxHp = _simulatedOstyMaxHp?.GetValueOrDefault(osty) ?? state.MaxHp;
+-        state.CurrentHp = Math.Min(maxHp, state.CurrentHp + Math.Max(0, amount));
++        state.CurrentHp = Math.Min(state.MaxHp, state.CurrentHp + Math.Max(0, amount));
+     }
+ 
+     public int GetOstyMaxHp(CombatPredictionSimulator simulator, Player player)
+@@ -130,8 +124,7 @@ internal sealed partial class SimulatedCombatState
+         Creature? osty = GetOsty(player);
+         if (osty == null)
+             return 0;
+-        return _simulatedOstyMaxHp?.GetValueOrDefault(osty)
+-            ?? simulator.State.GetCreature(osty).MaxHp;
++        return simulator.State.GetCreature(osty).MaxHp;
+     }
+ 
+     public bool IsOstyHittable(CombatPredictionSimulator simulator, Player player)
+@@ -579,7 +572,6 @@ internal sealed partial class SimulatedCombatState
+     {
+         AddCreatureIntMap(ref fingerprint, 'c', _cardsPlayedThisTurn);
+         AddCreatureIntMap(ref fingerprint, 'm', _manualCardsPlayedThisTurn);
+-        AddCreatureIntMap(ref fingerprint, 'o', _simulatedOstyMaxHp);
+ 
+         ulong first = 0;
+         ulong second = 0;
+diff --git a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.Fork.cs b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.Fork.cs
+index 74aa0c5..fc2370f 100644
+--- a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.Fork.cs
++++ b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.Fork.cs
+@@ -79,7 +79,6 @@ internal sealed partial class SimulatedCombatState
+             _historyCourseAttackWindows = _historyCourseAttackWindows is null ? null : new(_historyCourseAttackWindows),
+             _statefulRelicStates = _statefulRelicStates?.Fork(),
+             _simulatedOsties = _simulatedOsties?.Fork(),
+-            _simulatedOstyMaxHp = _simulatedOstyMaxHp?.Fork(),
+             _cardsPlayedThisTurn = _cardsPlayedThisTurn?.Fork(),
+             _manualCardsPlayedThisTurn = _manualCardsPlayedThisTurn?.Fork(),
+             _fetchCardsPlayedThisTurn = _fetchCardsPlayedThisTurn?.Fork(),
+diff --git a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.ReactiveRelics.cs b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.ReactiveRelics.cs
+--- a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.ReactiveRelics.cs
++++ b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.ReactiveRelics.cs
+@@ -294,7 +294,8 @@
+         int historyEntryStart)
+     {
+         foreach (CombatPredictionHistoryEntry entry in simulator.History.EntriesFrom(historyEntryStart))
+-            RecordRelicDamageEntry(entry);
++            if (entry is CombatPredictionDamageReceivedEntry hit && hit.Receiver.Player == player)
++                RecordRelicDamageEntry(entry);
+         foreach (EmotionChip relic in RelicsOf(player).OfType<EmotionChip>().Where(static relic => !relic.IsMelted))
+         {
+             StatefulRelicState state = GetStatefulRelicState(relic);
+diff --git a/src/CoopBots.Kernel/Vendor/Prediction/MonsterMoveEffects.cs b/src/CoopBots.Kernel/Vendor/Prediction/MonsterMoveEffects.cs
+index 9c8d7d3..02dde9f 100644
+--- a/src/CoopBots.Kernel/Vendor/Prediction/MonsterMoveEffects.cs
++++ b/src/CoopBots.Kernel/Vendor/Prediction/MonsterMoveEffects.cs
+@@ -53,7 +53,7 @@ internal static partial class MonsterMoveEffects
+             ("Myte", "TOXIC_MOVE") or
+             ("Myte", "SUCK_MOVE") or
+             ("Nibbit", "SLICE_MOVE") or
+-            ("Chomper", "SCREECH_MOVE") or
++            ("Chomper", "CLAMP_MOVE" or "SCREECH_MOVE") or
+             ("MagiKnight", "POWER_SHIELD_MOVE") or
+             ("MagiKnight", "PREP_MOVE") or
+             ("MechaKnight", "FLAMETHROWER_MOVE") or
+@@ -529,6 +529,9 @@ internal static partial class MonsterMoveEffects
+             case ("Nibbit", "SLICE_MOVE"):
+                 GainBlock(simulator, move.Owner, combat.GetMonsterStaticInt(move.Owner, "SliceBlock"));
+                 return true;
++            // Damage is handled by the intent pass; Clamp has no other effect.
++            case ("Chomper", "CLAMP_MOVE"):
++                return true;
+             case ("Chomper", "SCREECH_MOVE"):
+                 foreach (var partyTarget in targets)
+                     simulator.AddToCombat<Dazed>(partyTarget, PileType.Discard, 3, null);
+diff --git a/src/CoopBots.Kernel/Vendor/Prediction/MonsterValueReader.cs b/src/CoopBots.Kernel/Vendor/Prediction/MonsterValueReader.cs
+--- a/src/CoopBots.Kernel/Vendor/Prediction/MonsterValueReader.cs
++++ b/src/CoopBots.Kernel/Vendor/Prediction/MonsterValueReader.cs
+@@ -26,11 +26,21 @@
+         const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+         ParameterExpression input = Expression.Parameter(typeof(MonsterModel), "monster");
+         UnaryExpression typed = Expression.Convert(input, type);
+-        MemberExpression member = type.GetProperty(name, flags) is PropertyInfo property
++        MemberExpression? member = type.GetProperty(name, flags) is PropertyInfo property
+             ? Expression.Property(typed, property)
+             : type.GetField(name, flags) is FieldInfo field
+                 ? Expression.Field(typed, field)
+-                : throw new MissingMemberException(type.FullName, name);
++                : null;
++        if (member == null)
++        {
++            // A game update can turn the same integer field into a constant.
++            const BindingFlags staticFlags = BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
++            if (type.GetField(name, staticFlags) is { IsLiteral: true } constant
++                && constant.GetRawConstantValue() is int literal)
++                return _ => literal;
++            throw new MissingMemberException(type.FullName, name);
++        }
++
+         Expression value = member.Type == typeof(int) ? member : Expression.Convert(member, typeof(int));
+         return Expression.Lambda<Func<MonsterModel, int>>(value, input).Compile();
+     }

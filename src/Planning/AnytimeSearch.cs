@@ -11,39 +11,111 @@ namespace CoopSolver;
 // Only the current traversal, rollout and verification need mutable forks.
 internal sealed partial class AnytimeSearch : IDisposable
 {
-    private sealed record Edge(TreeStep? Exact,KernelTeamSearch.Action? Prior)
+    internal sealed record Edge(TreeStep? Exact,KernelTeamSearch.Action? Prior,SavedStep? Saved=null)
     {
+        private static bool SameList<T>(IReadOnlyList<T>? a,IReadOnlyList<T>? b)=>
+            ReferenceEquals(a,b) || a!=null && b!=null && a.SequenceEqual(b);
+        private static bool SameChoices(IReadOnlyList<KernelChoice>? a,IReadOnlyList<KernelChoice>? b)
+        {
+            if(ReferenceEquals(a,b))return true;
+            if(a==null || b==null || a.Count!=b.Count)return false;
+            for(int i=0;i<a.Count;i++)
+            {
+                var x=a[i];var y=b[i];
+                if(ReferenceEquals(x,y))continue;
+                if(x.Owner!=y.Owner || x.Source!=y.Source || x.Effect!=y.Effect || x.Pile!=y.Pile || x.Context!=y.Context ||
+                    x.Minimum!=y.Minimum || x.Maximum!=y.Maximum || x.RequestedMinimum!=y.RequestedMinimum ||
+                    x.RequestedMaximum!=y.RequestedMaximum || x.MenuSource!=y.MenuSource || x.Timing!=y.Timing ||
+                    x.NativeRound!=y.NativeRound || x.PlayerTurnNumber!=y.PlayerTurnNumber ||
+                    !SameList(x.Cards,y.Cards) || !SameList(x.Options,y.Options))return false;
+            }
+            return true;
+        }
+        private static bool SameTurn(KernelTurnStartChoiceContract? a,KernelTurnStartChoiceContract? b)=>
+            ReferenceEquals(a,b) || a!=null && b!=null && a.FromRound==b.FromRound && a.ToRound==b.ToRound &&
+            a.Complete==b.Complete && a.OwnersTurnNumbers.Count==b.OwnersTurnNumbers.Count &&
+            a.OwnersTurnNumbers.All(p=>b.OwnersTurnNumbers.TryGetValue(p.Key,out int n) && n==p.Value) && SameChoices(a.Choices,b.Choices);
+        internal bool Matches(Edge? other)
+        {
+            if(ReferenceEquals(this,other))return true;
+            if(other==null)return false;
+            if(Exact!=null || other.Exact!=null)
+                return Exact!=null && other.Exact!=null && Exact.Move==other.Exact.Move &&
+                    Exact.Digits.AsSpan().SequenceEqual(other.Exact.Digits) && Exact.MenuEvidence==other.Exact.MenuEvidence;
+            if(Saved is {} s && other.Saved is {} t)
+                return s.Seat==t.Seat && s.Id==t.Id && s.Slot==t.Slot && s.Target==t.Target && s.Key==t.Key && s.Occurrence==t.Occurrence &&
+                    SameList(s.Ordinals,t.Ordinals) && SameChoices(s.Choices,t.Choices) && SameTurn(s.Turn,t.Turn);
+            return SameAction(Prior,other.Prior);
+        }
+        internal static bool SameAction(KernelTeamSearch.Action? a,KernelTeamSearch.Action? b)
+        {
+            if(a==null || b==null)return false;
+            return ReferenceEquals(a,b) || ReferenceEquals(a.Player,b.Player) && ReferenceEquals(a.Card,b.Card) &&
+                ReferenceEquals(a.Target,b.Target) && ReferenceEquals(a.Potion,b.Potion) && a.EndTurn==b.EndTurn &&
+                a.CardStateKey==b.CardStateKey && a.CardStateOccurrence==b.CardStateOccurrence &&
+                SameList(a.ChoiceOrdinals,b.ChoiceOrdinals) && SameChoices(a.Choices,b.Choices) && SameTurn(a.TurnStartChoices,b.TurnStartChoices);
+        }
         internal bool Replay(KernelSession state,out KernelTeamSearch.Action? action,out string reason)
         {
             if(Exact!=null)return ActionFrontier.Replay(state,Exact,out action,out reason);
-            return state.ReplayPlanned(Prior!,int.MaxValue,out reason,out action);
+            var next=Prior??Saved?.Bind(state);
+            if(next==null){action=null;reason="保存的动作与当前盘面不符";return false;}
+            return state.ReplayPlanned(next,int.MaxValue,out reason,out action);
         }
     }
-    private sealed class Node(Node? parent=null,Edge? step=null)
+    internal sealed class Node(Node? parent=null,Edge? step=null)
     {
+        internal bool IsBattleRoot;
+        internal int Created=1;
+        private static int DepthAt(Node? parent)
+        {
+            if(parent==null)return 0;
+            if(parent.SharedRoot is {} tree)tree.Created++;
+            else if(parent.IsBattleRoot)parent.Created++;
+            return parent.Depth+1;
+        }
+        internal readonly Node? SharedRoot=parent?.SharedRoot??(parent?.IsBattleRoot==true?parent:null);
         internal Node? Parent=parent;
         internal Edge? Step=step;
         internal readonly List<Node> Children=new();
         internal ActionFrontier? Frontier;
-        internal bool Closed;
+        internal List<Node>? Legal;
+        internal int Families;
+        internal double Share;
+        internal bool MenuGap,UnknownMenu;
+        internal NodeEvidence? Evidence;
+        internal void ResetMenu()
+        {
+            Frontier=null;Legal=null;MenuGap=UnknownMenu=false;Families=0;Evidence=null;
+        }
+        internal bool Closed,HasFreeWin,Compacted;
+        internal Node? BestTerminal;
+        internal TerminalRecord? ReachedEnd;
+        internal int Turn;
         internal int Visits;
-        internal long DirectWork;
+        internal long DirectWork,SubtreeWork;
+        internal Node? Observed,RecipeSource;
+        internal object? WalkStamp;
+        internal int RecipeCursor;
         internal double Sum;
-        internal int Depth=parent==null?0:parent.Depth+1;
+        internal int Depth=DepthAt(parent);
         internal ulong Shape;
     }
 
-    private sealed record Proposal(Edge[] Prefix,IReadOnlyList<KernelTeamSearch.Action> Tail,TerminalRecord Ending,string Origin);
+    private sealed record Proposal(Edge[] Prefix,IReadOnlyList<KernelTeamSearch.Action> Tail,TerminalRecord Ending,string Origin)
+    {internal bool Verified;}
     private sealed record Checkpoint(Node Node,KernelSession? State);
     private readonly KernelSession root;
     private readonly Player[] party;
     private Node top=new();
+    internal Node MemoryRoot=>top;
+    private SearchTreeMemory? treeMeter;
+    internal void TrackTree(SearchTreeMemory meter){treeMeter=meter;if(HelperMeter!=null)HelperMeter.Memory=meter;meter.Attach(this);}
     private readonly Dictionary<string,int> boundaries=new();
     private readonly int initialEnemyHp;
     private readonly int initialBottles;
     private readonly double teamMaxHp;
-    private IEnumerator<Proposal?>? potionTrials;
-    internal long VisitTicks, RolloutTicks, VerifyTicks, PotionTrialTicks;
+    internal long VisitTicks, RolloutTicks, VerifyTicks;
     internal int VisitSteps, RolloutSteps;
     private readonly bool useRoundSearch;
     internal int BestBottlesLeft {get;private set;}
@@ -51,11 +123,13 @@ internal sealed partial class AnytimeSearch : IDisposable
     private KernelSession? working;
     private Node? position;
     private RolloutRun? rollout;
+    private long rolloutWork;
     private Node? rolloutRoot;
     private Proposal? verifying;
     private KernelSession? replay;
     private int replayIndex;
     private readonly List<KernelTeamSearch.Action> replayed=new();
+    private readonly List<long> replayWork=new();
     private Proposal? waitingTie;
     private readonly Queue<Proposal> waitingWins=new();
     private Proposal? waitingLoss;
@@ -69,9 +143,20 @@ internal sealed partial class AnytimeSearch : IDisposable
     internal KernelPlanningState[] BestTrail {get;private set;}=Array.Empty<KernelPlanningState>();
     private readonly ulong[] controlled;
     private int cadence, policies;
-    private int walks, anchorIndex, verificationRound;
+    private int walks, anchorIndex, verificationRound, lastHurtTurn, lateRolloutStarts, lateAnchorStarts;
+    private bool deferTail;
+    private int lastPaidStep,previousBottles,previousRevive;
+    private int[] previousVerificationHp=Array.Empty<int>();
+    internal const int CoveredStride=16;
+    internal long CoveredTreeExpansions {get;private set;}
+    internal long CoveredRoundExpansions {get;private set;}
+    private void UpdateFocus()
+    {
+        lastHurtTurn=Best?.Record?.Victory==true?
+            BestRoundHp.Where(r=>r.Loss.Any(n=>n>0)).Select(r=>r.Round).DefaultIfEmpty(0).Max():0;
+    }
     private readonly List<Checkpoint> anchors=new();
-    private readonly List<(int Index,KernelSession? State)> pendingAnchors=new();
+    private readonly List<(int Index,int Turn,KernelSession? State)> pendingAnchors=new();
     private Stack<Node>? replayToAnchor;
     internal int RoundAnchorCount=>anchors.Count;
     private readonly HashSet<string> replayRisks=new();
@@ -90,11 +175,14 @@ internal sealed partial class AnytimeSearch : IDisposable
     internal int TruncatedRollouts {get;private set;}
     internal int Replays {get;private set;}
     internal int RejectedReplays {get;private set;}
-    internal bool Finished=>top.Closed && rollout==null && verifying==null && waitingWins.Count==0 && waitingTie==null && waitingLoss==null && potionTrials==null && seedReader==null && (!useRoundSearch || !HasRoundWork);
+    internal bool Finished=>top.Closed && savingTrial==null && rollout==null && verifying==null && waitingWins.Count==0 && waitingPotions.Count==0 && waitingTie==null && waitingLoss==null && seedReader==null && (!useRoundSearch || !HasRoundWork);
     internal IReadOnlyDictionary<string,int> Boundaries=>boundaries;
     internal TournamentResult? Best {get;private set;}
     internal event Action? IncumbentChanged;
 
+    internal Move? RequiredFirst;
+    private ActionFrontier NewFrontier(KernelSession state,bool first)=>first && RequiredFirst is {} forced?
+        new ActionFrontier(state,forced):new ActionFrontier(state,Boundary);
     private readonly bool useRollouts;
 
     internal AnytimeSearch(KernelSession start,bool useRollouts=true,bool useRoundSearch=true,int roundSeed=171)
@@ -114,28 +202,37 @@ internal sealed partial class AnytimeSearch : IDisposable
         if(string.IsNullOrWhiteSpace(reason)) reason="未报告原因的模拟边界";
         boundaries[reason]=boundaries.GetValueOrDefault(reason)+1;
     }
-    private static Edge[] Path(Node leaf)
+    private Edge[] Path(Node leaf)
     {
-        var path=new Edge[leaf.Depth];
-        for(var n=leaf;n.Parent!=null;n=n.Parent) path[n.Depth-1]=n.Step!;
+        var path=new Edge[leaf.Depth-top.Depth];
+        for(var n=leaf;n!=top;n=n.Parent!)path[n.Depth-top.Depth-1]=n.Step!;
         return path;
     }
     internal double Estimate(KernelSession state)
     {
+        if(state.HasTerminal)return TreeReward(WithInventory(TerminalRecord.Capture(state,party,true,""),state));
 
-        double life=party.Average(p=>Math.Clamp(state.Hp(p.Creature)/(double)Math.Max(1,state.MaxHp(p.Creature)),0,1));
-        double alive=party.Count(p=>state.Hp(p.Creature)>0)/(double)party.Length;
-        double damage=1-Math.Clamp(state.RemainingOpposition().Hp/(double)initialEnemyHp,0,1);
-        double potions=party.Sum(state.HeldPotionCount)/(double)Math.Max(1,initialBottles);
-        double enemyProgress=1-state.Enemies.Sum(e=>Math.Clamp(state.Hp(e)/(double)Math.Max(1,state.MaxHp(e)),0,1))/
-            Math.Max(1,root.Enemies.Count);
-        return 0.30*damage+0.20*Math.Clamp(enemyProgress,0,1)+0.26*life+0.20*alive+0.04*Math.Min(1,potions);
+        return ScoreFeatures(ReadFeatures(state));
     }
     private TerminalRecord WithInventory(TerminalRecord ending,KernelSession state)
-        => ending with {ResourcesConsumed=initialBottles-party.Sum(state.HeldPotionCount)};
+        => DeathSaves.WithInventory(ending,root,state);
 
+    // Verified records retain pre-cleanup HP for replay. The adjustment is
+    // actual recovery less the native one-HP return for each fallen teammate.
+    internal static double HealthValue(TerminalRecord ending)=>ending.PostCombatHp.Sum()-ending.ConsumablePreservationPremium;
     internal static int Compare(TerminalRecord a,TerminalRecord b)
-        => TerminalComparer.Compare(a,b,KernelPotionPolicy.Objective);
+    {
+        if(a is {Victory:false,Verified:true} && b is {Victory:false,Verified:true} && a.RemainingEnemyHp!=b.RemainingEnemyHp)
+            return b.RemainingEnemyHp.CompareTo(a.RemainingEnemyHp);
+        if(a is not {Victory:true,Verified:true} || b is not {Victory:true,Verified:true})
+            return TerminalComparer.Compare(a,b,KernelPotionPolicy.Objective);
+        int theft=b.OutstandingStolenResource.CompareTo(a.OutstandingStolenResource);
+        if(theft!=0)return theft;
+        int hp=HealthValue(a).CompareTo(HealthValue(b));
+        if(hp!=0)return hp;
+        int bottles=b.ResourcesConsumed.CompareTo(a.ResourcesConsumed);
+        return bottles!=0?bottles:a.PostCombatHp.Sum().CompareTo(b.PostCombatHp.Sum());
+    }
 
     internal static int ComparePlans(TerminalRecord a,int stepsA,TerminalRecord b,int stepsB,HudRoundHp[]? roundsA=null,HudRoundHp[]? roundsB=null)
     {
@@ -160,93 +257,83 @@ internal sealed partial class AnytimeSearch : IDisposable
 
     internal static double WinReward(TerminalRecord ending,double teamMaxHp)
     {
-        // All wins exceed the unfinished-state range [0,1]. Within each surviving
-        // seat count, map utility monotonically to (0,1) without clipping gains.
-        double utility=TerminalComparer.ResourceUtility(ending,KernelPotionPolicy.Objective);
+        // Preserve the ordering by stolen resources, effective team HP and bottles.
+        double utility=HealthValue(ending)+0.25/(1+ending.ResourcesConsumed);
         double resources=0.5+Math.Atan(utility/teamMaxHp)/Math.PI;
         double withinSeats=1.0/(2+ending.OutstandingStolenResource-resources);
-        int seats=ending.PostCombatHp.Count;
-        return 1+(seats-ending.IrreversibleLoss+withinSeats)/(seats+1);
+        return 1+withinSeats;
     }
 
-    private IEnumerable<Proposal?> RefineWin(IReadOnlyList<KernelTeamSearch.Action> line)
+    // A settled defeat is ranked by remaining opposition. Simulation source and
+    // unused bottles cannot change that order. Scale by the same opening for all branches.
+    internal static double DefeatReward(int enemyHp,int openingHp)=>
+        -(double)enemyHp/(Math.Max(1,openingHp)+(double)enemyHp);
+
+    private double TerminalValue(TerminalRecord ending)=>ending.Victory?WinReward(ending,teamMaxHp)
+        :DefeatReward(ending.RemainingEnemyHp,InSharedTree?baselineEnemyHp:initialEnemyHp);
+
+    private double TreeReward(TerminalRecord record)=>TerminalValue(focusCursor && record.Victory?
+        record with {ResourcesConsumed=record.ResourcesConsumed+inheritedBottlesUsed,
+            ConsumablePreservationPremium=record.ConsumablePreservationPremium+inheritedReviveCost}:record);
+
+    // Rollouts can switch to another simulation fork while resolving an action.
+    // Bind both the outcome and its resource ledger to the completed run.
+    internal TerminalRecord RolloutEnding(RolloutRun run)=>WithInventory(run.Result!.Record,run.State);
+    private static void CreditWork(Node node,long work)
     {
-        foreach(var trial in TrySavingPotions(line))yield return trial;
-        if(line.Count==0 || !line[0].EndTurn)yield break;
-        var actor=line[0].Player;
-        int initial=root.RemainingOpposition().Hp;
-        foreach(var family in new ActionFrontier(root,Boundary).Families)
+        if(work<=0)return;
+        node.DirectWork+=work;
+        for(Node? n=node;n!=null;n=n.Parent)System.Threading.Interlocked.Add(ref n.SubtreeWork,work);
+    }
+    // The playout was already charged to its starting node. Once its path is retained,
+    // move one actual played action to each edge. Alternative previews stay at the start.
+    private static void AttributeCommittedMoves(Node start,Node tip,int steps,long charged)
+    {
+        if(steps==0 || steps>charged)return;
+        start.DirectWork-=steps;
+        long suffix=0;
+        for(var n=tip;n!=start;n=n.Parent!)
         {
-            if(family.Move.Kind!=MoveKind.Card || party[family.Move.Seat]!=actor)continue;
-            var state=root.ForkForReplay();
-            bool played=family.Expand(state,out var extra,out _,out _);
-            yield return null;
-            if(!played || state.RemainingOpposition().Hp>=initial)continue;
-            var tail=new List<KernelTeamSearch.Action>();
-            foreach(var old in line)
-            {
-                if(state.HasTerminal || !state.ReplayPlanned(old,int.MaxValue,out _,out var action))break;
-                tail.Add(action!);yield return null;
-            }
-            if(state.HasWon)
-            {
-                var ending=WithInventory(TerminalRecord.Capture(state,party,true,""),state);
-                yield return new(new[]{new Edge(extra,null)},tail,ending,"early-damage");
-            }
+            n.DirectWork++;
+            System.Threading.Interlocked.Add(ref n.SubtreeWork,++suffix);
         }
     }
-
-    private IEnumerable<Proposal?> TrySavingPotions(IReadOnlyList<KernelTeamSearch.Action> line)
-    {
-        for(int omit=0;omit<line.Count;omit++)
-        {
-            if(line[omit].Potion==null)continue;
-            var state=root.ForkForReplay();
-            var actual=new List<KernelTeamSearch.Action>(line.Count-1);
-            for(int i=0;i<line.Count && !state.HasTerminal;i++)
-            {
-                if(i==omit)continue;
-                if(!state.ReplayPlanned(line[i],int.MaxValue,out _,out var action))break;
-                actual.Add(action!);
-                yield return null;
-            }
-            if(state.HasWon)
-            {
-                var ending=WithInventory(TerminalRecord.Capture(state,party,true,""),state);
-                yield return new Proposal(Array.Empty<Edge>(),actual,ending,"potion-omission");
-            }
-            yield return null;
-        }
-    }
-
-    private static void Record(Node node,double value)
+    private void Record(Node node,double value)
     {
         for(Node? n=node;n!=null;n=n.Parent){n.Visits++;n.Sum+=value;}
+        if(focusCursor)battle!.LiveBackups++;
     }
-    private void Submit(Proposal proposal)
+    private void Submit(Proposal proposal,Node? tip=null)
     {
         if(!proposal.Ending.Verified)return;
+        if((TrackEvidence || InSharedTree) && proposal.Origin is not ("reference" or "prefix-reference" or "solved-subtree" or "potion-omission"))
+        {
+            tip??=Descend(top,proposal.Prefix.Concat(proposal.Tail.Select(a=>new Edge(null,a))));
+            RememberTerminal(tip,proposal.Ending);
+        }
         // External records can count potion actions instead of terminal inventory.
         // A winning reference needs replay before we can compare the two belts.
-        bool needsInventory=proposal.Origin=="reference" && proposal.Ending.Victory;
+        bool needsInventory=(proposal.Origin is "reference" or "prefix-reference") && proposal.Ending.Victory;
         if(!needsInventory && Best?.Record is {} old)
         {
             int rank=ComparePlans(proposal.Ending,0,old,0);
-            if(rank<0)return;
+            if(rank<0){QueuePotionAlternative(proposal);return;}
             if(rank==0)
             {
                 if(proposal.Ending.Victory && old.Victory && proposal.Ending.ResourcesConsumed==old.ResourcesConsumed &&
                     proposal.Ending.PostCombatHp.SequenceEqual(old.PostCombatHp) &&
                     proposal.Ending.ConsumablePreservationPremium==old.ConsumablePreservationPremium)
                 {
-                    if(proposal.Origin=="early-damage")waitingWins.Enqueue(proposal);
-                    else waitingTie??=proposal;
+                    waitingTie??=proposal;
                 }
+                QueuePotionAlternative(proposal);
                 return;
             }
         }
         if(proposal.Ending.Victory)waitingWins.Enqueue(proposal);
-        else if(waitingLoss==null || Compare(proposal.Ending,waitingLoss.Ending)>0)waitingLoss=proposal;
+        else if(waitingLoss==null)waitingLoss=proposal;
+        else if(Compare(proposal.Ending,waitingLoss.Ending)>0){QueuePotionAlternative(waitingLoss);waitingLoss=proposal;}
+        else QueuePotionAlternative(proposal);
     }
     internal void KeepBestFromSameRoot(AnytimeSearch previous)
     {
@@ -254,6 +341,7 @@ internal sealed partial class AnytimeSearch : IDisposable
         if(previous.Best==null)return;
         BestRoundHp=previous.BestRoundHp;BestKills=previous.BestKills;BestRecipes=previous.BestRecipes;BestFirstHp=previous.BestFirstHp;BestTrail=previous.BestTrail;Best=previous.Best;BestOrigin=previous.BestOrigin;BestRisks=previous.BestRisks;
         BestBottlesLeft=previous.BestBottlesLeft;BestTurnNumber=previous.BestTurnNumber;
+        UpdateFocus();
         if(Best.Record is {} ending && Best.Script is {} tail)
         {
             var proposal=new Proposal(Array.Empty<Edge>(),tail,ending,"retained-best");
@@ -271,23 +359,12 @@ internal sealed partial class AnytimeSearch : IDisposable
     {
         var watch=Stopwatch.StartNew();
         if(helperResults.TryDequeue(out var completed))completed();
-        while(recovery!=null)
-        {
-            if(!recovery.MoveNext()){recovery.Dispose();recovery=null;break;}
-            if(watch.Elapsed>=slice)return;
-        }
+        if(!ResumeRecovery(watch,slice))return;
         bool hadWin=Best?.Record?.Victory==true;
         do
         {
             // Give all three jobs service without waiting for one playout to finish.
-            if(verifying==null && (waitingWins.Count>0 || waitingTie!=null || waitingLoss!=null))
-            {
-                if(waitingWins.TryDequeue(out var win))verifying=win;
-                else if(waitingTie!=null){verifying=waitingTie;waitingTie=null;}
-                else {verifying=waitingLoss;waitingLoss=null;}
-                replay=root.ForkForReplay();replayIndex=0;replayed.Clear();
-                pendingAnchors.Clear();replayedShapes.Clear();verifyingStates.Clear();verificationDeaths=new(root);verifyingFirstHp=null;replayRisks.Clear();verificationRound=replay.RoundsAdvanced;
-            }
+            StartNextProposal();
             cadence=(cadence+1)%4;
             long started=Stopwatch.GetTimestamp();
             if(seedReader!=null && cadence==1)
@@ -301,14 +378,9 @@ internal sealed partial class AnytimeSearch : IDisposable
                 VerifyOne();
                 VerifyTicks+=Stopwatch.GetTimestamp()-started;
             }
-            else if(potionTrials!=null && (cadence==2 || top.Closed && rollout==null))
-            {
-                if(!potionTrials.MoveNext()){potionTrials.Dispose();potionTrials=null;}
-                else if(potionTrials.Current is {} trial)Submit(trial);
-                PotionTrialTicks+=Stopwatch.GetTimestamp()-started;
-            }
             // One policy step may preview many cards across all three seats.
             // Meter real work, otherwise a cheap walk gets just one call per costly step.
+            else if(savingTrial!=null && cadence==1)AdvancePotionSavings();
             else if(useRoundSearch && HasRoundWork && (top.Closed || RoundTicks<=3*VisitTicks))
             {
                 RoundOne();
@@ -317,10 +389,7 @@ internal sealed partial class AnytimeSearch : IDisposable
             else if(rollout!=null && (top.Closed || (useRoundSearch
                 ? RolloutTicks*5<=RoundTicks+VisitTicks : RolloutTicks<=2*VisitTicks)))
             {
-                var leaf=rolloutRoot;
-                long before=SimulationMeter.ThreadActions;
                 RollOne();
-                if(leaf!=null)leaf.DirectWork+=SimulationMeter.ThreadActions-before;
                 RolloutSteps++;
                 RolloutTicks+=Stopwatch.GetTimestamp()-started;
             }
@@ -328,8 +397,8 @@ internal sealed partial class AnytimeSearch : IDisposable
             {
                 var accountingNode=position??top;
                 long before=SimulationMeter.ThreadActions;
-                VisitOne();
-                accountingNode.DirectWork+=SimulationMeter.ThreadActions-before;
+                VisitOne(ref accountingNode);
+                CreditWork(accountingNode,SimulationMeter.ThreadActions-before);
                 VisitSteps++;
                 VisitTicks+=Stopwatch.GetTimestamp()-started;
             }
@@ -338,123 +407,226 @@ internal sealed partial class AnytimeSearch : IDisposable
         }while(watch.Elapsed<slice);
     }
 
-    private void VisitOne()
+    internal static double SelectionScore(Node child,int parentVisits,double? reachedValue=null)
+    {
+        if(child.Visits==0)return double.PositiveInfinity;
+        double value=reachedValue??child.Sum/child.Visits;
+        return value+0.7*Math.Sqrt(Math.Log(parentVisits+1)/child.Visits);
+    }
+
+    private double? ReachedValue(Node child)
+    {
+        if(child.BestTerminal?.ReachedEnd is not {Verified:true} end)return null;
+        // Cached terminals already include any comparable opening prefix. This
+        // is a selection hint only; a cached line must still replay to be shown.
+        return TerminalValue(end);
+    }
+
+    private void VisitOne(ref Node accountingNode)
     {
         if(working==null)
         {
             position=top;working=root;
-            // Keep most new traversals free to change the opening. One in eight
-            // can start deeper on the incumbent without replaying its prefix.
-            if(++walks%8==0 && anchors.Count>0)
+            Checkpoint? anchor;
+            do
             {
-                var anchor=anchors[anchorIndex++%anchors.Count];
-                if(!anchor.Node.Closed)
+                walks++;
+                anchor=walks%8==0 && anchors.Count!=0?anchors[anchorIndex++%anchors.Count]:null;
+            }while(!Simplifying && anchor!=null && !anchor.Node.Closed && anchor.Node.HasFreeWin &&
+                ++lateAnchorStarts%CoveredStride!=0);
+            deferTail=!Simplifying && walks%CoveredStride!=0;
+            if(anchor!=null && !anchor.Node.Closed)
+            {
+                AnchorVisits++;
+                if(anchor.State!=null){position=anchor.Node;working=anchor.State;}
+                else
                 {
-                    AnchorVisits++;
-                    if(anchor.State!=null){position=anchor.Node;working=anchor.State;}
-                    else
-                    {
-                        replayToAnchor=new Stack<Node>();
-                        for(var n=anchor.Node;n.Parent!=null;n=n.Parent)replayToAnchor.Push(n);
-                    }
+                    replayToAnchor=new Stack<Node>();
+                    for(var n=anchor.Node;n!=top;n=n.Parent!)replayToAnchor.Push(n);
                 }
             }
             working=working.ForkForReplay();
         }
         if(replayToAnchor!=null && replayToAnchor.TryPop(out var transit))
         {
-            if(transit.Step!.Replay(working,out _,out var reason))position=transit;
+            if(transit.Step!.Replay(working,out _,out var reason))accountingNode=position=transit;
             else {Boundary(reason);replayToAnchor.Clear();working=null;position=null;}
             if(replayToAnchor.Count==0)replayToAnchor=null;
             return;
         }
-        var node=position!;
+        var node=accountingNode=position!;
+        node.Turn=working.TurnNumber;
+        if(TrackEvidence && !Simplifying && deferTail && node!=top && Facts(node).Solved is {} solution)
+        {
+            OfferSolution(node,solution);Record(node,TreeReward(solution.Ending));
+            working=null;position=null;return;
+        }
         if(working.HasTerminal)
         {
             node.Closed=true;
             Submit(new(Path(node),Array.Empty<KernelTeamSearch.Action>(),
-                WithInventory(TerminalRecord.Capture(working,party,true,""),working),"retained-tree"));
+                WithInventory(TerminalRecord.Capture(working,party,true,""),working),"retained-tree"),node);
             working=null;position=null;return;
         }
-        node.Frontier??=new ActionFrontier(working,Boundary);
+        var source=node.Observed??node.RecipeSource;
+        if(source!=null && node.RecipeCursor<source.Children.Count)
+        {
+            var saved=source.Children[node.RecipeCursor++];
+            var edge=saved.Step!;
+            var trial=working.ForkForReplay();
+            if(edge.Replay(trial,out _,out _))
+            {
+                var child=accountingNode=Descend(node,new[]{edge});
+                if(!ReferenceEquals(child,saved))child.RecipeSource=saved;
+                Record(child,Estimate(trial));
+                if(trial.HasTerminal)Submit(new(Path(child),Array.Empty<KernelTeamSearch.Action>(),WithInventory(TerminalRecord.Capture(trial,party,true,""),trial),"observed-continuation"),child);
+            }
+            position=null;working=null;return;
+        }
+        if(TrackEvidence)OpenMenu(node,working);
+        else if(node.Frontier==null){node.Frontier=NewFrontier(working,node==top);CountReopened(node);}
         int width=1+(int)(2*Math.Sqrt(node.Visits+1));
-        if(!node.Frontier.Finished && (node.Children.Count<width || node.Children.All(n=>n.Closed)))
+        if(!node.Frontier!.Finished && (node.Children.Count<width || node.Children.All(n=>n.Closed)))
         {
             var branch=working.ForkForReplay();
-            if(node.Frontier.Expand(branch,out var step,out _,out var reason))
+            if(node.HasFreeWin)CoveredTreeExpansions++;
+            TreeStep? step;string reason;Node? registered=null;
+            bool expanded=TrackEvidence?ExpandMenu(node,branch,out registered,out step,out _,out reason):
+                node.Frontier.Expand(branch,out step,out _,out reason);
+            if(expanded)
             {
-                var known=ReusedNodes==0 && !importedEdges?null:node.Children.FirstOrDefault(c=>c.Step?.Exact is {} prior &&
-                    prior.Move==step!.Move && prior.Digits.AsSpan().SequenceEqual(step.Digits) && prior.MenuEvidence==step.MenuEvidence);
-                var child=known??new Node(node,new Edge(step,null));
+                var known=registered??FindChild(node,new(step,null));
+                var child=accountingNode=known??new Node(node,new Edge(step,null));
+                child.Turn=branch.TurnNumber;
                 if(step!.Move.Kind==MoveKind.Potion)
                 {
                     if(working.RoundsAdvanced==0)OpeningPotionEdges++;else LaterPotionEdges++;
                 }
-                if(FollowEnabled)Index(child,ShapeOf(branch));
-                if(known==null){node.Children.Add(child);Nodes++;OfferBranch(child);}
+                ulong shape=FollowEnabled || verifiedJoins!=null?ShapeOf(branch):0;
+                if(FollowEnabled)Index(child,shape);
+                if(known==null){node.Children.Add(child);Nodes++;}
                 MaxDepth=Math.Max(MaxDepth,child.Depth);
                 if(branch.HasTerminal)
                 {
                     child.Closed=true;
                     var path=Path(child);
                     var terminal=WithInventory(TerminalRecord.Capture(branch,party,true,""),branch);
-                    Record(child,terminal.Victory?WinReward(terminal,teamMaxHp):Estimate(branch));
-                    Submit(new(path,Array.Empty<KernelTeamSearch.Action>(),terminal,"tree"));
+                    Record(child,TreeReward(terminal));
+                    Submit(new(path,Array.Empty<KernelTeamSearch.Action>(),terminal,"tree"),child);
                 }
                 else
                 {
-                    Record(child,Estimate(branch));
+                    var features=ReadFeatures(branch);
+                    Record(child,ScoreFeatures(features));
                     if(useRoundSearch && (pendingRoundSeed==null || Nodes%127==0))
                         pendingRoundSeed=child;
-                    if(useRollouts && rollout==null)
+                    // Spend fewer fresh playouts on alternatives to a verified free suffix.
+                    // Already-started continuations and terminal verification always finish.
+                    bool startRollout=Simplifying || !(node.HasFreeWin || child.HasFreeWin) || ++lateRolloutStarts%CoveredStride==0;
+                    if(startRollout && !QueueJoin(child,branch,shape))
                     {
-                        rolloutRoot=child;
-                        var policy=Policies[policies++%Policies.Length];
-                        rollout=new RolloutRun(branch,party,party,new RolloutOptions(policy){InvestmentLookahead=false,SequenceLookahead=false});
+                        if(useRollouts && rollout==null)
+                        {
+                            rolloutRoot=child;rolloutWork=0;
+                            var policy=Policies[policies++%Policies.Length];
+                            rolloutFeatures=features;rolloutPolicy=policy;
+                            rollout=new RolloutRun(branch,party,party,new RolloutOptions(policy){InvestmentLookahead=false,SequenceLookahead=false});
+                        }
+                        else TryExtraRollout(child,branch,features);
                     }
-                    else TryExtraRollout(child,branch);
+                    IndexJoinNode(child,shape);
                 }
             }
             else {Boundary(reason);Record(node,Estimate(working));}
             working=null;position=null;return;
         }
         Node? pick=null;
-        double highest=double.NegativeInfinity;
+        double highest=double.NegativeInfinity;int bestBand=int.MinValue;
         foreach(var c in node.Children)
         {
             if(c.Closed)continue;
-            double q=c.Sum/c.Visits+0.7*Math.Sqrt(Math.Log(node.Visits+1)/c.Visits);
-            if(q>highest){pick=c;highest=q;}
+            double q=SelectionScore(c,node.Visits,ReachedValue(c));
+            // Prefer untested continuations, keeping occasional ordinary UCT walks.
+            int band=deferTail && (c.HasFreeWin || TrackEvidence && Facts(c).Solved!=null)?-1:0;
+            if(deferTail && TrackEvidence && Target is {} target && Facts(c).Upper is {} upper && Compare(upper,target)<=0)
+                band-=2;
+            if(band>bestBand || band==bestBand && q>highest){pick=c;highest=q;bestBand=band;}
         }
         if(pick==null){node.Closed=true;working=null;position=null;return;}
         if(!pick.Step!.Replay(working,out _,out var mismatch))
         {
-            Boundary("重放分歧："+mismatch);pick.Closed=true;working=null;position=null;return;
+            Boundary("重放分歧："+mismatch);if(TrackEvidence)RejectState(pick);pick.Closed=true;working=null;position=null;return;
         }
-        position=pick;
+        position=accountingNode=pick;
     }
     private void RollOne()
     {
+        var leaf=rolloutRoot!;
+        long before=SimulationMeter.ThreadActions;
         try {rollout!.Step();}
         catch(Exception e) when(e is InvalidOperationException or NotSupportedException)
         {
             Boundary("续打："+e.GetBaseException().Message);
             rollout=null;rolloutRoot=null;return;
         }
+        finally
+        {
+            long work=SimulationMeter.ThreadActions-before;
+            rolloutWork+=work;CreditWork(leaf,work);
+        }
         if(!rollout.Done)return;
         var result=rollout.Result!;
-        var leaf=rolloutRoot!;
-        var ending=WithInventory(result.Record,rollout.State);
-        if(ending.Victory)Record(leaf,WinReward(ending,teamMaxHp));
+        var ending=RolloutEnding(rollout);
+        if(result.Terminal && rolloutFeatures!=null)LearnFromRollout(leaf,rolloutPolicy,rolloutFeatures,ending);
+        rolloutFeatures=null;
+        Node? rolloutTip=null;
+        if(InSharedTree)
+        {
+            var tip=rolloutTip=Descend(leaf,result.Actions.Select(a=>new Edge(null,a)));
+            AttributeCommittedMoves(leaf,tip,result.Actions.Count,rolloutWork);
+            Record(tip,result.Terminal?TreeReward(ending):Estimate(rollout.State));
+        }
+        else if(result.Terminal)Record(leaf,TreeReward(ending));
         else if(!useRoundSearch)Record(leaf,Estimate(rollout.State));
         if(result.Terminal)
         {
             var path=Path(leaf);
-            Submit(new(path,result.Actions,ending,"tree-rollout"));
+            Submit(new(path,result.Actions,ending,"tree-rollout"),rolloutTip);
         }
         else TruncatedRollouts++;
         CompletedRollouts++;
         rollout=null;rolloutRoot=null;
+    }
+    private void StartNextProposal()
+    {
+        if(verifying==null && (waitingWins.Count>0 || waitingPotions.Count>0 || waitingTie!=null || waitingLoss!=null))
+        {
+            if(waitingWins.TryDequeue(out var win))verifying=win;
+            else if(waitingLoss!=null){verifying=waitingLoss;waitingLoss=null;}
+            else if(waitingPotions.Count!=0){var entry=waitingPotions.First();waitingPotions.Remove(entry.Key);verifying=entry.Value;}
+            else {verifying=waitingTie;waitingTie=null;}
+            BeginVerification(verifying!);
+        }
+    }
+    internal bool HasPendingWin=>waitingWins.Count>0 || verifying?.Ending.Victory==true;
+    internal void VerifyPendingWin(TimeSpan slice)
+    {
+        if(waitingWins.Count==0 && verifying?.Ending.Victory!=true)return;
+        var timer=Stopwatch.StartNew();
+        do
+        {
+            if(verifying==null && waitingWins.Count==0)break;
+            StartNextProposal();
+            VerifyOne();
+        }while(timer.Elapsed<slice);
+    }
+    private void BeginVerification(Proposal candidate)
+    {
+        verifying=candidate;
+        replay=root.ForkForReplay();replayIndex=0;replayed.Clear();replayWork.Clear();
+        pendingAnchors.Clear();replayedShapes.Clear();verifyingStates.Clear();verificationDeaths=new(root);
+        lastPaidStep=0;previousBottles=DeathSaves.UsedBottles(root);previousRevive=DeathSaves.Restored(root);
+        previousVerificationHp=party.Select(p=>root.Hp(p.Creature)).ToArray();verifyingFirstHp=null;replayRisks.Clear();verificationRound=replay.RoundsAdvanced;
     }
     private void VerifyOne()
     {
@@ -464,35 +636,60 @@ internal sealed partial class AnytimeSearch : IDisposable
         if(replayIndex==length)
         {
             var record=WithInventory(TerminalRecord.Capture(state,party,state.HasTerminal,state.HasTerminal?"":"重放未到终局"),state);
-            bool resourcesMatch=p.Origin=="reference" ||
+            bool resourcesMatch=(p.Origin is "reference" or "prefix-reference") ||
                 record.ResourcesConsumed==p.Ending.ResourcesConsumed &&
                 record.ConsumablePreservationPremium==p.Ending.ConsumablePreservationPremium;
-            if(resourcesMatch && record.OutstandingStolenResource==p.Ending.OutstandingStolenResource &&
+            if(resourcesMatch && (GoalResult.For(p.Ending) is not {} expectedGoal || expectedGoal==GoalResult.For(record)) && record.OutstandingStolenResource==p.Ending.OutstandingStolenResource &&
                 record.Verified && record.Victory==p.Ending.Victory && record.RoundsSurvived==p.Ending.RoundsSurvived &&
                 record.PostCombatHp.SequenceEqual(p.Ending.PostCombatHp)
                 && record.RemainingEnemies==p.Ending.RemainingEnemies && record.RemainingEnemyHp==p.Ending.RemainingEnemyHp)
             {
-                Replays++;
+                if((TrackEvidence || InSharedTree) && p.Origin is "reference" or "prefix-reference" or "solved-subtree" or "potion-omission")
+                    RememberTerminal(Descend(top,p.Prefix.Concat(p.Tail.Select(a=>new Edge(null,a)))),record);
+                if(TrackEvidence || InSharedTree)
+                {
+                    var cursor=top;
+                    for(int i=0;i<replayWork.Count;i++)
+                    {
+                        var edge=i<p.Prefix.Length?p.Prefix[i]:new Edge(null,p.Tail[i-p.Prefix.Length]);
+                        var child=FindChild(cursor,edge);
+                        if(child==null)break;
+                        CreditWork(child,replayWork[i]);cursor=child;
+                    }
+                }
+                Replays++;p.Verified=true;RememberPotionRoute(p,record,state);
                 if(p.Origin=="retained-best" && ReferenceEquals(Best?.Script,p.Tail))
                 {
-                    InstallValidatedPath(p,record.Victory?WinReward(record,teamMaxHp):Estimate(state));
-                    if(record.Victory)potionTrials=RefineWin(p.Tail).GetEnumerator();
+                    InstallValidatedPath(p,TreeReward(record));
                 }
                 if(Best?.Record is not {} old || ComparePlans(record,replayed.Count,old,Best.Script!.Count,verificationDeaths!.Rounds(),BestRoundHp)>0)
                 {
                     Best=new TournamentResult(replayed.FirstOrDefault(),record,Array.Empty<TerminalRecord>(),CompletedRollouts,0,"已从原盘面复算"){Script=replayed.ToArray()};
-                    BestRisks=replayRisks.Order().ToArray();
+                    BestRisks=ReplayCoverage.RouteDetails(replayRisks.Order().ToArray(),replayed);
+                    if(record.Victory)StartPotionSavings(Best.Script!);
                     BestOrigin=p.Origin;
+                    bestJoinShapes=replayedShapes.ToArray();
                     BestRoundHp=verificationDeaths!.Rounds();BestKills=verificationDeaths.Freeze();BestTrail=verifyingStates.ToArray();BestFirstHp=verifyingFirstHp;
+                    UpdateFocus();
                     BestRecipes=new TreeStep?[replayed.Count];
                     for(int i=0;i<p.Prefix.Length;i++)BestRecipes[i]=p.Prefix[i].Exact;
                     BestBottlesLeft=party.Sum(state.HeldPotionCount);
                     BestTurnNumber=state.TurnNumber;
-                    StopPreview();
-                    InstallValidatedPath(p,record.Victory?WinReward(record,teamMaxHp):Estimate(state));
-                    potionTrials?.Dispose();
-                    potionTrials=record.Victory ? RefineWin(Best.Script!).GetEnumerator() : null;
+                    InstallValidatedPath(p,TreeReward(record));
                     IncumbentChanged?.Invoke();
+                }
+                else if(record.Victory)
+                {
+                    // Other verified wins can also cover positions already in the tree.
+                    var existing=top;
+                    if(lastPaidStep==0)existing.HasFreeWin=true;
+                    for(int i=0;i<replayed.Count;i++)
+                    {
+                        var edge=i<p.Prefix.Length?p.Prefix[i]:new Edge(null,p.Tail[i-p.Prefix.Length]);
+                        existing=FindChild(existing,edge);
+                        if(existing==null)break;
+                        if(i+1>=lastPaidStep)existing.HasFreeWin=true;
+                    }
                 }
             }
             else {RejectedReplays++;Boundary("候选终局与重放不一致");}
@@ -501,19 +698,32 @@ internal sealed partial class AnytimeSearch : IDisposable
         string reason="";
         KernelTeamSearch.Action? resolved=null;
         bool ok;
-        ReplayCoverage.Begin(state,replayRisks);
+        long actionStart=SimulationMeter.ThreadActions;
+        ReplayCoverage.Begin(state);
         try
         {
             ok=!state.HasTerminal && (replayIndex<p.Prefix.Length
                 ? p.Prefix[replayIndex].Replay(state,out resolved,out reason)
                 : state.ReplayPlanned(p.Tail[replayIndex-p.Prefix.Length],int.MaxValue,out reason,out resolved));
         }
-        finally {ReplayCoverage.End();}
+        finally {ReplayCoverage.End(resolved);}
         if(!ok){RejectedReplays++;Boundary("候选复算："+reason);verifying=null;replay=null;return;}
+        int bottles=DeathSaves.UsedBottles(state),revive=DeathSaves.Restored(state);
+        bool paid=bottles!=previousBottles || revive!=previousRevive;
+        for(int seat=0;seat<party.Length;seat++)
+        {
+            int hp=state.Hp(party[seat].Creature);
+            paid|=hp<previousVerificationHp[seat];
+            previousVerificationHp[seat]=hp;
+        }
+        if(paid)lastPaidStep=replayIndex+1;
+        previousBottles=bottles;previousRevive=revive;
+        replayWork.Add(SimulationMeter.ThreadActions-actionStart);
         verificationDeaths!.Observe(state,replayIndex,resolved);replayed.Add(resolved!); replayIndex++;
         if(verifyingFirstHp==null && (state.HasTerminal || state.RoundsAdvanced!=root.RoundsAdvanced))
             verifyingFirstHp=party.Select(p=>state.Hp(p.Creature)).ToArray();
-        if(FollowEnabled){replayedShapes.Add(ShapeOf(state));verifyingStates.Add(state.PlanningState(controlled));}
+        if(FollowEnabled || verifiedJoins!=null)replayedShapes.Add(ShapeOf(state));
+        if(FollowEnabled)verifyingStates.Add(state.PlanningState(controlled));
         ReplayCoverage.Collect(state,replayRisks);
         if(!state.HasTerminal && (replayIndex==2 || state.RoundsAdvanced!=verificationRound))
         {
@@ -521,7 +731,7 @@ internal sealed partial class AnytimeSearch : IDisposable
             // later boundaries without a cache can be restored from the path.
             int spacing=Math.Max(1,(p.Ending.RoundsSurvived+7)/8);
             bool cache=replayIndex==2 || state.RoundsAdvanced%spacing==0;
-            pendingAnchors.Add((replayIndex,cache?state.ForkForReplay():null));
+            pendingAnchors.Add((replayIndex,state.TurnNumber,cache?state.ForkForReplay():null));
         }
         verificationRound=state.RoundsAdvanced;
     }
@@ -533,20 +743,26 @@ internal sealed partial class AnytimeSearch : IDisposable
         var node=top;
         anchors.Clear();anchorIndex=0;bestPathNodes.Clear();
         int checkpoint=0;
+        if(proposal.Ending.Victory && lastPaidStep==0)top.HasFreeWin=true;
         for(int i=0;i<replayed.Count;i++)
         {
             var edge=i<proposal.Prefix.Length?proposal.Prefix[i]:new Edge(null,proposal.Tail[i-proposal.Prefix.Length]);
-            var child=node.Children.FirstOrDefault(n=>ReferenceEquals(n.Step,edge) ||
-                edge.Prior!=null && ReferenceEquals(n.Step?.Prior,edge.Prior));
+            var child=FindChild(node,edge);
             if(child==null)
             {
                 child=new Node(node,edge){Visits=1,Sum=value};
                 node.Children.Add(child);Nodes++;
             }
             node=child;
+            if(proposal.Ending.Victory && i+1>=lastPaidStep)node.HasFreeWin=true;
             if(FollowEnabled){Index(node,replayedShapes[i]);bestPathNodes.Add(node);}
             if(checkpoint<pendingAnchors.Count && pendingAnchors[checkpoint].Index==i+1)
-                anchors.Add(new(node,pendingAnchors[checkpoint++].State));
+            {
+                var saved=pendingAnchors[checkpoint++];
+                node.Turn=saved.Turn;
+                var anchor=new Checkpoint(node,saved.State);
+                anchors.Add(anchor);
+            }
         }
         node.Closed=true;
     }

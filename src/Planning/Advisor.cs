@@ -23,7 +23,11 @@ internal sealed partial class Advisor(SceneTree tree)
         SimulationMeter.Install();
         ChaosPotionChoices.Install();
         ExactMenus.Install();
-        ReplayCoverage.Install();
+        ContinuationHistory.Install();
+        DamageAttribution.Install();
+        DeathSaves.Install();
+        TransformScope.Install();
+        GoalResult.Install();
         PotionOpenings.Install();
         RetrievalChoices.Install();
         InterceptMirror.Install();
@@ -31,52 +35,36 @@ internal sealed partial class Advisor(SceneTree tree)
         var advisor=new Advisor(tree);
         advisor.liveAdvisor=new Advisor(tree){owner=advisor};
         advisor.share=new RouteShare();advisor.share.Install();
+        advisor.InstallNativeMenus();
+        tree.Root.TreeExiting+=()=>advisor.SaveLearnedWeights(force:true);
         tree.ProcessFrame+=advisor.Tick;
         GD.Print("[CoopSolver] Ready");
     }
     private RouteWindow? window;
     private Advisor? owner,liveAdvisor;
     private bool resultsHidden,searchEnabled,manuallyPaused;
-    private bool showLive,switchRequested,followWanted,openingWanted;
+    private bool showLive=true,switchRequested,followWanted,openingWanted;
     private bool Follow=>owner!=null;
-    private Advisor Selected=>showLive?liveAdvisor!:this;
-    private RouteWindow? routeWindow=>Follow ? (owner!.showLive?owner.window:null) : (!showLive?window:null);
-    private string buttonLabel="求解 (F8)";
-    private void SetButton(string text)
-    {
-        buttonLabel=text;
-
-    }
+    private bool sharedOpening;
+    private Advisor Selected=>showLive && !sharedOpening?liveAdvisor!:this;
     private bool canSolve;
     private bool NativeUi=>DisplayServer.GetName()!="headless";
 
     private void OpenRoute(bool automatic=false)
     {
         if(owner!=null){owner.OpenRoute(automatic);return;}
-        if(!NativeUi || resultsHidden)return;
-        window??=new RouteWindow(tree,()=>requested=true,value=>{if(showLive!=value){showLive=value;switchRequested=true;}});
+        if(!NativeUi)return;
+        window??=new RouteWindow(tree,CreateHud);
         bool keepFocus=automatic && tree.Root.HasFocus();
         if(!automatic || !window.IsShown)window.Open();
+        if(window.Panel is {} detached && hudFrame!=null && hudRoom!=null && hudNet!=null)
+            detached.Update(hudFrame,hudNet.NetId,!FollowingHost,canSolve,hudRoom.RoundNumber,
+                hudNet.Type==MegaCrit.Sts2.Core.Multiplayer.Game.NetGameType.Client,
+                hudNet.Type==MegaCrit.Sts2.Core.Multiplayer.Game.NetGameType.Host?broadcastRoutes:null,targetNames);
         if(keepFocus)tree.Root.GrabFocus();
-        Selected.Paint();
-        Selected.SyncWindowControl();
     }
 
     private int ViewPercent=>showLive?100-SearchCapacity.OpeningPercent:SearchCapacity.OpeningPercent;
-    private string ToggleCaption()
-    {
-        return searchEnabled?"暂停搜索":SearchCapacity.OpeningPercent==100?"开始搜开局":"开始搜实战";
-    }
-    private void SyncWindowControl()
-    {
-        if(UseWorker)
-        {
-            var host=owner??this;
-            routeWindow?.SetControl(host.ToggleCaption(),host.searchEnabled || canSolve || host.root!=null);return;
-        }
-        bool legacyBusy=legacyMode && (search!=null || replay!=null);
-        routeWindow?.SetControl(legacyBusy?"计算中":running?"暂停计算":(planner!=null || engine!=null)?"继续计算":"开始求解",(canSolve || !Follow && root!=null) && !legacyBusy);
-    }
     private bool requested, holdingKey, caseStarted;
     private CombatState? board;
     private TournamentRun? search;
@@ -91,16 +79,22 @@ internal sealed partial class Advisor(SceneTree tree)
 
     public void Tick()
     {
-        try { Update(); }
+        try
+        {
+            Update();SaveLearnedWeights();AdvanceArchivedChoices();
+            FlushRouteArchive();liveAdvisor?.FlushRouteArchive();AdvancePlayback();
+            if(tickError!=null && Environment.TickCount64-tickErrorAt>2000){tickError=null;nextHud=0;}
+        }
         catch (Exception e)
         {
-            search?.Dispose();
+            StopPlayback();search?.Dispose();
             search = null;
             replay = null;
             ClearTree();
             liveAdvisor?.ClearTree();
-            GD.PrintErr("[CoopSolver] " + e);
-            Report("求解未完成：" + e.GetBaseException().Message);
+            var message="当前盘面搜索出错："+e.GetBaseException().Message;
+            if(tickError!=message)GD.PrintErr("[CoopSolver] "+e);
+            tickError=message;tickErrorAt=Environment.TickCount64;nextHud=0;
         }
     }
 
@@ -117,10 +111,10 @@ internal sealed partial class Advisor(SceneTree tree)
             && RunManager.Instance.ActionQueueSynchronizer.CombatState == MegaCrit.Sts2.Core.Entities.Multiplayer.ActionSynchronizerCombatState.PlayPhase
             && RunManager.Instance.ActionExecutor.CurrentlyRunningAction == null && RunManager.Instance.ActionQueueSet.IsEmpty
             && live.Players.Any(p => p.Creature.IsAlive && p.PlayerCombatState?.Phase == PlayerTurnPhase.Play);
+        if(playing)CloseSettledTurnStart(live!);
         canSolve=playing;
         if(liveAdvisor!=null)liveAdvisor.canSolve=playing;
 
-        Selected.SyncWindowControl();
         bool pressed = Input.IsKeyPressed(Key.F8);
         bool hotkey=pressed && !holdingKey;
         bool reopen=hotkey && window?.IsShown!=true;
@@ -134,52 +128,73 @@ internal sealed partial class Advisor(SceneTree tree)
             if(Environment.GetEnvironmentVariable("STS2_CASE_AUDIT_ONLY")=="1")return;
             WatchNativeInput(live);
             ObserveOpening(live,playing);
-            if(playing && seedDirectory!=null && tapeInputs.Count>0)
+            if(sharedOpening && playing && live!=null && (tapeInputs.Count>0 || Environment.TickCount64>=nextStampCheck))
             {
-                var group=new TapeGroup(tapeInputs.ToArray(),SlCache.Witness(live!));exchange?.Append(group);
-                try{SlCache.Append(seedDirectory,attempt,group);}
-                catch(Exception e) when(e is IOException or UnauthorizedAccessException){archiveError="实战路径未写入："+e.Message;}
-                tapeInputs.Clear();
+                nextStampCheck=Environment.TickCount64+300;
+                if(tapeInputs.Count>0 || BoardStamp(live)!=stamp)
+                {
+                    sharedOpening=false;nextHud=0;
+                    var side=liveAdvisor!;
+                    side.board=live;side.root=root;side.shownLine=shownLine;
+                    side.ClearRecommendations();
+                    side.previousRecommendations.AddRange(previousRecommendations);
+                    side.displayedRounds.AddRange(displayedRounds);
+                    side.recommendationsRoot=recommendationsRoot;
+                    side.displayedPotion=displayedPotion;side.potionRoot=potionRoot;
+                    ClearRecommendations();
+                    side.savedResult=savedResult;side.meter=meter;
+                    // Force capture even if the visible stamp happened to cycle back.
+                    side.stamp="";
+                }
             }
-            if(initialWindowPending && playing)initialWindowPending=false;
-            if(hotkey && (playing || window!=null))OpenRoute();
+            if(playing && exchange!=null && tapeInputs.Count>0)
+            {
+                RecordInputGroup(SlCache.CaptureGroup(live!,tapeInputs.ToArray()));
+            }
+            if(live!=null && beforeReady.Count>0)
+                foreach(var seat in beforeReady.Where(pair=>pair.Value.Root.TurnNumber!=live.RoundNumber).Select(pair=>pair.Key).ToArray())beforeReady.Remove(seat);
+            // Keep the opening and actual moves available for a later local search.
+            if(hotkey && (playing || hudRoom!=null || window!=null))OpenRoute();
+            if(FollowingHost)
+            {
+                if(playing && rejectedPosition.HasValue)CaptureStable(live!);
+                return;
+            }
+            if(System.Threading.Volatile.Read(ref restarting)!=0)return;
             bool changedTab=switchRequested;
             switchRequested=false;
             if(UseWorker)
             {
-                if(changedTab)
-                {
-                    nextHud=0;
-                    if(Selected.savedResult==null && Selected.provisionalHud==null && Selected.FallbackPlan()==null)window?.Reset();
-                    Selected.Paint();
-                    if(Selected.provisionalHud is {} pending)window?.SetRoute(pending.Steps,pending.Result,pending);
-
-                }
+                if(changedTab)nextHud=0;
                 if(start)
                 {
-
                     searchEnabled=!searchEnabled;manuallyPaused=!searchEnabled;
-                    if(manuallyPaused)foreach(var slot in openChoices.Values){slot.Probe?.Cancel();slot.Probe=null;}
+                    if(searchEnabled){ClearWorkerError();liveAdvisor!.ClearWorkerError();}
+                    pauseReason=null;
+                    if(manuallyPaused)foreach(var slot in PendingChoices){slot.Probe?.Cancel();slot.Probe=null;}
                 }
-                bool wantOpening=searchEnabled && SearchCapacity.OpeningPercent>0;
-                bool wantLive=searchEnabled && SearchCapacity.OpeningPercent<100;
-                InteractiveSearch.Dispatcher.Split(wantOpening && wantLive && playing && root!=null);
+                bool wantOpening=searchEnabled && (sharedOpening || SearchCapacity.OpeningPercent>0);
+                bool wantLive=searchEnabled && !sharedOpening && SearchCapacity.OpeningPercent<100;
+                InteractiveSearch.Dispatcher.Split(wantOpening && root!=null && engine?.IsExhausted!=true && !Memory.Waiting() &&
+                     (wantLive && playing && liveAdvisor?.engine?.IsExhausted!=true || SelectingHand && SearchCapacity.OpeningPercent<100));
                 openingWanted=wantOpening;
+                if(searchEnabled)exchange?.PumpPromotions(meter);
+                if(root!=null && exchange?.TakeLine() is {} promoted)RenderLine(promoted with {FoundAt=meter.Actions+exchange.ConnectedWork});
                 if(root!=null && ReferenceEquals(board,live))UpdateTree(live,playing,wantOpening!=running);
+                wantLive &= searchEnabled;
                 var liveSide=liveAdvisor!;
                 if(!wantLive && liveSide.running)
                 {
                     liveSide.running=false;liveSide.activeTime.Stop();liveSide.engine?.Pump(false);
                 }
                 liveSide.followWanted=wantLive;
-                if(wantLive || showLive)liveSide.UpdateFollow(live,playing,false,changedTab);
+                if(!sharedOpening && (wantLive || showLive || manuallyPaused && SearchCapacity.OpeningPercent<100))liveSide.UpdateFollow(live,playing,false,changedTab);
                 else liveSide.DropInactiveBattle(live);
-                Selected.SyncWindowControl();
                 return;
             }
             if(changedTab)
             {
-                window?.Reset();Selected.Paint();Selected.SetButton(Selected.buttonLabel);
+                nextHud=0;
                 if(showLive)liveAdvisor!.followWanted=true;
                 else {liveAdvisor!.activeTime.Stop();liveAdvisor.engine?.Pump(false);}
             }
@@ -187,10 +202,8 @@ internal sealed partial class Advisor(SceneTree tree)
             if(showLive && start)liveAdvisor!.followWanted=!liveAdvisor.running;
             if(root!=null && (ReferenceEquals(board,live) || playing))
                 UpdateTree(live,playing,!showLive && start || openingWanted && !running && planner==null && engine==null);
-            else if(!showLive && (start || changedTab))Paint();
             if(showLive)liveAdvisor!.UpdateFollow(live,playing,start,changedTab);
             else liveAdvisor!.DropInactiveBattle(live);
-            Selected.SyncWindowControl();
             return;
         }
         if (search != null || replay != null)
@@ -249,33 +262,71 @@ internal sealed partial class Advisor(SceneTree tree)
         }
         if (!start || !playing) return;
         OpenRoute();
-        routeWindow?.Reset();
-        routeWindow?.SetStatus("正在计算","");
         if (!Capture(live!)) return;
         baselinePhase = true;
         search = NewSearch(includePotions:false, budget:40000, reference:null);
-        SetButton("正在计算…");
+    }
+
+    private bool captureDeferred;
+    private string[] captureWarnings=Array.Empty<string>();
+    private (CombatState Room,uint Action,int Round)? rejectedPosition;
+    private string? tickError;
+    private long tickErrorAt;
+
+    private void ClearCaptureWarnings()
+    {
+        rejectedPosition=null;captureWarnings=Array.Empty<string>();
+    }
+    private KernelSession? CaptureStable(CombatState live)
+    {
+        var host=owner??this;
+        var position=(live,RunManager.Instance.ActionQueueSet.NextActionId,live.RoundNumber);
+        if(host.rejectedPosition==position)return null;
+        if(host.rejectedPosition.HasValue)host.ClearCaptureWarnings();
+        try
+        {
+            var captured=KernelSession.Capture(live);
+            if(captured.ProjectionDifferences.Count==0){host.ClearCaptureWarnings();return captured;}
+            host.captureWarnings=captured.ProjectionDifferences.Select(s=>"盘面与模拟不一致："+s).ToArray();
+            GD.PrintErr("[CoopSolver] "+string.Join("\n",host.captureWarnings));
+        }
+        catch(CoopBots.Kernel.Vendor.IncompatibleGameplayModException e)
+        {
+            // The full patch signature is for the log. Show the affected game method to the player.
+            const string mirrored=" on mirrored ";
+            int at=e.Subject.IndexOf(mirrored,StringComparison.Ordinal);
+            string effect=at<0?e.Subject:e.Subject[(at+mirrored.Length)..];
+            if(at>=0)effect=string.Join(".",effect.Split('.').TakeLast(2));
+            host.captureWarnings=new[]{"模组规则无法模拟："+e.PlayerFacingModName+" · "+effect};
+            GD.PrintErr("[CoopSolver] "+e.Message);
+        }
+        catch(Exception e) when(e is IndexOutOfRangeException or ArgumentOutOfRangeException ||
+            e is InvalidOperationException && e.Message.Contains("Collection was modified",StringComparison.Ordinal))
+        {return null;} // Retry after the native transition settles.
+        host.rejectedPosition=position;host.nextHud=0;
+        return null;
     }
 
     private bool Capture(CombatState live)
     {
-        caseStarted = true;
-        board = live!;
-        var players = board.Players.ToArray();
-        participants = players;
-        actors = players.Where(p => p.Creature.IsAlive && p.PlayerCombatState?.Phase == PlayerTurnPhase.Play
-            && !CombatManager.Instance.IsPlayerReadyToEndTurn(p)).ToArray();
-        if (actors.Length == 0) return false;
-        stamp = BoardStamp(board);
-        rootRound=board.RoundNumber;
+
+        var captured=CaptureStable(live);
+        captureDeferred=captured==null && (owner??this).rejectedPosition==null;
+        if(captured==null)return false;
+        var players=captured.Party.ToArray();
+        var active=players.Where(p=>p.Creature.IsAlive && p.PlayerCombatState?.Phase==PlayerTurnPhase.Play &&
+            !CombatManager.Instance.IsPlayerReadyToEndTurn(p)).ToArray();
+        if(active.Length==0)return false;
+        var capturedStamp=BoardStamp(live);
+        caseStarted=true;board=live;participants=players;actors=active;root=captured;
+        stamp=capturedStamp;rootRound=live.RoundNumber;
         if (caseOutput != null)
             File.WriteAllText(caseOutput + ".opening.json", JsonSerializer.Serialize(new {
                 round = board.RoundNumber, seats = players.Select(p => new { character = p.Character.Id.Entry,
                     hp = p.Creature.CurrentHp, cards = p.PlayerCombatState!.Hand.Cards.Select(c => c.Id.Entry).ToArray() }),
                 enemies = board.Enemies.Select(e => new { id = e.Monster?.Id.Entry, hp = e.CurrentHp })
             }));
-        root = KernelSession.Capture(board);
-        playerNames=RunManager.Instance.NetService.Type==NetGameType.Singleplayer?new[]{"我"}:participants.Select(p=>MegaCrit.Sts2.Core.Platform.PlatformUtil.GetPlayerName(RunManager.Instance.NetService.Platform,p.NetId)).ToArray();
+        playerNames=RunManager.Instance.NetService.Type==NetGameType.Singleplayer?new[]{Ui.T("我","You")}:participants.Select(p=>MegaCrit.Sts2.Core.Platform.PlatformUtil.GetPlayerName(RunManager.Instance.NetService.Platform,p.NetId)).ToArray();
         startHp=participants.Select(p=>root.Hp(p.Creature)).ToArray();
         startBottles=participants.Sum(root.HeldPotionCount);
         CaptureLabels(board);
@@ -287,11 +338,6 @@ internal sealed partial class Advisor(SceneTree tree)
                     targets = root.PotionTargets(b).Select(t => t?.Player?.Character.Id.Entry ?? t?.Monster?.Id.Entry)
                 })
             })));
-        if (root.ProjectionDifferences.Count != 0)
-        {
-            Report("当前盘面与模拟器不一致，无法确认路线。\n" + string.Join("\n", root.ProjectionDifferences));
-            return false;
-        }
         return true;
     }
 
@@ -315,15 +361,31 @@ internal sealed partial class Advisor(SceneTree tree)
         return s.Append('\n').Append(FormatSteps(board,r.Script,startRound,frozen)).ToString();
     }
 
-    private static string ChoiceNames(KernelChoice choice)
+    internal static string ChoiceNames(KernelChoice choice,bool live=false)
     {
-            var names=choice.Cards.Select(c=>{
-                var model=ModelDb.GetById<CardModel>(new ModelId("CARD",c.Id));
-                string title=model.Title+(c.Upgrade<=0?"":c.Upgrade==1?"+":"+"+c.Upgrade);
-                if(choice.Options!=null && choice.Options.Count(t=>t.Id==c.Id && t.Upgrade==c.Upgrade)>1)
-                    title+=$"（同名第 {c.Occurrence+1} 张）";
-                return title;
-            });
+        var names=choice.Cards.Select(c=>{
+            var model=ModelDb.GetById<CardModel>(new ModelId("CARD",c.Id));
+            string title=model.Title+(c.Upgrade<=0?"":c.Upgrade==1?"+":"+"+c.Upgrade);
+            title+=CardPresentation.Describe(c.StateKey,model,CardPresentation.MenuFee(c,choice.Options));
+            if(choice.Options is {} options)
+            {
+                var same=Enumerable.Range(0,options.Count).Where(i=>options[i].Id==c.Id && options[i].Upgrade==c.Upgrade &&
+                    CardPresentation.Describe(options[i].StateKey,model,CardPresentation.MenuFee(options[i],choice.Options))==CardPresentation.Describe(c.StateKey,model,CardPresentation.MenuFee(c,choice.Options))).ToArray();
+                int at=CardPresentation.MenuIndex(choice,c,options);
+                var layout=ChoiceLayout.For(choice);
+                bool stateDiff=same.Any(i=>!CardPresentation.SameDisplayedVariant(options[i].StateKey,c.StateKey));
+                bool positionDiff=layout!=null && choice.Cards.Count<options.Count &&
+                    same.Select(i=>layout.Runs[i]).Distinct().Count()>1;
+                if(at>=0 && same.Length>1 && (stateDiff || positionDiff))
+                {
+                    var visible=live && layout!=null?NativeAutoMenu.VisibleOrder(choice,layout):null;
+                    var order=(visible??layout?.DisplayOrder(choice)??Enumerable.Range(0,options.Count).ToArray()).Where(same.Contains).ToArray();
+                    int ordinal=Array.IndexOf(order,at)+1;
+                    if(ordinal>0)title+=$"（第{ordinal}张）";
+                }
+            }
+            return title;
+        });
         return choice.Cards.Count==0?"（跳过）":string.Join("、",names);
     }
 
@@ -335,10 +397,13 @@ internal sealed partial class Advisor(SceneTree tree)
             int seat=board.Players.ToList().FindIndex(p=>p.NetId==choice.Owner)+1;
             s.Append("〔P").Append(seat).Append(choice.Cards.Count==0?" 跳过选择":" 选 "+ChoiceNames(choice)).Append("〕");
         }
-        foreach (var action in route)
+        for(int index=0;index<route.Count;index++)
         {
+            var action=route[index];
             var who = $"P{board!.Players.ToList().FindIndex(p => p.NetId == action.Player.NetId) + 1} {action.Player.Character.Title.GetFormattedText()}";
-            var move = action.EndTurn ? "结束回合" : action.Card?.Title ?? action.Potion?.Title.GetFormattedText() ?? "选择";
+            var move = action.EndTurn ? "结束回合" : action.Potion is {} used?"用药 "+used.Title.GetFormattedText():action.Card?.Title??"选择";
+            if(action.Card is {} card)
+                move=CardPresentation.PlayTitle(card,action.CardStateKey,CardPresentation.FeeFor(action));
             s.Append("\n").Append(who).Append("：").Append(move);
             if(action.Potion is {} potion && (frozen==null ? action.Player.Potions.Count(b=>b.Id==potion.Id) : frozen.CapturedPotions(action.Player).Count(b=>b.Id==potion.Id))>1)
             {
@@ -362,16 +427,9 @@ internal sealed partial class Advisor(SceneTree tree)
         return s.ToString();
     }
 
-    private void Report(string message,bool display=true)
+    private void Report(string message)
     {
-        SetButton("求解 (F8)");
-        if (caseOutput != null) File.WriteAllText(caseOutput, message);
-        if(!display || routeWindow==null)return;
-        if(message.StartsWith("模拟找到胜线。",StringComparison.Ordinal) || message.StartsWith("模拟结果：",StringComparison.Ordinal))
-        {
-            routeWindow.SetRoute(message);routeWindow.SetStatus(message.StartsWith("模拟找到胜线。")?"已找到模拟胜线":"当前最佳完整路线","");
-        }
-        else routeWindow.SetStatus("求解提示",message);
-        SyncWindowControl();
+        if(caseOutput!=null)File.WriteAllText(caseOutput,message);
+        else GD.Print("[CoopSolver] "+message);
     }
 }

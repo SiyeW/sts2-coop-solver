@@ -17,6 +17,17 @@ internal sealed record TreeStep(Move Move,int[] Digits,string MenuEvidence);
 internal sealed class MoveFamily(Move move)
 {
     private readonly Queue<int[]> pending=new(new[]{Array.Empty<int>()});
+    private long digitBytes;
+    internal void Enqueue(int[] digits)
+    {
+        pending.Enqueue(digits);digitBytes+=SearchTreeMemory.Survey.Buffer(digits.Length,4);
+    }
+    internal long RetainedBytes=>80+SearchTreeMemory.Survey.Buffer(pending.EnsureCapacity(0),8)+digitBytes;
+    internal void Measure(SearchTreeMemory.Survey size)
+    {
+        size.Owned(RetainedBytes);
+        size.Move(move);
+    }
     internal Move Move=>move;
     internal bool Finished=>pending.Count==0;
     internal void Save(BinaryWriter writer)
@@ -30,13 +41,13 @@ internal sealed class MoveFamily(Move move)
         var family=new MoveFamily(RoundAgenda.ReadMove(reader));
         family.pending.Clear();
         int count=reader.ReadInt32();
-        for(int i=0;i<count;i++)family.pending.Enqueue(RoundAgenda.ReadDigits(reader));
+        for(int i=0;i<count;i++)family.Enqueue(RoundAgenda.ReadDigits(reader));
         return family;
     }
-    internal bool Expand(KernelSession state,out TreeStep? step,out KernelTeamSearch.Action? shown,out string reason)
+    internal bool Expand(KernelSession state,out TreeStep? step,out KernelTeamSearch.Action? shown,out string reason,ActionFrontier? proof=null)
     {
-        var digits=pending.Dequeue();
-        bool ok=ActionFrontier.Apply(state,move,digits,out shown,out var evidence,pending,out reason);
+        var digits=pending.Dequeue();digitBytes-=SearchTreeMemory.Survey.Buffer(digits.Length,4);
+        bool ok=ActionFrontier.Apply(state,move,digits,out shown,out var evidence,this,out reason,proof);
         step=ok?new TreeStep(move,digits,evidence):null;
         return ok;
     }
@@ -47,12 +58,42 @@ internal sealed class MoveFamily(Move move)
 internal sealed class ActionFrontier
 {
     private readonly Queue<MoveFamily> queue = new();
-    internal bool Finished => queue.Count==0;
+    private readonly bool measureCoverage;
+    private AnytimeSearch? owner;
+    private AnytimeSearch.Node? node;
+    private int readIndex;
+    private bool bookmark;
+    internal int ReadIndex=>readIndex;
+    internal ActionFrontier(AnytimeSearch owner,AnytimeSearch.Node node,int index)
+    {this.owner=owner;this.node=node;readIndex=index;}
+    internal int FamilyCount=>node?.Families??queue.Count;
+    internal double ChoiceShare {get;private set;}
+    internal bool Finished => node!=null?readIndex>=node.Legal!.Count && node.Frontier!.Finished:queue.Count==0;
     internal IEnumerable<MoveFamily> Families => queue;
 
+    internal long RetainedBytes=>80+SearchTreeMemory.Survey.Buffer(queue.EnsureCapacity(0),8)+
+        System.Linq.Enumerable.Sum(queue,family=>family.RetainedBytes);
+    internal void Measure(SearchTreeMemory.Survey size)
+    {
+        size.Owned(80+SearchTreeMemory.Survey.Buffer(queue.EnsureCapacity(0),8));
+        foreach(var family in queue)family.Measure(size);
+    }
     private ActionFrontier() {}
+    internal ActionFrontier(KernelSession state,Move forced)
+    {
+        if(forced.Kind==MoveKind.Potion && forced.PotionChoice<0 &&
+            CapturedBelt.At(state,state.Party[forced.Seat],forced.Slot) is {} bottle && KernelSession.RequiresPotionChoiceContract(bottle))
+        {
+            var targets=state.PotionTargets(bottle);
+            if(!TryTarget(targets,forced.Target,out var target))return;
+            int count=state.PotionActions(bottle,target,int.MaxValue,state.Party).Count;
+            for(int i=0;i<count;i++)queue.Enqueue(new MoveFamily(forced with {PotionChoice=i}));
+        }
+        else queue.Enqueue(new MoveFamily(forced));
+    }
     internal void Save(BinaryWriter writer)
     {
+        if(node!=null || bookmark){writer.Write(-1);writer.Write(readIndex);return;}
         writer.Write(queue.Count);
         foreach(var family in queue)family.Save(writer);
     }
@@ -60,13 +101,15 @@ internal sealed class ActionFrontier
     {
         var frontier=new ActionFrontier();
         int count=reader.ReadInt32();
+        if(count==-1){frontier.bookmark=true;frontier.readIndex=reader.ReadInt32();return frontier;}
         for(int i=0;i<count;i++)frontier.queue.Enqueue(MoveFamily.Load(reader));
         return frontier;
     }
 
 
-    internal ActionFrontier(KernelSession state, Action<string> unsupported)
+    internal ActionFrontier(KernelSession state, Action<string> unsupported,bool measureCoverage=false)
     {
+        this.measureCoverage=measureCoverage;
         var lanes=new List<Queue<Move>>();
         for(int seat=0;seat<state.Party.Count;seat++)
         {
@@ -113,22 +156,163 @@ internal sealed class ActionFrontier
 
     internal bool Expand(KernelSession state,out TreeStep? step,out KernelTeamSearch.Action? shown,out string reason)
     {
+        if(node!=null)
+        {
+            AnytimeSearch.Node? child;
+            if(readIndex<node.Legal!.Count)
+            {
+                child=node.Legal[readIndex++];
+                step=child.Step!.Exact!;
+                if(!Replay(state,step,out shown,out reason)){owner!.RejectState(child);return false;}
+                owner!.ReadState(child,state);
+            }
+            else
+            {
+                if(!owner!.ExpandMenu(node,state,out child,out step,out shown,out reason))return false;
+                readIndex++;
+            }
+            ChoiceShare=child!.Share*node.Families;
+            return true;
+        }
         var family=queue.Dequeue();
-        bool ok=family.Expand(state,out step,out shown,out reason);
+        bool ok=family.Expand(state,out step,out shown,out reason,measureCoverage?this:null);
         if(!family.Finished) queue.Enqueue(family);
         return ok;
     }
     internal static bool Replay(KernelSession state,TreeStep step,out KernelTeamSearch.Action? shown,out string reason)
     {
+        if(step.Move is not {} move || (uint)move.Seat>=(uint)state.Party.Count || step.Digits==null ||
+            move.Kind==MoveKind.Card && move.Slot<0 || move.Kind is not (MoveKind.Card or MoveKind.Potion or MoveKind.End))
+        {shown=null;reason="动作记录无效";return false;}
         if(!Apply(state,step.Move,step.Digits,out shown,out var evidence,null,out reason)) return false;
         if(evidence==step.MenuEvidence) return true;
         reason="选牌菜单或选择已变化";
         return false;
     }
+    // Preserve the result of an already playable recording. During import, a
+    // native key can replace it only when it reproduces both the input and state.
+    internal static bool ReplayRecorded(KernelSession parent,ref KernelSession child,KernelTeamSearch.Action? input,
+        ref TreeStep? recipe,out KernelTeamSearch.Action? resolved,out string reason,bool recoverKey=false)
+    {
+        resolved=null;
+        if(recipe==null && input==null){reason="保存的动作与当前盘面不符";return false;}
+        bool ok;
+        ReplayCoverage.Begin(child);
+        try
+        {
+            if(recipe!=null)return Replay(child,recipe,out resolved,out reason);
+            ok=child.ReplayPlanned(input!,int.MaxValue,out reason,out resolved);
+        }
+        finally{ReplayCoverage.End(resolved);}
+        if(ok && !SameLayouts(input!,resolved!)){reason="选牌在原牌堆中的位置已变化";return false;}
+        if((ok && !recoverKey) || (!ok && !Menus(input!).Any()))return ok;
+        if(PortableMove(parent,input!) is not {} move || MenuDigits(input!) is not {} digits)return ok;
+
+        var native=parent.ForkForReplay();
+        KernelTeamSearch.Action? played=null;
+        ReplayCoverage.Begin(native);
+        try
+        {
+            if(!Apply(native,move,digits,out played,out var evidence,null,out _) ||
+                !AnytimeSearch.Edge.SameAction(input,played) || !SameLayouts(input!,played!))return ok;
+            if(ok)
+            {
+                var seats=parent.Party.Select(p=>p.NetId).ToArray();
+                var expected=child.PlanningState(seats);var actual=native.PlanningState(seats);
+                if(!expected.Matches(actual) || expected.SearchMetadata!=actual.SearchMetadata)return true;
+            }
+            child=native;recipe=new(move,digits,evidence);resolved=played;reason="";return true;
+        }
+        finally{ReplayCoverage.End(played);}
+    }
+
+    private static IEnumerable<KernelChoice> Menus(KernelTeamSearch.Action action)=>
+        (action.Choices??Array.Empty<KernelChoice>()).Concat(action.TurnStartChoices?.Choices??Array.Empty<KernelChoice>());
+
+    private static bool SameLayouts(KernelTeamSearch.Action input,KernelTeamSearch.Action resolved)
+    {
+        using var observed=Menus(resolved).GetEnumerator();
+        foreach(var menu in Menus(input))
+        {
+            bool present=observed.MoveNext();
+            if(ChoiceLayout.For(menu) is not {} saved || menu.Options is not {} options)continue;
+            foreach(var card in menu.Cards)
+            {
+                int at=CardPresentation.MenuIndex(menu,card,options);
+                if(at<0)return false;
+                bool positional=Enumerable.Range(0,options.Count).Any(i=>options[i].Id==card.Id &&
+                    options[i].Upgrade==card.Upgrade && options[i].StateKey==card.StateKey && saved.Runs[i]!=saved.Runs[at]);
+                if(!positional)continue;
+                if(!present || observed.Current.Options is not {} actualOptions ||
+                    ChoiceLayout.For(observed.Current) is not {} actualLayout)return false;
+                int actual=CardPresentation.MenuIndex(observed.Current,card,actualOptions);
+                if(actual<0 || actualLayout.Source[actual]!=saved.Source[at])return false;
+            }
+        }
+        return true;
+    }
+
+    private static Move? PortableMove(KernelSession state,KernelTeamSearch.Action action)
+    {
+        int seat=0;
+        while(seat<state.Party.Count && !ReferenceEquals(state.Party[seat],action.Player))seat++;
+        if(seat==state.Party.Count)return null;
+        if(action.Card is {} card)
+        {
+            var hand=state.Hand(action.Player);int slot=-1;
+            for(int i=0;i<hand.Count;i++)
+                if(ReferenceEquals(hand[i],card)){if(slot>=0)return null;slot=i;}
+            return slot<0 || state.CardStateKey(card)!=action.CardStateKey?null:new(seat,MoveKind.Card,slot,action.CardStateKey,action.Target?.CombatId);
+        }
+        if(action.Potion is {} potion)
+        {
+            int slot=CapturedBelt.Slot(state,potion);
+            if(slot<0 || !state.HoldsPotion(potion) || KernelSession.RequiresPotionChoiceContract(potion))return null;
+            return new(seat,MoveKind.Potion,slot,potion.Id.Entry,action.Target?.CombatId);
+        }
+        return action.EndTurn?new(seat,MoveKind.End,-1,"",null):null;
+    }
+
+    private static int[]? MenuDigits(KernelTeamSearch.Action action)
+    {
+        var digits=new List<int>();
+        foreach(var menu in Menus(action))
+        {
+            if(menu.Options==null || menu.Cards.Count<menu.Minimum || menu.Cards.Count>menu.Maximum)return null;
+            digits.Add(menu.Maximum-menu.Cards.Count);
+            var remaining=Enumerable.Range(0,menu.Options.Count).ToList();
+            foreach(var selected in menu.Cards)
+            {
+                int option=CardPresentation.MenuIndex(menu,selected,menu.Options);
+                int at=remaining.IndexOf(option);
+                if(at<0)return null;
+                digits.Add(at);remaining.RemoveAt(at);
+            }
+        }
+        int last=digits.FindLastIndex(i=>i!=0);
+        return last<0?Array.Empty<int>():digits.GetRange(0,last+1).ToArray();
+    }
+
+    internal static TreeStep RebindEquivalent(KernelSession state,TreeStep step,int occurrence)
+    {
+        var move=step.Move;
+        if(move==null || move.Kind!=MoveKind.Card || (uint)move.Seat>=(uint)state.Party.Count)return step;
+        var hand=state.Hand(state.Party[move.Seat]);
+        if(move.Slot>=0 && move.Slot<hand.Count && state.CardStateKey(hand[move.Slot])==move.Key)return step;
+        int first=-1;
+        for(int i=0;i<hand.Count;i++)
+        {
+            if(state.CardStateKey(hand[i])!=move.Key)continue;
+            if(first<0)first=i;
+            if(occurrence--==0)return step with {Move=move with {Slot=i}};
+        }
+        return first<0?step:step with {Move=move with {Slot=first}};
+    }
     internal static bool Apply(KernelSession state,Move move,int[] digits,out KernelTeamSearch.Action? shown,
-        out string evidence,Queue<int[]>? pending,out string reason)
+        out string evidence,MoveFamily? pending,out string reason,ActionFrontier? proof=null)
     {
         shown=null; evidence=""; reason="";
+        if((uint)move.Seat>=(uint)state.Party.Count){reason="行动者已变化";return false;}
         var p=state.Party[move.Seat];
         if(!state.CanAct(p)) { reason="玩家行动状态变化"; return false; }
         KernelTeamSearch.Action action;
@@ -136,7 +320,7 @@ internal sealed class ActionFrontier
         else if(move.Kind==MoveKind.Card)
         {
             var hand=state.Hand(p);
-            if(move.Slot>=hand.Count || state.CardStateKey(hand[move.Slot])!=move.Key)
+            if((uint)move.Slot>=(uint)hand.Count || state.CardStateKey(hand[move.Slot])!=move.Key)
             { reason="手牌身份变化"; return false; }
             var card=hand[move.Slot];
             var targets=state.Targets(card);
@@ -162,12 +346,15 @@ internal sealed class ActionFrontier
         {
             if(!state.ForecastCausal(action,int.MaxValue,out reason,out var resolved)) return false;
             if(!menus.Consumed){reason="选牌步骤消失";return false;}
+            if(proof!=null)proof.ChoiceShare=menus.ChoiceShare;
+            if(resolved.Potion is {} potion && GeneratedPotionChoices.Supports(potion))
+                resolved=resolved with {Choices=menus.Observed.ToArray(),ChoiceOrdinals=digits};
             shown=resolved;
             if(menus.Observed.Count!=0 || resolved.TurnStartChoices?.Choices.Count>0 || move.PotionChoice>=0)
                 evidence=JsonSerializer.Serialize(new {answers=menus.Observed, resolved.Choices, resolved.TurnStartChoices});
             return true;
         }
-        catch(Exception e) when(e is InvalidOperationException or NotSupportedException or ArgumentException)
+        catch(Exception e) when(e is InvalidOperationException or NotSupportedException or ArgumentException or IndexOutOfRangeException)
         {
             reason=move.Kind+"/"+(move.Key.Split('|')[0])+"："+e.GetBaseException().Message;
             return false;

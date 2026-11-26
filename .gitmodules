@@ -1,0 +1,3 @@
+[submodule "vendor/CoopBots"]
+	path = vendor/CoopBots
+	url = https://github.com/imbalilang/STS2-Co-op_Bots.git

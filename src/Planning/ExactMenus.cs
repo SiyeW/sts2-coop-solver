@@ -4,6 +4,7 @@ using System.Linq;
 using CoopBots.Kernel;
 using CoopBots.Kernel.Vendor;
 using CoopBots.Kernel.Vendor.Engine.Common;
+using CoopBots.Kernel.Vendor.Engine.InCombat.Simulation;
 using HarmonyLib;
 using MegaCrit.Sts2.Core.Entities.Players;
 using MegaCrit.Sts2.Core.Models;
@@ -34,19 +35,46 @@ internal sealed class ExactMenus : IDisposable
     }
     public void Dispose() => current=null;
     internal IReadOnlyList<KernelChoice> Observed => observed;
+    // Each dependent menu divides its incoming share among its legal answers.
+    internal double ChoiceShare
+    {
+        get
+        {
+            double share=1;
+            foreach(int radix in radices)share/=radix;
+            return share;
+        }
+    }
     internal bool Consumed => digits.Length<=radices.Count;
 
     internal static void Install()
     {
+        ChoiceLayout.Install();
+        GeneratedPotionChoices.Install();
         var harmony=new Harmony("sts2.coopsolver.physical-menus");
         void Patch(string original,string prefix) => harmony.Patch(AccessTools.Method(typeof(KernelSession),original),
             prefix:new HarmonyMethod(typeof(ExactMenus),prefix));
         Patch("ChoiceCursor",nameof(CardCursor));
         Patch("AutomaticTurnStartChoice",nameof(TurnChoice));
-        Patch("PreparePartyStartChoices",nameof(UseRecordedMenu));
+        Patch("PreparePartyStartChoices",nameof(CanComparePartyChoices));
         Patch("PrepareAfterStartChoices",nameof(UseRecordedMenu));
     }
+    internal static bool Observes(KernelSession state)=>current?.session==state;
+    internal static PlanCardChoice? ChooseGenerated(KernelSession state,TurnStartChoiceRequest request,Player owner)=>
+        current?.session==state?current.Select(request,owner,false):null;
     private static bool UseRecordedMenu(KernelSession __instance) => current?.session!=__instance;
+    private static bool CanComparePartyChoices(KernelSession __instance,Player owner,Player[] players,
+        IReadOnlyDictionary<Player,CombatPredictionSimulator.PartySetupPause> pauses)
+    {
+        if(!UseRecordedMenu(__instance) || KernelChoiceContinuation.Active || !__instance.AutoResolveTurnStartChoices ||
+            KernelSearchBudgetScope.IsStopped)return false;
+        // Other seats and shared turn-start effects may have appended to the
+        // history since the pause was captured. Only the optional menu probe
+        // needs a fork. The ordinary turn driver resumes the original branch.
+        var steps=players.Where(pauses.ContainsKey).SelectMany(p=>pauses[p].Continuation.Steps).ToArray();
+        return __instance.Simulator.History.SupportsExecutionContinuation(pauses[owner].Continuation.HistoryStart,
+            steps.SelectMany(s=>s.Frame.DeferredEntries),steps.SelectMany(s=>s.Frame.ActiveCardPlays));
+    }
     private static bool CardCursor(KernelSession __instance,Player owner,ref TurnStartChoiceCursor __result)
     {
         var scope=current;
@@ -105,6 +133,7 @@ internal sealed class ExactMenus : IDisposable
                 Options=KernelChoice.MenuTokens(options.Select(c=>c.Preview).ToArray()),
                 RequestedMinimum=spec.MinCount,RequestedMaximum=spec.MaxCount,MenuSource=request.MenuSource,Timing=request.Timing.ToString()
             };
+            ChoiceLayout.Record(spec,choice.Options);
             observed.Add(choice);
             if(actionMenu) Answers(session).Add(choice);
         }

@@ -37,8 +37,10 @@ internal sealed partial class Advisor
     }
     private void ClearTree()
     {
-        engine?.Release();engine=null;boundRoot=null;shownLine=lastPublication=pendingSuffix=guardLine=null;guardHud=provisionalHud=null;
-        displayedPreview=null;
+        ClearWorkerError();CancelPausedRoute();pausedInputs.Clear();pausedOrigin=null;
+        engine?.Release();engine=null;boundRoot=null;shownLine=lastPublication=pendingSuffix=null;
+        transitionPlan=null;routeDiverged=pendingCheckVisible=false;orderedMove=null;
+        ClearRecommendations();
         reuseSource?.Dispose();reuseSource=null;
         running=false; planner?.Dispose(); planner=null; lastSeed=null; lastSeedScript=null; benchResume=false;
         search?.Dispose();search=null;
@@ -46,7 +48,6 @@ internal sealed partial class Advisor
         participants=Array.Empty<MegaCrit.Sts2.Core.Entities.Players.Player>();
         actors=participants;
         activeTime.Reset();
-        SetButton("求解 (F8)");
     }
     private void UpdateTree(CombatState? live,bool playing,bool start)
     {
@@ -60,7 +61,7 @@ internal sealed partial class Advisor
             caseStarted=true;
             if(planner==null)
             {
-                if(savedResult==null)routeWindow?.Reset();
+
                 if(caseOutput!=null && Environment.GetEnvironmentVariable("COOPBOTS_ALLOC_PROBE")=="1")
                 {
                     AllocationProbe.RefreshEnabled();
@@ -68,16 +69,10 @@ internal sealed partial class Advisor
                 }
                 int seed=longStudySeconds>0 && caseOutput!=null &&
                     int.TryParse(Environment.GetEnvironmentVariable("STS2_ROUND_SEED"),out var requestedSeed) ? requestedSeed : 171;
-                planner=new AnytimeSearch(root!,roundSeed:seed){FollowEnabled=Follow};
+                planner=new AnytimeSearch(root!,roundSeed:seed){Evaluation=(owner??this).evaluation,FollowEnabled=Follow};
                 if(reuseSource!=null){planner.InheritCompatibleWork(reuseSource);reuseSource=null;}
                 planner.IncumbentChanged+=PublishBest;
                 if(caseOutput!=null)planner.IncumbentChanged+=RecordIncumbent;
-                planner.TrackPreview=caseOutput!=null || routeWindow!=null;
-                if(routeWindow!=null)
-                {
-                    displayedPreview=null;
-
-                }
                 initialHeap=GC.GetGCMemoryInfo().HeapSizeBytes;
                 revision=KernelSession.LiveRevision;
                 initialActionId=RunManager.Instance.ActionQueueSet.NextActionId;
@@ -93,15 +88,14 @@ internal sealed partial class Advisor
                 search=NewSearch(false,40000,null);
             }
             running=true;
-            if(savedResult==null && planner.Best==null && planner.Preview==null)routeWindow?.SetNotice("");
             autoStopMs=benchmarks.Length>0 && benchIndex<benchmarks.Length
                 ? 1000L*benchmarks[benchIndex] : caseOutput!=null ? activeTime.ElapsedMilliseconds+120000 : long.MaxValue;
             if(studyAfterWin && caseOutput!=null)
                 autoStopMs=firstStudyWinMs.HasValue ? firstStudyWinMs.Value+120000 : 360000;
             if(longStudySeconds>0 && caseOutput!=null)autoStopMs=1000L*longStudySeconds;
             activeTime.Start();
-            UpdateWindowProgress("正在计算");
-            SyncWindowControl();
+
+
             nextStatus=0;
         }
         if(!running || planner==null)return;
@@ -144,15 +138,6 @@ internal sealed partial class Advisor
             }
             referenceTicks+=Stopwatch.GetTimestamp()-sliceStart;
         }
-        if(planner.TrackPreview && planner.Best==null)planner.AdvancePreview();
-        if(planner.Best==null && planner.Preview is {} preview && !ReferenceEquals(preview,displayedPreview))
-        {
-            displayedPreview=preview;
-            var health=participants.Zip(preview.Hp,(player,value)=>$"{player.Character.Title.GetFormattedText()} {value}");
-            string detail=$"中间路线 · 暂算至第 {preview.Turn} 回合，胜负未定\n"+
-                $"队伍生命   {string.Join("  /  ",health)}\n剩 {preview.Enemies} 名敌人，共 {preview.EnemyHp} 生命；剩余药水 {preview.Bottles} 瓶";
-            Publish(new(null,preview.Actions.Length,preview.Score,"中间路线\n"+FormatSteps(board!,preview.Actions,rootRound,root),detail,preview.Risks));
-        }
         bool newWin=!hadWin && planner.Best?.Record?.Victory==true;
         if(longStudy && (activeTime.ElapsedMilliseconds>=nextLongSample || activeTime.ElapsedMilliseconds>=autoStopMs))
         {
@@ -167,8 +152,7 @@ internal sealed partial class Advisor
         if(Environment.TickCount64>=nextStatus)
         {
             nextStatus=Environment.TickCount64+1000;
-            SetButton($"暂停计算 (F8) · {activeTime.Elapsed.TotalSeconds:F0} 秒 · 普通动作树 {planner.Nodes} 个节点");
-            UpdateWindowProgress("正在计算");
+
             if(RotateIfNeeded())return;
             var memory=GC.GetGCMemoryInfo();
             if(memory.HeapSizeBytes-initialHeap>768L*1024*1024 && memory.HighMemoryLoadThresholdBytes>0 &&
@@ -176,31 +160,19 @@ internal sealed partial class Advisor
                 PauseTree("内存压力较高，已保留搜索进度");
         }
     }
-    private AnytimeSearch.PreviewLine? displayedPreview;
 
     private void PublishBest()
     {
         var best=planner?.Best;
         if(best?.Record is not {} record)return;
-        displayedPreview=null;
+
         var hp=participants.Zip(record.PostCombatHp,(player,value)=>$"{player.Character.Title.GetFormattedText()} {value}");
         int used=best!.Script!.Count(action=>action.Potion!=null);
         string summary=record.Victory ? "模拟胜利 · 战后生命   "+string.Join("  /  ",hp) :
             $"当前最佳完整路线 · 第 {planner!.BestTurnNumber} 回合全队倒下\n剩 {record.RemainingEnemies} 名敌人，合计 {record.RemainingEnemyHp} 生命";
-        Publish(new(record,best.Script!.Count,0,Format(best),summary+$"\n全队用药 {used} 瓶，剩余 {planner!.BestBottlesLeft} 瓶",planner.BestRisks));
+        Publish(new(record,best.Script!.Count,0,Format(best),summary+$"\n全队用药 {used} 瓶，剩余 {planner!.BestBottlesLeft} 瓶",planner.BestRisks,ResourceScoreVersion:4));
     }
 
-    private void SetWindowRisks(string[] risks)
-        => routeWindow?.SetNotice(risks.Length>0?ReplayCoverage.Summary(risks)+" 悬停查看详情。":"",string.Join("\n",risks));
-
-    private void UpdateWindowProgress(string title)
-    {
-        if(routeWindow==null || planner==null)return;
-        var elapsed=activeTime.Elapsed;
-        string time=$"{(int)elapsed.TotalMinutes:D2}:{elapsed.Seconds:D2}";
-        if(running && savedResult?.Ending?.Victory==true)title="正在优化胜线";
-        routeWindow.SetStatus(title,$"累计 {time}   ·   模拟动作 {meter.Actions:N0} 次（出牌 {meter.Plays:N0} / 用药 {meter.Potions:N0} / 结束回合 {meter.Ends:N0}）\n动作树 {planner.Nodes:N0} 个节点   ·   回合评估 {planner.SettledPlans:N0} 次"+TrackingDetail());
-    }
 
     private void RecordLongSample(AnytimeSearch p)
     {
@@ -233,22 +205,19 @@ internal sealed partial class Advisor
         var p=planner!;
         var best=p.Best;
         string summary=best?.Record is {Verified:true} ? Format(best)
-            : p.Preview is {} preview ? $"当前中间路线，暂算至第 {preview.Turn} 回合，胜负未定。\n"+FormatSteps(board!,preview.Actions,rootRound,root)
             : "本段未找到已复算的路线。";
         string stats=$"{reason}。累计 {activeTime.Elapsed.TotalSeconds:F1} 秒，普通动作树已存 {p.Nodes} 个节点，已展开 {p.RootMoves} 种开局动作、含选牌共 {p.RootOptions} 条，最深 {p.MaxDepth} 步。已做 {p.SettledPlans} 次回合结算评估，仍有 {p.DeferredRoundJobs} 项排队，从当前盘面起算最远到第 {Math.Max(board!.RoundNumber,p.FarthestRootTurn)} 回合。";
         if(p.RoundStorageError!=null)stats+="\n回合候选的临时文件不可用，普通动作树仍可搜索："+p.RoundStorageError;
         if(p.BestRisks.Length>0)
         {
-            var details=p.BestRisks.Where(x=>!string.IsNullOrWhiteSpace(x)).Take(2).ToArray();
-            string warning=ReplayCoverage.Summary(p.BestRisks);
-            if(details.Length>0) warning+=" "+string.Join("、",details);
-            summary=warning+"\n"+summary;
+            var details=p.BestRisks.Where(ReplayCoverage.HasEffectDetail).Take(2).ToArray();
+            if(details.Length>0)summary="未覆盖的效果："+string.Join("、",details)+"\n"+summary;
         }
         if(p.Boundaries.Count>0)stats+="\n部分模拟分支未能结算："+string.Join("、",p.Boundaries.OrderByDescending(k=>k.Value).Take(3).Select(k=>k.Key));
         if(caseOutput!=null)
         {
             double Seconds(long ticks)=>(double)ticks/Stopwatch.Frequency;
-            var profile=new {rounds=Seconds(p.RoundTicks),tree=Seconds(treeTicks),reference=Seconds(referenceTicks),walk=Seconds(p.VisitTicks),rollout=Seconds(p.RolloutTicks),verify=Seconds(p.VerifyTicks),potionTrials=Seconds(p.PotionTrialTicks),p.VisitSteps,p.RolloutSteps};
+            var profile=new {rounds=Seconds(p.RoundTicks),tree=Seconds(treeTicks),reference=Seconds(referenceTicks),walk=Seconds(p.VisitTicks),rollout=Seconds(p.RolloutTicks),verify=Seconds(p.VerifyTicks),p.VisitSteps,p.RolloutSteps};
             var kernelWork=AllocationProbe.Enabled ? AllocationProbe.ReportAndReset() : null;
             if(longStudySeconds>0 && frameGaps.Count>0)RecordLongSample(p);
             var metrics=new {reason,p.DeferredRoundJobs,p.RoundFileBytes,p.SettledPlans,p.TreeSeededPasses,p.FarthestRootTurn,p.FarthestTurn,kernelWork,milliseconds=activeTime.ElapsedMilliseconds,p.Nodes,p.RootMoves,p.RootOptions,p.MaxDepth,p.CompletedRollouts,
@@ -272,11 +241,7 @@ internal sealed partial class Advisor
         if(benchmarks.Length>0 && activeTime.ElapsedMilliseconds>=autoStopMs && ++benchIndex<benchmarks.Length &&
             best?.Record?.Victory!=true && !(p.Finished && search==null))
         {benchResume=true;return;}
-        Report(summary+"\n\n"+stats+"\n盘面保持不变时，可继续计算。",false);
-        UpdateWindowProgress(best?.Record?.Victory==true && reason=="找到已复算的模拟胜线" ? "已找到模拟胜线" : reason);
-        ShowResult();
-        if(savedResult==null && best==null && p.Preview==null)routeWindow?.SetNotice(summary);
-        SyncWindowControl();
-        SetButton("继续计算 (F8)");
+        Report(summary+"\n\n"+stats);
+        nextHud=0;
     }
 }

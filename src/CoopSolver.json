@@ -2,8 +2,8 @@
   "id": "CoopSolver",
   "name": "多人战斗求解器",
   "author": "StS2CoopSolver",
-  "version": "0.6.0",
-  "description": "单人战斗在本机求解，多人战斗由房主计算并共享路线。",
+  "version": "0.10.37",
+  "description": "计算单人或全队战斗路线。联机时可跟随主机，也可在本机独立计算。",
   "has_dll": true,
   "has_pck": false,
   "affects_gameplay": false,
@@ -11,7 +11,7 @@
   "dependencies": [
     {
       "id": "STS2-RitsuLib",
-      "min_version": "0.6.14"
+      "min_version": "0.6.16"
     }
   ]
 }

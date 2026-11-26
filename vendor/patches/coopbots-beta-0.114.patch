@@ -1,0 +1,3518 @@
+diff --git a/src/CoopBots.Kernel/KernelPlanningState.Facts.cs b/src/CoopBots.Kernel/KernelPlanningState.Facts.cs
+index 156d5a7..3703741 100644
+--- a/src/CoopBots.Kernel/KernelPlanningState.Facts.cs
++++ b/src/CoopBots.Kernel/KernelPlanningState.Facts.cs
+@@ -1,3 +1,4 @@
++using MegaCrit.Sts2.Core.Models.Relics;
+ using System.Collections.Concurrent;
+ using System.Collections;
+ using System.Globalization;
+@@ -142,7 +143,7 @@ public sealed partial class KernelSession
+                     // Tracked/stateful relic counters already have explicit
+                     // live/predicted renderers. Their stale native clone fields
+                     // must not override the captured StateStore values below.
+-                    if (!RelicPredictionStateSupport.IsTracked(relic) && !IsStatefulRelic(relic))
++                    if (relic is not ConductorsBaton && !RelicPredictionStateSupport.IsTracked(relic) && !IsStatefulRelic(relic))
+                         AppendDerivedFields(relic, typeof(RelicModel));
+                 }
+             }
+@@ -159,7 +160,8 @@ public sealed partial class KernelSession
+                     if (!stored.Any(entry => ReferenceEquals(entry.Model, power) && entry.StateType == required))
+                         Unavailable("missing-captured-power-state:" + power.GetType().Name);
+                 }
+-                else if (power is GigantificationPower or SubroutinePower or StranglePower)
++                else if (power is GigantificationPower or SubroutinePower or StranglePower or AimPower or ImpaledPower
++                    or QuietusPower or StretchPower or EncorePower or LullabyPower or YahPower or ShowOffPower or VigorPower)
+                 {
+                     // These mirrors keep only an in-flight attack/card-play receipt.
+                     // Their settled effect amount is already captured above.
+@@ -236,6 +238,9 @@ public sealed partial class KernelSession
+                 if (entry.Model is PowerModel retired && retired.Amount == 0
+                     && RequiredPowerStates.TryGetValue(retired.GetType(), out var retiredState)
+                     && entry.StateType == retiredState) continue;
++                // The continuation stamp serializes these with their quiver and owner.
++                if (entry.Model is AimPower or ImpaledPower or QuietusPower or StretchPower or VigorPower) continue;
++                if (entry.Model is PowerModel { Amount: 0 } && entry.Model is EncorePower or LullabyPower or YahPower) continue;
+                 var address = ModelAddress(entry.Model);
+                 if (address is null) { Unavailable("detached-captured-state:" + entry.Model.GetType().Name); continue; }
+                 text.Append(";captured-state=").Append(address).Append('/').Append(entry.StateType.FullName).Append('{');
+diff --git a/src/CoopBots.Kernel/KernelTurns.cs b/src/CoopBots.Kernel/KernelTurns.cs
+index 4f89f9f..4928041 100644
+--- a/src/CoopBots.Kernel/KernelTurns.cs
++++ b/src/CoopBots.Kernel/KernelTurns.cs
+@@ -568,6 +568,7 @@ public sealed partial class KernelSession
+                             return EnemyPhaseFail("unmodeled-move-boundary");
+                         }
+                         LastActionHadEnvironmentalRisk = true;
++                        LastActionRiskDetail = $"enemy-move-unmodeled:{enemy.Monster!.Id.Entry}/{move.Move.Id}";
+                     }
+                     if (!MonsterMoveSemantics.ApplyPartyMove(simulator, Combat, move, targets, processedDeaths,
+                             AutoResolveEnemyChoices)) return EnemyPhaseFail("party-move");
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/CardOnPlayMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/CardOnPlayMirrors.cs
+index 586f6de..15bdc21 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/CardOnPlayMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/CardOnPlayMirrors.cs
+@@ -74,6 +74,22 @@ internal static partial class CardOnPlayMirrors
+     private static Registry CreateRegistry()
+     {
+         var registry = new Registry(OnPlay);
++        FoolCardMirrors.Register(registry);
++        TarotCardMirrors.Register(registry);
++        registry.Register<FoolishShot>(FoolArrowCardMirrors.Shoot);
++        registry.Register<QuickShot>(FoolArrowCardMirrors.Shoot);
++        registry.Register<SkyShot>(FoolArrowCardMirrors.Shoot);
++        registry.Register<DivineShot>(FoolArrowCardMirrors.Shoot);
++        registry.Register<HeavyShot>(FoolArrowCardMirrors.Shoot);
++        registry.Register<RepeatShot>(FoolArrowCardMirrors.Shoot);
++        registry.Register<MelodicShot>(FoolArrowCardMirrors.Shoot);
++        registry.Register<TheShot>(FoolArrowCardMirrors.Shoot);
++        registry.Register<TwinShot>(FoolArrowCardMirrors.Shoot);
++        registry.Register<RainShot>(FoolArrowCardMirrors.Rain);
++        registry.Register<Nock>(FoolArrowCardMirrors.Nock);
++        registry.Register<Quiver>(FoolArrowCardMirrors.Quiver);
++        registry.Register<Recall>((card, context) =>
++            context.Simulator.RecallArrows(context.Target!, card.Owner, context.Card));
+ 
+         registry.Register<HowlFromBeyond>(GeneralCardMirrors.GeneralAttackOnPlay);
+         registry.Register<Mangle>(GeneralCardMirrors.GeneralAttackOnPlay);
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/FoolArrowCardMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/FoolArrowCardMirrors.cs
+new file mode 100644
+index 0000000..0359508
+--- /dev/null
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/FoolArrowCardMirrors.cs
+@@ -0,0 +1,116 @@
++// Adapted from CombatSolver v0.51.9 (Torch1230 and contributors, MIT).
++using MegaCrit.Sts2.Core.Commands;
++using MegaCrit.Sts2.Core.Entities.Cards;
++using MegaCrit.Sts2.Core.Models;
++using MegaCrit.Sts2.Core.Models.Cards;
++using MegaCrit.Sts2.Core.Models.Powers;
++using MegaCrit.Sts2.Core.Hooks;
++using MegaCrit.Sts2.Core.ValueProps;
++using CoopBots.Kernel.Vendor.Engine.InCombat.Simulation;
++
++namespace CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Cards.OnPlay;
++
++internal static class FoolArrowCardMirrors
++{
++    internal static void Blossom(BlossomShot card, CardOnPlayMirrorContext c)
++    {
++        var sim = c.Simulator;
++        if (c.Target is null || sim.State.GetCreature(c.Target).IsDead) return;
++        var arrow = sim.ShootArrow(card.Owner, c.Card);
++        if (arrow is null) return;
++        if (sim.State.GetCreature(c.Target).IsDead)
++        {
++            arrow.Status = MegaCrit.Sts2.Core.Entities.FoolArrows.ArrowStatus.Retrieved;
++            return;
++        }
++        var attack = DamageCmd.Attack(card.DynamicVars.Damage.BaseValue).FromCard(card, c.CardPlay)
++            .FromArrow().Targeting(c.Target);
++        sim.ExecuteAttack(attack);
++        sim.RequireSettledArrowEffect();
++        int damage = attack.Results.SelectMany(hit => hit).Sum(result => result.TotalDamage + result.OverkillDamage);
++        ((SimulatedCombatState)c.CombatState).ApplyPowerFromSource(typeof(StretchPower), card.Owner.Creature,
++            damage, card.Owner.Creature, card);
++        sim.ImpaleArrow(c.Target, arrow, c.Card, c.Card);
++    }
++
++    internal static void Rain(RainShot card, CardOnPlayMirrorContext c)
++    {
++        var sim = c.Simulator;
++        var combat = (SimulatedCombatState)c.CombatState;
++        if (c.Target is null || sim.State.GetCreature(c.Target).IsDead) return;
++        var arrow = sim.ShootArrow(card.Owner, c.Card);
++        if (sim.HasPendingChoice || arrow is null) return;
++        if (sim.State.GetCreature(c.Target).IsDead)
++        {
++            arrow.Status = MegaCrit.Sts2.Core.Entities.FoolArrows.ArrowStatus.Retrieved;
++            return;
++        }
++        var attack = sim.BeginAttackContext(c.Card, c.CardPlay);
++        bool completed = false;
++        try
++        {
++            sim.RequireSettledArrowEffect();
++            if (sim.State.GetCreature(c.Target).IsAlive)
++            {
++                var results = sim.Damage([c.Target], card.DynamicVars.Damage.BaseValue,
++                    ValueProp.Move | ValueProp.FromArrow, card.Owner.Creature, c.Card, c.CardPlay);
++                sim.RequireSettledArrowEffect();
++                sim.AddAttackContextHit(attack, results);
++                if (combat.GetPower<AimPower>(card.Owner.Creature) is { } aim) combat.SetPowerAmount(aim, 0);
++                if (combat.GetPower<QuietusPower>(card.Owner.Creature) is { } quietus) combat.SetPowerAmount(quietus, 0);
++                if (results.FirstOrDefault() is { } result)
++                {
++                    var targets = combat.GetTeammatesOf(result.Receiver)
++                        .Where(target => target != c.Target && sim.State.IsHittable(target)).ToArray();
++                    if (targets.Length > 0)
++                    {
++                        var spread = sim.Damage(targets, result.TotalDamage + result.OverkillDamage,
++                            ValueProp.Move, card.Owner.Creature, c.Card, c.CardPlay, capOnly: true);
++                        sim.RequireSettledArrowEffect();
++                        sim.AddAttackContextHit(attack, spread);
++                    }
++                }
++                sim.ImpaleArrow(c.Target, arrow, c.Card, c.Card);
++                sim.RequireSettledArrowEffect();
++            }
++            completed = true;
++        }
++        finally { sim.EndAttackContext(attack, completed, recordAttack: false); }
++    }
++
++    internal static void Shoot(CardModel card, CardOnPlayMirrorContext context)
++    {
++        int hits = card switch
++        {
++            TwinShot => card.DynamicVars.HitCount.IntValue,
++            RepeatShot => context.Card.ResolveEnergyXValue(context.State),
++            MelodicShot => card.DynamicVars.CalculationBase.IntValue + card.DynamicVars.CalculationExtra.IntValue
++                * ((SimulatedCombatState)context.CombatState).MelodyCount(card.Owner),
++            _ => 1
++        };
++        if (hits <= 0) return;
++        var attack = DamageCmd.Attack(card.DynamicVars.Damage.BaseValue).FromArrow()
++            .FromCard(card, context.CardPlay).WithHitCount(hits).Targeting(context.Target);
++        var sim = context.Simulator;
++        if (!sim.ShootArrowAt(context.Target, card.Owner, context.Card, attack)) return;
++        if (card is TrickShot) sim.Draw(card.Owner, card.DynamicVars.Cards.IntValue);
++        if (card is HobblingShot)
++        {
++            var combat = (SimulatedCombatState)context.CombatState;
++            int amount = card.DynamicVars["Power"].IntValue;
++            combat.ApplyPowerFromSource(typeof(WeakPower), context.Target, amount, card.Owner.Creature, card);
++            if (!sim.HasPendingChoice)
++                combat.ApplyPowerFromSource(typeof(VulnerablePower), context.Target, amount, card.Owner.Creature, card);
++        }
++    }
++
++    internal static void Nock(Nock card, CardOnPlayMirrorContext context)
++        => ((SimulatedCombatState)context.CombatState).ApplyPowerFromSource(typeof(AimPower), card.Owner.Creature,
++            card.DynamicVars["AimPower"].IntValue, card.Owner.Creature, card);
++
++    internal static void Quiver(Quiver card, CardOnPlayMirrorContext context)
++    {
++        for (int index = 0; index < card.DynamicVars.Repeat.BaseValue; index++)
++            context.OwnerState.GainArrowSlot(card.Owner);
++    }
++}
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/FoolCardMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/FoolCardMirrors.cs
+new file mode 100644
+index 0000000..7f964fd
+--- /dev/null
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/FoolCardMirrors.cs
+@@ -0,0 +1,382 @@
++// Adapted from CombatSolver v0.51.9 (Torch1230 and contributors, MIT).
++using CoopBots.Kernel.Vendor.Engine.Common;
++using CoopBots.Kernel.Vendor.Engine.Common.Mirrors;
++using CoopBots.Kernel.Vendor.Engine.InCombat.Extensions;
++using CoopBots.Kernel.Vendor.Engine.InCombat.Simulation;
++using MegaCrit.Sts2.Core.Commands;
++using MegaCrit.Sts2.Core.Entities.Cards;
++using MegaCrit.Sts2.Core.Extensions;
++using MegaCrit.Sts2.Core.Models;
++using MegaCrit.Sts2.Core.Models.CardPools;
++using MegaCrit.Sts2.Core.Models.Cards;
++using MegaCrit.Sts2.Core.Models.Powers;
++using MegaCrit.Sts2.Core.ValueProps;
++
++namespace CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Cards.OnPlay;
++
++internal static class FoolCardMirrors
++{
++    internal static void Register(MethodMirrorRegistry<CardModel, CardOnPlayMirrorContext> registry)
++    {
++        registry.Register<BlossomShot>(FoolArrowCardMirrors.Blossom);
++        registry.Register<HobblingShot>(FoolArrowCardMirrors.Shoot);
++        registry.Register<TrickShot>(FoolArrowCardMirrors.Shoot);
++        registry.Register<StrikeFool>((_, c) => c.AttackSingle());
++        registry.Register<DefendFool>((card, c) => c.GainBlock(card.Owner.Creature));
++        registry.Register<WhistlingArrows>((card, c) => c.GainBlock(card.Owner.Creature));
++        registry.Register<Coda>((_, c) => c.AttackSingle());
++        registry.Register<EpicRetrieval>((_, c) => c.AttackSingle());
++        registry.Register<Anguish>((card, c) =>
++        {
++            int generated = ((SimulatedCombatState)c.CombatState).SadnessGenerated(c.Simulator, card.Owner);
++            decimal damage = card.DynamicVars.CalculationBase.BaseValue + card.DynamicVars.ExtraDamage.BaseValue * generated;
++            c.Simulator.ExecuteAttack(DamageCmd.Attack(damage).FromCard(card, c.CardPlay).Targeting(c.Target));
++        });
++        registry.Register<WahSymphony>((card, c) =>
++        {
++            int melodies = c.OwnerState.AllCards.Count(candidate =>
++                candidate.Preview.Tags.Contains(CardTag.Cho) || candidate.Preview.Tags.Contains(CardTag.Ki));
++            decimal damage = card.DynamicVars.CalculationBase.BaseValue + card.DynamicVars.ExtraDamage.BaseValue * melodies;
++            c.Simulator.ExecuteAttack(DamageCmd.Attack(damage).FromCard(card, c.CardPlay).TargetingAllOpponents(c.CombatState));
++        });
++        registry.Register<RhythmStrike>((card, c) => c.AttackSingle(card.DynamicVars.CalculationBase.IntValue
++            + card.DynamicVars.CalculationExtra.IntValue * ((SimulatedCombatState)c.CombatState).MelodyCount(card.Owner)));
++        registry.Register<HarmonicShield>((card, c) =>
++        {
++            var variable = card.DynamicVars.CalculatedBlock;
++            decimal block = card.DynamicVars.CalculationBase.BaseValue + card.DynamicVars.CalculationExtra.BaseValue
++                * ((SimulatedCombatState)c.CombatState).MelodyCount(card.Owner);
++            c.Simulator.GainBlock(card.Owner.Creature, block, variable.Props, c.Card, c.CardPlay);
++        });
++        registry.Register<Enrapture>(Play);
++        registry.Register<SelfDeprecate>(Play);
++        registry.Register<Yoga>(Play);
++        registry.Register<Optimism>(Play);
++        OwnerPower<Compost, CompostPower>(registry, "Energy");
++        OwnerPower<CoveringFire, CoveringFirePower>(registry, "CoveringFirePower");
++        OwnerPower<Ensemble, EnsemblePower>(registry, "Cards");
++        registry.Register<ShowOff>((card, c) =>
++        {
++            var combat = (SimulatedCombatState)c.CombatState;
++            combat.ApplyPowerFromSource(typeof(AimPower), card.Owner.Creature, card.DynamicVars["AimPower"].IntValue,
++                card.Owner.Creature, card);
++            if (!c.Simulator.HasPendingChoice && !c.Simulator.IsEnding) combat.ApplyShowOff(c.Card);
++        });
++        registry.Register<KiChant>((card, c) =>
++        {
++            var draw = c.OwnerState.DrawPile;
++            if (draw.Cards.Count == 0) c.Simulator.ShuffleIfNecessary(card.Owner);
++            else if (draw.Cards.Count < card.DynamicVars.Cards.IntValue && !c.OwnerState.DiscardPile.IsEmpty)
++            {
++                var top = draw.Cards.ToArray();
++                c.Simulator.Shuffle(card.Owner);
++                if (c.Simulator.HasPendingChoice) return;
++                c.Simulator.AddToPile(top.Where(candidate => candidate.GetPile(c.State) == draw).Reverse().ToArray(),
++                    PileType.Draw, CardPilePosition.Top);
++            }
++        });
++        OwnerPower<AllIsWell, AllIsWellPower>(registry, "AllIsWellPower");
++        OwnerPower<Archery, ArcheryPower>(registry, "AimPower");
++        OwnerPower<Ecstasy, EcstasyPower>(registry, "Cards");
++        OwnerPower<HiddenRoots, HiddenRootsPower>(registry, "HiddenRootsPower");
++        OwnerPower<Honing, HoningPower>(registry, "HoningPower");
++        OwnerPower<LostLute, LostLutePower>(registry, "LostLutePower");
++        OwnerPower<Lullaby, LullabyPower>(registry, "LullabyPower");
++        OwnerPower<Motif, MotifPower>(registry, "MotifPower");
++        OwnerPower<Quietus, QuietusPower>(registry, "QuietusPower");
++        OwnerPower<SerratedArrows, SerratedArrowsPower>(registry, "SerratedArrowsPower");
++        OwnerPower<Simpleton, SimpletonPower>(registry, "SimpletonPower");
++        OwnerPower<SongPath, SongPathPower>(registry, "SongPathPower");
++        OwnerPower<Tune, TunePower>(registry, "Cards");
++        OwnerPower<ViolentChord, ViolentChordPower>(registry, "ViolentChordPower");
++        OwnerPower<Yah, YahPower>(registry, "Energy");
++        OwnerPower<ExplosiveArrows, ExplosiveArrowsPower>(registry, "ExplosiveArrowsPower");
++        OwnerPower<KiVerse, KiVersePower>(registry, "KiVersePower");
++        registry.Register<BrightenUp>(Play);
++        registry.Register<MourningBlow>((card, c) =>
++        {
++            c.AttackSingle();
++            if (!c.Simulator.HasPendingChoice && c.CardPlay.IsLastInSeries)
++                c.MutablePreviewCard.TransformIntoAfterPlay = PredictionUtils.CreateCard(ModelDb.Card<Sadness>(), card.Owner);
++        });
++        registry.Register<Florescence>((_, _) => { });
++        registry.Register<Encore>((card, c) =>
++        {
++            c.Simulator.GainEnergy(card.Owner, card.DynamicVars.Energy.IntValue);
++            if (c.Simulator.HasPendingChoice) return;
++            c.Simulator.Draw(card.Owner, card.DynamicVars.Cards.IntValue);
++            if (!c.Simulator.HasPendingChoice)
++                ((SimulatedCombatState)c.CombatState).ApplyPowerFromSource(typeof(EncorePower), card.Owner.Creature,
++                    card.DynamicVars["EncorePower"].IntValue, card.Owner.Creature, card);
++        });
++        registry.Register<Ennui>((card, c) =>
++        {
++            var combat = (SimulatedCombatState)c.CombatState;
++            combat.ApplyPowerFromSource(typeof(EnnuiPower), card.Owner.Creature, card.DynamicVars["EnnuiPower"].IntValue, card.Owner.Creature, card);
++            combat.GetPower<EnnuiPower>(card.Owner.Creature)?.IncrementSadnessAmount();
++        });
++        registry.Register<MythicForm>((card, c) =>
++        {
++            var combat = (SimulatedCombatState)c.CombatState;
++            combat.ApplyPowerFromSource(typeof(MythicFormPower), card.Owner.Creature, 1, card.Owner.Creature, card);
++        });
++        OwnerPower<Bounce, StretchPower>(registry, "StretchPower");
++        registry.Register<ChoChorus>((card, c) =>
++        {
++            c.GainBlock(card.Owner.Creature);
++            if (c.Simulator.HasPendingChoice) return;
++            var cards = c.OwnerState.Hand.Cards.Where(candidate => candidate.Preview.Tags.Contains(CardTag.Wah)
++                || candidate.Preview.Tags.Contains(CardTag.Ki)).ToArray();
++            foreach (var candidate in cards)
++            {
++                c.Simulator.AutoPlay(candidate, nestedChoiceSourceId: card.Id.Entry);
++                if (c.Simulator.HasPendingChoice) return;
++            }
++        });
++        registry.Register<Brace>(Play);
++        registry.Register<Joy>(Play);
++        registry.Register<ChoBarbs>(Play);
++        registry.Register<ChoFirm>(Play);
++        registry.Register<ChoKi>(Play);
++        registry.Register<ChoReady>(Play);
++        registry.Register<ChoLimbs>(Play);
++        registry.Register<DeepStretch>(Play);
++        registry.Register<DislikeYou>(Play);
++        registry.Register<KiHop>(Play);
++        registry.Register<KiWhip>(Play);
++        registry.Register<KiRest>(Play);
++        registry.Register<BowSmack>(Play);
++        registry.Register<PunchOfJoy>(Play);
++        registry.Register<SorrowfulStrike>(Play);
++        registry.Register<WahCho>(Play);
++        registry.Register<WahChoKi>(Play);
++        registry.Register<WahKi>(Play);
++        registry.Register<WahSweep>(Play);
++        registry.Register<WahTouch>(Play);
++        registry.Register<Timber>(Play);
++        registry.Register<Jest>(Play);
++        registry.Register<Nail>(Play);
++        registry.Register<Rummage>(Play);
++        registry.Register<Vitriol>(Play);
++        registry.Register<Growth>(Play);
++        registry.Register<Uproot>(Play);
++        registry.Register<Wrest>(Play);
++        registry.Register<BlotOutTheSky>(Play);
++        registry.Register<LockedIn>((_, _) => { });
++        registry.Register<ArrowStab>((_, c) => c.AttackSingle());
++        registry.Register<WahHammer>((_, c) => c.AttackSingle());
++        registry.Register<WahBlast>((card, c) => c.AttackAllOpponents(
++            ((SimulatedCombatState)c.CombatState).PlayedMelody(card.Owner, CardTag.Cho)
++            || ((SimulatedCombatState)c.CombatState).PlayedMelody(card.Owner, CardTag.Ki) ? 2 : 1));
++        registry.Register<SteadyCadence>((card, c) =>
++        {
++            c.AttackSingle();
++            if (!c.Simulator.HasPendingChoice)
++                c.Simulator.Draw(card.Owner, card.DynamicVars.CalculationBase.IntValue
++                    + card.DynamicVars.CalculationExtra.IntValue * ((SimulatedCombatState)c.CombatState).MelodyCount(card.Owner));
++        });
++    }
++
++    private static void OwnerPower<TCard, TPower>(MethodMirrorRegistry<CardModel, CardOnPlayMirrorContext> registry, string key)
++        where TCard : CardModel where TPower : PowerModel
++        => registry.Register<TCard>((card, c) => ((SimulatedCombatState)c.CombatState).ApplyPowerFromSource(
++            typeof(TPower), card.Owner.Creature, card.DynamicVars[key].IntValue, card.Owner.Creature, card));
++
++    private static void Play(CardModel card, CardOnPlayMirrorContext c)
++    {
++        var sim = c.Simulator;
++        var combat = (SimulatedCombatState)c.CombatState;
++        var owner = card.Owner;
++        void Apply<T>(int amount, bool enemy = false) where T : PowerModel
++            => combat.ApplyPowerFromSource(typeof(T), enemy ? c.Target! : owner.Creature, amount, owner.Creature, card);
++        void Generate<T>(int count) where T : CardModel
++            => sim.CreateAndAddGeneratedCardsToCombat<T>(owner, PileType.Hand, count, owner);
++        bool Impaled() => c.Target is not null && combat.EffectivePowers().OfType<ImpaledPower>()
++            .Any(power => power.Amount > 0 && power.Owner == c.Target);
++
++        switch (card)
++        {
++            case Enrapture:
++                Apply<VigorPower>(card.DynamicVars["VigorPower"].IntValue, true);
++                if (!sim.HasPendingChoice) Apply<StretchPower>(card.DynamicVars["StretchPower"].IntValue, true);
++                break;
++            case SelfDeprecate:
++                Generate<Sadness>(card.DynamicVars["Sadness"].IntValue);
++                foreach (var ally in combat.GetTeammatesOf(owner.Creature))
++                {
++                    if (sim.HasPendingChoice) return;
++                    if (ally.Player is { } player && player != owner && sim.State.GetCreature(ally).IsAlive)
++                        sim.CreateAndAddGeneratedCardsToCombat<Joy>(player, PileType.Hand, card.DynamicVars["Joy"].IntValue, owner);
++                }
++                break;
++            case Yoga:
++                foreach (var ally in combat.GetTeammatesOf(owner.Creature).Where(ally => ally.IsPlayer && sim.State.GetCreature(ally).IsAlive))
++                {
++                    combat.ApplyPowerFromSource(typeof(StretchPower), ally, card.DynamicVars["StretchPower"].IntValue, owner.Creature, card);
++                    if (sim.HasPendingChoice) return;
++                }
++                break;
++            case Optimism:
++                var removed = c.OwnerState.Hand.Cards.Where(candidate => candidate.Preview is Sadness).ToArray();
++                foreach (var candidate in removed) { sim.Exhaust(candidate); if (sim.HasPendingChoice) return; }
++                if (removed.Length > 0) sim.Draw(owner, removed.Length);
++                break;
++            case BrightenUp:
++                Generate<Sadness>(card.DynamicVars["Sadness"].IntValue);
++                if (!sim.HasPendingChoice) Generate<Joy>(card.DynamicVars["Joy"].IntValue);
++                break;
++            case Brace:
++                for (int i = 0, count = c.Card.ResolveEnergyXValue(c.State); i < count; i++)
++                {
++                    Apply<AimPower>(card.DynamicVars["AimPower"].IntValue);
++                    if (sim.HasPendingChoice) return;
++                }
++                break;
++            case Joy:
++                sim.GainEnergy(owner, card.DynamicVars.Energy.IntValue);
++                if (!sim.HasPendingChoice) sim.Draw(owner, card.DynamicVars.Cards.IntValue);
++                break;
++            case ChoBarbs:
++                c.GainBlock(owner.Creature);
++                if (!sim.HasPendingChoice) Apply<ChoBarbsPower>(card.DynamicVars["ChoBarbsPower"].IntValue);
++                break;
++            case ChoFirm:
++            case ChoLimbs:
++                int blocks = card is ChoLimbs || c.OwnerState.Arrows.Any(arrow => arrow.IsAvailable) ? 2 : 1;
++                for (int i = 0; i < blocks; i++) { c.GainBlock(owner.Creature); if (sim.HasPendingChoice) return; }
++                break;
++            case ChoKi:
++                int stretch = combat.GetAmount<StretchPower>(owner.Creature);
++                c.GainBlock(owner.Creature);
++                if (!sim.HasPendingChoice && stretch > 0) Apply<StretchPower>(stretch);
++                break;
++            case ChoReady:
++                c.GainBlock(owner.Creature);
++                if (!sim.HasPendingChoice) Apply<AimPower>(card.DynamicVars["AimPower"].IntValue);
++                break;
++            case DeepStretch:
++                Apply<StretchPower>(card.DynamicVars["StretchPower"].IntValue);
++                if (!sim.HasPendingChoice) sim.Draw(owner, card.DynamicVars.Cards.IntValue);
++                break;
++            case DislikeYou:
++                c.AttackSingle();
++                if (!sim.HasPendingChoice) Apply<DislikeYouPower>(card.DynamicVars["DislikeYouPower"].IntValue, true);
++                break;
++            case KiHop:
++            case BowSmack:
++                bool impaled = Impaled();
++                c.AttackSingle();
++                if (sim.HasPendingChoice || !impaled) return;
++                if (card is KiHop) sim.Draw(owner, card.DynamicVars.Cards.IntValue);
++                else sim.GainEnergy(owner, card.DynamicVars.Energy.IntValue);
++                break;
++            case KiWhip:
++                c.AttackSingle();
++                if (!sim.HasPendingChoice) Apply<EnergyNextTurnPower>(card.DynamicVars.Energy.IntValue);
++                break;
++            case WahKi:
++                c.AttackSingle(card.DynamicVars.HitCount.IntValue);
++                break;
++            case KiRest:
++                Apply<EnergyNextTurnPower>(card.DynamicVars.Energy.IntValue);
++                if (!sim.HasPendingChoice && (combat.PlayedMelody(owner, CardTag.Wah) || combat.PlayedMelody(owner, CardTag.Cho)))
++                    Apply<RetainHandPower>(1);
++                break;
++            case PunchOfJoy:
++                c.AttackSingle();
++                if (sim.HasPendingChoice) return;
++                var sadness = c.OwnerState.Hand.Cards.Where(candidate => candidate.Preview is Sadness).ToList();
++                if (sadness.Count > 0)
++                {
++                    var chosen = sadness.StableShuffle(c.Rng.CombatCardSelection).Take(card.DynamicVars.Cards.IntValue).ToArray();
++                    if (!CardChoiceSupport.TransformCards(sim, chosen, CanonicalModels.Card<Joy>(), false))
++                        sim.RejectExecutionContinuation();
++                }
++                break;
++            case SorrowfulStrike:
++                c.AttackSingle();
++                if (!sim.HasPendingChoice) Generate<Sadness>(card.DynamicVars.Cards.IntValue);
++                break;
++            case WahCho:
++                c.GainBlock(owner.Creature);
++                if (!sim.HasPendingChoice) c.AttackSingle();
++                break;
++            case WahChoKi:
++                c.AttackSingle();
++                if (sim.HasPendingChoice) return;
++                c.GainBlock(owner.Creature);
++                if (!sim.HasPendingChoice) sim.Draw(owner, card.DynamicVars.Cards.IntValue);
++                break;
++            case WahSweep:
++                c.AttackAllOpponents();
++                break;
++            case WahTouch:
++                c.AttackSingle();
++                if (!sim.HasPendingChoice) Apply<VulnerablePower>(card.DynamicVars.Vulnerable.IntValue, true);
++                break;
++            case Timber:
++                var timber = sim.BeginAttackContext(c.Card, c.CardPlay);
++                bool completed = false;
++                try
++                {
++                    var hits = sim.Damage([c.Target], card.DynamicVars.Damage.BaseValue,
++                        ValueProp.Move, owner.Creature, c.Card, c.CardPlay);
++                    sim.RequireSettledArrowEffect();
++                    sim.AddAttackContextHit(timber, hits);
++                    if (hits.Any(result => result.WasTargetKilled))
++                    {
++                        var opponents = combat.GetOpponentsOf(owner.Creature).Where(sim.State.IsHittable).ToArray();
++                        var spread = sim.Damage(opponents, card.DynamicVars["OnKillDamage"].BaseValue,
++                            ValueProp.Move, owner.Creature, c.Card, c.CardPlay);
++                        sim.RequireSettledArrowEffect();
++                        sim.AddAttackContextHit(timber, spread);
++                    }
++                    completed = true;
++                }
++                finally { sim.EndAttackContext(timber, completed, recordAttack: false); }
++                break;
++            case Jest:
++                c.GainBlock(owner.Creature);
++                if (!sim.HasPendingChoice) Generate<Sadness>(card.DynamicVars.Cards.IntValue);
++                break;
++            case Nail:
++                if (!Impaled()) return;
++                c.AttackSingle();
++                if (sim.HasPendingChoice) return;
++                Apply<WeakPower>(card.DynamicVars["Power"].IntValue, true);
++                if (!sim.HasPendingChoice) Apply<VulnerablePower>(card.DynamicVars["Power"].IntValue, true);
++                break;
++            case Rummage:
++                sim.Draw(owner, card.DynamicVars.Cards.IntValue);
++                if (!sim.HasPendingChoice) Generate<Sadness>(1);
++                break;
++            case Vitriol:
++                Apply<WeakPower>(card.DynamicVars.Weak.IntValue, true);
++                if (!sim.HasPendingChoice) Generate<Sadness>(card.DynamicVars.Cards.IntValue);
++                break;
++            case Growth:
++                c.GainBlock(owner.Creature);
++                if (sim.HasPendingChoice) return;
++                var sad = c.OwnerState.Hand.Cards.Where(candidate => candidate.Preview is Sadness)
++                    .ToList().StableShuffle(c.Rng.CombatCardSelection).FirstOrDefault();
++                if (sad != null)
++                    CardChoiceSupport.TransformCardToGeneratedReplacement(sim, sad, c.Card.CreateClone().MutablePreview);
++                break;
++            case Uproot:
++            case Wrest:
++                if (sim.ImpaledBy(c.Target!, owner) is null) return;
++                while (sim.ImpaledBy(c.Target!, owner) is not null)
++                { sim.RecallArrows(c.Target!, owner, c.Card); if (sim.HasPendingChoice) return; }
++                if (card is Uproot) Apply<VulnerablePower>(card.DynamicVars.Vulnerable.IntValue, true);
++                else sim.Draw(owner, card.DynamicVars.Cards.IntValue);
++                break;
++            case BlotOutTheSky:
++                var generated = ModelDb.CardPool<FoolCardPool>().GetUnlockedCards(owner.UnlockState, c.CardMultiplayerConstraint)
++                    .Where(candidate => candidate.Tags.Contains(CardTag.Shoot))
++                    .GetDistinctForCombat(owner, 1, c.Rng.CombatCardGeneration, c.CardMultiplayerConstraint);
++                sim.AddGeneratedCardsToCombat(generated.Select(candidate => candidate.SetToFreeThisTurn()).ToList(), PileType.Hand, owner);
++                break;
++            default: throw new ArgumentOutOfRangeException(nameof(card), card.GetType().FullName);
++        }
++    }
++}
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/TarotCardMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/TarotCardMirrors.cs
+new file mode 100644
+index 0000000..8ff3238
+--- /dev/null
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/TarotCardMirrors.cs
+@@ -0,0 +1,139 @@
++// Adapted from CombatSolver v0.51.9 (Torch1230 and contributors, MIT).
++using CoopBots.Kernel.Vendor.Engine.Common;
++using CoopBots.Kernel.Vendor.Engine.Common.Mirrors;
++using CoopBots.Kernel.Vendor.Engine.InCombat.Extensions;
++using CoopBots.Kernel.Vendor.Engine.InCombat.Simulation;
++using MegaCrit.Sts2.Core.Entities.Cards;
++using MegaCrit.Sts2.Core.Commands;
++using MegaCrit.Sts2.Core.Extensions;
++using MegaCrit.Sts2.Core.Models;
++using MegaCrit.Sts2.Core.Models.Cards;
++using MegaCrit.Sts2.Core.Models.Powers;
++using MegaCrit.Sts2.Core.ValueProps;
++
++namespace CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Cards.OnPlay;
++
++internal static class TarotCardMirrors
++{
++    internal static void Register(MethodMirrorRegistry<CardModel, CardOnPlayMirrorContext> registry)
++    {
++        registry.Register<TheTower>((card, context) =>
++        {
++            var combat = (SimulatedCombatState)context.CombatState;
++            decimal damage = card.DynamicVars.CalculationBase.BaseValue + card.DynamicVars.ExtraDamage.BaseValue * combat.CapturedTotalFloor;
++            context.Simulator.ExecuteAttack(DamageCmd.Attack(damage).FromCard(card, context.CardPlay).Targeting(context.Target));
++        });
++        registry.Register<Death>(Play); registry.Register<Judgement>(Play); registry.Register<Strength>(Play);
++        registry.Register<TheDevil>(Play); registry.Register<TheEmperor>(Play); registry.Register<TheEmpress>(Play);
++        registry.Register<TheFool>(Play); registry.Register<TheHangedMan>(Play); registry.Register<TheHierophant>(Play);
++        registry.Register<TheLovers>(Play); registry.Register<TheMagician>(Play); registry.Register<TheMoon>(Play);
++        registry.Register<TheStar>(Play); registry.Register<TheSun>(Play); registry.Register<TheWorld>(Play);
++        registry.Register<WheelOfFortune>(Play); registry.Register<TheHermit>((_, _) => { });
++        registry.Register<MightyShield>(Play); registry.Register<MightyWeapon>(Play); registry.Register<GodByrd>(Play);
++    }
++
++    private static void Play(CardModel card, CardOnPlayMirrorContext c)
++    {
++        var sim = c.Simulator;
++        var combat = (SimulatedCombatState)c.CombatState;
++        var owner = card.Owner;
++        void Apply<T>(int amount, bool enemy = false) where T : PowerModel
++            => combat.ApplyPowerFromSource(typeof(T), enemy ? c.Target! : owner.Creature, amount, owner.Creature, card);
++        switch (card)
++        {
++            case Death: Apply<DoomPower>(card.DynamicVars.Doom.IntValue, true); break;
++            case Strength: Apply<StrengthPower>(card.DynamicVars["StrengthPower"].IntValue); break;
++            case Judgement:
++                if (sim.State.GetCreature(c.Target!).IsAlive && sim.State.GetCreature(c.Target!).CurrentHp <= card.DynamicVars["Threshold"].IntValue)
++                    sim.Kill(c.Target!);
++                break;
++            case TheDevil:
++                var exhausted = c.OwnerState.Hand.Cards.ToArray();
++                foreach (var item in exhausted) { sim.Exhaust(item); if (sim.HasPendingChoice) return; }
++                sim.AutoPlayFromDrawPile(owner, exhausted.Length, CardPilePosition.Top, upgrade: card.IsUpgraded);
++                break;
++            case TheEmperor: sim.GainEnergy(owner, card.DynamicVars.Energy.IntValue); break;
++            case TheEmpress:
++                Apply<WeakPower>(card.DynamicVars["Power"].IntValue, true);
++                if (!sim.HasPendingChoice) Apply<VulnerablePower>(card.DynamicVars["Power"].IntValue, true);
++                break;
++            case TheFool:
++                for (int index = 0; index < card.DynamicVars.Cards.BaseValue; index++)
++                {
++                    var selected = c.OwnerState.Hand.Cards.Where(candidate => !candidate.HasKeyword(c.State, CardKeyword.Unplayable))
++                        .ToList().StableShuffle(c.Rng.CombatCardSelection).FirstOrDefault();
++                    if (selected is null) continue;
++                    sim.AutoPlay(selected, nestedChoiceSourceId: card.Id.Entry);
++                    if (sim.HasPendingChoice) return;
++                }
++                break;
++            case TheHangedMan:
++                sim.Damage([owner.Creature], card.DynamicVars.HpLoss.BaseValue,
++                    ValueProp.Unblockable | ValueProp.Unpowered | ValueProp.Move, owner.Creature, c.Card, c.CardPlay);
++                if (!sim.HasPendingChoice) combat.Apply<ExtraTurnPower>(owner.Creature, 1, owner.Creature);
++                break;
++            case TheHierophant:
++                foreach (var generated in sim.GetDistinctUnlockedColorlessForCombat(owner, card.DynamicVars.Cards.IntValue,
++                             c.Rng.CombatCardGeneration, c.CardMultiplayerConstraint).ToArray())
++                {
++                    sim.AddGeneratedCardToCombat(generated, PileType.Hand, owner);
++                    if (sim.HasPendingChoice) return;
++                }
++                break;
++            case TheLovers:
++                var pools = owner.UnlockState.CharacterCardPools.ToList();
++                if (pools.Count > 1) pools.Remove(owner.Character.CardPool);
++                var loversCards = pools.SelectMany(pool => pool.GetUnlockedCards(owner.UnlockState, c.CardMultiplayerConstraint))
++                    .GetForCombat(owner, sim.GetMaxHandSize(owner) - c.OwnerState.Hand.Cards.Count,
++                        c.Rng.CombatCardGeneration, c.CardMultiplayerConstraint).ToArray();
++                if (card.IsUpgraded) foreach (var generated in loversCards) generated.Upgrade();
++                sim.AddGeneratedCardsToCombat(loversCards, PileType.Hand, owner);
++                break;
++            case TheMagician:
++                c.OwnerState.OrbQueue.AddCapacity(card.DynamicVars.Repeat.IntValue);
++                for (int index = 0; index < card.DynamicVars.Repeat.IntValue; index++)
++                {
++                    sim.OrbChannel(owner, OrbModel.GetRandomOrb(c.Rng.CombatOrbGeneration).ToMutable());
++                    if (sim.HasPendingChoice) return;
++                }
++                break;
++            case TheMoon:
++                var shivs = sim.CreateAndAddGeneratedCardsToCombat<Shiv>(owner, PileType.Hand,
++                    sim.GetMaxHandSize(owner) - c.OwnerState.Hand.Cards.Count, owner);
++                if (sim.HasPendingChoice) return;
++                if (card.IsUpgraded) foreach (var result in shivs) result.CardAdded.Upgrade();
++                break;
++            case TheStar:
++                Apply<EnergyNextTurnPower>(card.DynamicVars.Energy.IntValue);
++                if (!sim.HasPendingChoice) Apply<DrawCardsNextTurnPower>(card.DynamicVars.Cards.IntValue);
++                break;
++            case TheSun:
++                sim.Draw(owner, card.DynamicVars.Cards.IntValue);
++                if (sim.HasPendingChoice) return;
++                sim.GainEnergy(owner, card.DynamicVars.Energy.IntValue);
++                if (!sim.HasPendingChoice) sim.CreateAndAddGeneratedCardsToCombat<Soot>(owner, PileType.Draw, 2, owner, CardPilePosition.Random);
++                break;
++            case TheWorld:
++                int count = Math.Max(0, Math.Min(card.DynamicVars.Cards.IntValue, sim.GetMaxHandSize(owner) - c.OwnerState.Hand.Cards.Count));
++                sim.AddToPile(c.OwnerState.DiscardPile.Cards.TakeRandom(count, c.Rng.CombatCardSelection).ToList(), PileType.Hand);
++                break;
++            case WheelOfFortune:
++                var hand = c.OwnerState.Hand.Cards.ToArray();
++                if (hand.Length > 0) sim.DiscardAndDraw(hand, card.DynamicVars.Cards.IntValue);
++                else sim.Draw(owner, card.DynamicVars.Cards.IntValue);
++                break;
++            case MightyShield:
++            case MightyWeapon:
++                if (card is MightyShield) c.GainBlock(owner.Creature); else c.AttackAllOpponents();
++                if (sim.HasPendingChoice) return;
++                for (int i = 0; i < card.DynamicVars.Cards.IntValue; i++)
++                {
++                    sim.CreateAndAddGeneratedCardsToCombat<Dazed>(owner, PileType.Draw, 1, owner, CardPilePosition.Random);
++                    if (sim.HasPendingChoice) return;
++                }
++                break;
++            case GodByrd: Apply<GodByrdPower>(card.DynamicVars.Damage.IntValue); break;
++            default: throw new ArgumentOutOfRangeException(nameof(card), card.GetType().FullName);
++        }
++    }
++}
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/HookMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/HookMirrors.cs
+index 0469004..b97fe77 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/HookMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/HookMirrors.cs
+@@ -7,6 +7,7 @@ using MegaCrit.Sts2.Core.Entities.Creatures;
+ using MegaCrit.Sts2.Core.Entities.Players;
+ using MegaCrit.Sts2.Core.Hooks;
+ using MegaCrit.Sts2.Core.Models;
++using MegaCrit.Sts2.Core.Models.Powers;
+ using MegaCrit.Sts2.Core.Models.Relics;
+ using MegaCrit.Sts2.Core.ValueProps;
+ using CoopBots.Kernel.Vendor.Engine.Common;
+@@ -50,7 +51,13 @@ internal static partial class HookMirrors
+ 
+         foreach (var listener in IterateCombatHookListeners(simulator, MirroredHookMask.ModifyBlockAdditive))
+         {
+-            var additive = listener.ModifyBlockAdditive(target, block, props, cardModel, cardPlay);
++            var additive = listener is StretchPower stretch
++                ? StretchPowerMirrors.Modify(stretch, new ModifyBlockMultiplicativeMirrorContext
++                {
++                    Simulator = simulator, Target = target, Amount = block, Props = props,
++                    CardSource = cardSource, CardPlay = cardPlay
++                })
++                : listener.ModifyBlockAdditive(target, block, props, cardModel, cardPlay);
+             block += additive;
+             if (additive != 0)
+             {
+@@ -690,6 +697,7 @@ internal static partial class HookMirrors
+     public static void AbortCardPlayed(CombatPredictionSimulator simulator, CardPlay cardPlay)
+     {
+         BeforeCardPlayedMirrors.CompleteOrAbort(simulator, cardPlay);
++        StretchPowerMirrors.Cleanup(simulator, cardPlay, completed: false);
+         AfterCardPlayedMirrors.CompleteOrAbort(simulator, cardPlay, completed: false);
+     }
+ 
+@@ -729,6 +737,7 @@ internal static partial class HookMirrors
+         // A paired listener can be removed by the card being resolved, so it no longer appears in
+         // either AfterCardPlayed pass. The pairing belongs to this completed CardPlay transaction.
+         BeforeCardPlayedMirrors.CompleteOrAbort(simulator, cardPlay);
++        StretchPowerMirrors.Cleanup(simulator, cardPlay, completed: true);
+         AfterCardPlayedMirrors.CompleteOrAbort(simulator, cardPlay, completed: true);
+     }
+ 
+@@ -814,6 +823,12 @@ internal static partial class HookMirrors
+             }
+         }
+ 
++        return ApplyDamageCap(simulator, target, dealer, damage, props, cardModel, cardPlay);
++    }
++
++    internal static decimal ApplyDamageCap(CombatPredictionSimulator simulator, Creature? target, Creature? dealer,
++        decimal damage, ValueProp props, CardModel? cardModel, CardPlay? cardPlay)
++    {
+         var cap = decimal.MaxValue;
+         foreach (var listener in IterateRunHookListeners(simulator, MirroredHookMask.ModifyDamageCap))
+         {
+@@ -1152,13 +1167,15 @@ internal static partial class HookMirrors
+     public static void AfterDeath(
+         CombatPredictionSimulator simulator,
+         Creature creature,
+-        bool wasRemovalPrevented)
++        bool wasRemovalPrevented,
++        PredictedCard? cardSource = null)
+     {
+         var context = new AfterDeathMirrorContext
+         {
+             Simulator = simulator,
+             Creature = creature,
+-            WasRemovalPrevented = wasRemovalPrevented
++            WasRemovalPrevented = wasRemovalPrevented,
++            Source = cardSource
+         };
+ 
+         foreach (var listener in IterateRunHookListeners(simulator, MirroredHookMask.AfterDeath))
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/ArrowMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/ArrowMirrors.cs
+new file mode 100644
+index 0000000..d86462a
+--- /dev/null
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/ArrowMirrors.cs
+@@ -0,0 +1,90 @@
++// Adapted from CombatSolver v0.51.9 (Torch1230 and contributors, MIT). See the upstream notices.
++using CoopBots.Kernel.Vendor.Engine.Common;
++using CoopBots.Kernel.Vendor.Engine.Common.Mirrors;
++using MegaCrit.Sts2.Core.Entities.Cards;
++using MegaCrit.Sts2.Core.Entities.FoolArrows;
++using MegaCrit.Sts2.Core.Entities.Players;
++using MegaCrit.Sts2.Core.GameActions.Multiplayer;
++using MegaCrit.Sts2.Core.Models;
++using MegaCrit.Sts2.Core.Models.Cards;
++using MegaCrit.Sts2.Core.Models.Powers;
++using MegaCrit.Sts2.Core.Models.Relics;
++using MegaCrit.Sts2.Core.ValueProps;
++
++namespace CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks;
++
++internal static class ArrowMirrors
++{
++    private static readonly MethodMirrorRegistry<AbstractModel, ArrowMirrorContext> Shot = new(
++        MirrorMethodSpec.Hook(nameof(AbstractModel.AfterArrowShot),
++            [typeof(Player), typeof(ArrowSlot), typeof(PlayerChoiceContext), typeof(CardModel)]));
++    private static readonly MethodMirrorRegistry<AbstractModel, ArrowMirrorContext> Impaled = new(
++        MirrorMethodSpec.Hook(nameof(AbstractModel.AfterArrowImpaled),
++            [typeof(ImpaledPower), typeof(ArrowSlot), typeof(PlayerChoiceContext), typeof(CardModel)]));
++    private static readonly MethodMirrorRegistry<AbstractModel, ArrowMirrorContext> Dislodged = new(
++        MirrorMethodSpec.Hook(nameof(AbstractModel.AfterArrowDislodged),
++            [typeof(ImpaledPower), typeof(ArrowSlot), typeof(PlayerChoiceContext), typeof(CardModel)]));
++
++    static ArrowMirrors()
++    {
++        Dislodged.Register<YahPower>((power, c) =>
++        {
++            if (c.Player.Creature != power.Owner) return;
++            var gate = c.StateStore.Get<Card.FoolTurnTriggerState>(power);
++            if (gate.Triggered) return;
++            gate.Triggered = true;
++            c.Simulator.GainEnergy(c.Player, power.Amount);
++        });
++        Shot.Register<WhistlingArrows>((card, c) =>
++        {
++            if (card.Owner != c.Player || c.Arrow is null) return;
++            PredictedCard? predicted = c.State.GetPlayerCombatState(card.Owner).FindCard(card);
++            if (predicted is not null && c.State.GetPlayerCombatState(card.Owner).DiscardPile.Cards.Contains(predicted))
++                c.Simulator.AddToPile(predicted, PileType.Hand);
++        });
++        Shot.Register<CoveringFirePower>((power, c) =>
++        {
++            if (c.Player.Creature != power.Owner || c.Source is null) return;
++            foreach (var ally in c.CombatState.GetTeammatesOf(power.Owner))
++                if (ally.IsPlayer && ally != power.Owner && c.State.GetCreature(ally).IsAlive)
++                    c.Simulator.GainBlock(ally, power.Amount, ValueProp.Unpowered);
++        });
++        Impaled.Register<ExplosiveArrowsPower>((power, c) =>
++        {
++            if (c.Arrow?.owner.Creature == power.Owner)
++                c.Simulator.Damage(c.State.HittableEnemies.ToArray(), power.Amount, ValueProp.Unpowered, power.Owner);
++        });
++        Dislodged.Register<EpicRetrieval>((card, c) =>
++        {
++            if (c.Impaled!.Applier == card.Owner.Creature && c.Source?.References(card) == true)
++                c.Simulator.GainEnergy(card.Owner, card.DynamicVars.Energy.IntValue);
++        });
++        Dislodged.Register<Twine>((relic, c) =>
++        {
++            if (c.Arrow!.owner == relic.Owner)
++                c.Simulator.GainBlock(relic.Owner.Creature, relic.DynamicVars.Block);
++        });
++
++    }
++
++    public static void AfterShot(ArrowMirrorContext context) => Invoke(Shot, context);
++    public static void AfterImpaled(ArrowMirrorContext context) => Invoke(Impaled, context);
++    public static void AfterDislodged(ArrowMirrorContext context) => Invoke(Dislodged, context);
++
++    private static void Invoke(MethodMirrorRegistry<AbstractModel, ArrowMirrorContext> registry, ArrowMirrorContext context)
++    {
++        foreach (var listener in context.State.IterateHookListeners())
++        {
++            registry.Invoke(listener, context);
++            if (context.Simulator.HasPendingChoice) return;
++        }
++    }
++}
++
++internal sealed class ArrowMirrorContext : CombatMirrorContext
++{
++    public required Player Player { get; init; }
++    public required ArrowSlot? Arrow { get; init; }
++    public ImpaledPower? Impaled { get; init; }
++    public PredictedCard? Source { get; init; }
++}
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Attack/AfterAttackMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Attack/AfterAttackMirrors.cs
+index 7392898..948d79d 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Attack/AfterAttackMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Attack/AfterAttackMirrors.cs
+@@ -43,6 +43,12 @@ internal static class AfterAttackMirrors
+             case GigantificationPower power:
+                 GigantificationPowerMirrors.CompleteOrAbort(power, context, completed);
+                 break;
++            case QuietusPower quietus:
++                QuietusPowerMirrors.CompleteOrAbort(quietus, context, completed);
++                break;
++            case AimPower aim:
++                AimPowerMirrors.CompleteOrAbort(aim, context, completed);
++                break;
+             case VigorPower power:
+                 VigorPowerMirrors.CompleteOrAbort(power, context, completed);
+                 break;
+@@ -52,6 +58,8 @@ internal static class AfterAttackMirrors
+     private static Registry CreateRegistry()
+     {
+         var registry = new Registry(AfterAttack);
++        registry.Register<AimPower>(AimPowerMirrors.AfterAttack);
++        registry.Register<QuietusPower>(QuietusPowerMirrors.AfterAttack);
+ 
+         registry.Register<BoneFlute>(HandleBoneFlute);
+         registry.Register<Flatten>(HandleFlatten);
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Attack/AimPowerMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Attack/AimPowerMirrors.cs
+new file mode 100644
+index 0000000..dcdcf41
+--- /dev/null
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Attack/AimPowerMirrors.cs
+@@ -0,0 +1,96 @@
++// Adapted from CombatSolver v0.51.9 (Torch1230 and contributors, MIT). See the upstream notices.
++using CoopBots.Kernel.Vendor;
++using CoopBots.Kernel.Vendor.Engine.Common;
++using CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Damage;
++using CoopBots.Kernel.Vendor.Engine.InCombat.Simulation;
++using MegaCrit.Sts2.Core.Commands.Builders;
++using MegaCrit.Sts2.Core.Models;
++using MegaCrit.Sts2.Core.Models.Cards;
++using MegaCrit.Sts2.Core.Models.Powers;
++using MegaCrit.Sts2.Core.ValueProps;
++
++namespace CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Attack;
++
++internal static class AimPowerMirrors
++{
++    internal static void CaptureRoot(CombatPredictionSimulator simulator, AimPower target, AimPower source)
++    {
++        var command = source.GetInternalData<AimPower.Data>().commandToModify;
++        _ = simulator.StateStore.GetReadOnly(target, () => new State
++        {
++            HasLatchedCommand = command is not null,
++            SourceIdentity = command?.ModelSource as CardModel
++        });
++    }
++
++    internal static void BeforeAttack(AimPower power, BeforeAttackMirrorContext c)
++    {
++        var command = c.Command;
++        if (command.Attacker != power.Owner || !command.DamageProps.IsPoweredAttack()
++            || !command.DamageProps.HasFlag(ValueProp.FromArrow) || command.ModelSource is not (null or CardModel)) return;
++        var state = c.StateStore.Get<State>(power);
++        if (state.HasLatchedCommand) return;
++        state.HasLatchedCommand = true;
++        state.SourceIdentity = command.ModelSource as CardModel;
++        state.ActiveCommand = command;
++        state.StartingAmount = power.Amount;
++    }
++
++    internal static decimal ModifyDamageAdditive(AimPower power, ModifyDamageMirrorContext c)
++    {
++        if (c.Dealer != power.Owner || !c.Props.IsPoweredAttack() || !c.Props.HasFlag(ValueProp.FromArrow)) return 0;
++        var state = c.StateStore.Get<State>(power);
++        if (state.HasLatchedCommand && c.CardSource is not null && !c.CardSource.References(state.SourceIdentity)) return 0;
++        return c.CardSource?.Preview is HeavyShot heavy ? heavy.ModifyAimAmount(power.Amount) : power.Amount;
++    }
++
++    internal static void AfterAttack(AimPower power, AfterAttackMirrorContext c) => CompleteOrAbort(power, c, true);
++
++    internal static void CompleteOrAbort(AimPower power, AfterAttackMirrorContext c, bool completed)
++    {
++        var state = c.StateStore.Get<State>(power);
++        if (state.ActiveCommand != c.Command) return;
++        state.ActiveCommand = null;
++        if (completed) ((SimulatedCombatState)c.CombatState).SetPowerAmount(power, power.Amount - state.StartingAmount);
++        else { state.HasLatchedCommand = false; state.SourceIdentity = null; }
++        state.StartingAmount = 0;
++    }
++
++    internal static string Describe(AimPower power, CombatPredictionSimulator? simulator)
++    {
++        bool latched;
++        CardModel? source;
++        if (simulator is null)
++        {
++            var command = power.GetInternalData<AimPower.Data>().commandToModify;
++            latched = command is not null;
++            source = command?.ModelSource as CardModel;
++        }
++        else
++        {
++            var state = simulator.StateStore.Peek(power, static () => new State());
++            state.AssertForkable();
++            latched = state.HasLatchedCommand;
++            source = state.SourceIdentity;
++        }
++        if (!latched) return "ready";
++        if (source is null) return "latched:null";
++        int index = simulator is null
++            ? Array.IndexOf(power.Owner.Player!.PlayerCombatState!.AllCards.ToArray(), source)
++            : Array.FindIndex(simulator.State.GetPlayerCombatState(power.Owner.Player!).AllCards.ToArray(), card => card.References(source));
++        return $"latched:{index}";
++    }
++
++    private sealed class State : IPredictionStateForkable, IPredictionForkBoundary
++    {
++        public bool HasLatchedCommand;
++        public CardModel? SourceIdentity;
++        public AttackCommand? ActiveCommand;
++        public int StartingAmount;
++        public void AssertForkable()
++        {
++            if (ActiveCommand is not null) throw new InvalidOperationException("Cannot fork during Aim attack resolution.");
++        }
++        public object Fork(PredictionForkContext context) { AssertForkable(); return MemberwiseClone(); }
++    }
++}
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Attack/BeforeAttackMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Attack/BeforeAttackMirrors.cs
+index fe478bd..0e320f4 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Attack/BeforeAttackMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Attack/BeforeAttackMirrors.cs
+@@ -24,6 +24,8 @@ internal static class BeforeAttackMirrors
+     private static Registry CreateRegistry()
+     {
+         var registry = new Registry(BeforeAttack);
++        registry.Register<AimPower>(AimPowerMirrors.BeforeAttack);
++        registry.Register<QuietusPower>(QuietusPowerMirrors.BeforeAttack);
+ 
+         registry.Register<GigantificationPower>(GigantificationPowerMirrors.BeforeAttack);
+         registry.RegisterIgnored<HellraiserPower>();
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Attack/QuietusPowerMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Attack/QuietusPowerMirrors.cs
+new file mode 100644
+index 0000000..8bce0a0
+--- /dev/null
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Attack/QuietusPowerMirrors.cs
+@@ -0,0 +1,54 @@
++// Adapted from CombatSolver v0.51.9 (Torch1230 and contributors, MIT).
++using CoopBots.Kernel.Vendor.Engine.Common;
++using CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Damage;
++using MegaCrit.Sts2.Core.Commands.Builders;
++using MegaCrit.Sts2.Core.Models;
++using MegaCrit.Sts2.Core.Models.Powers;
++using MegaCrit.Sts2.Core.ValueProps;
++
++namespace CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Attack;
++
++internal static class QuietusPowerMirrors
++{
++    internal static void BeforeAttack(QuietusPower power, BeforeAttackMirrorContext context)
++    {
++        AttackCommand command = context.Command;
++        if (command.Attacker == power.Owner && command.DamageProps.IsPoweredAttack()
++            && command.DamageProps.HasFlag(ValueProp.FromArrow) && command.ModelSource is null or CardModel)
++            context.StateStore.Get<State>(power).Command ??= command;
++    }
++
++    internal static decimal ModifyDamageMultiplicative(QuietusPower power, ModifyDamageMirrorContext context)
++    {
++        if (context.Dealer != power.Owner || !context.Props.IsPoweredAttack()
++            || !context.Props.HasFlag(ValueProp.FromArrow)) return 1;
++        AttackCommand? command = context.StateStore.Get<State>(power).Command;
++        return command is not null && context.CardSource is not null
++            && !context.CardSource.References(command.ModelSource) ? 1 : power.Amount;
++    }
++
++    internal static void AfterAttack(QuietusPower power, AfterAttackMirrorContext context)
++        => CompleteOrAbort(power, context, completed: true);
++
++    internal static void CompleteOrAbort(QuietusPower power, AfterAttackMirrorContext context, bool completed)
++    {
++        State state = context.StateStore.Get<State>(power);
++        if (state.Command != context.Command) return;
++        state.Command = null;
++        if (completed) ((SimulatedCombatState)context.CombatState).SetPowerAmount(power, 0);
++    }
++
++    private sealed class State : IPredictionStateForkable, IPredictionForkBoundary
++    {
++        internal AttackCommand? Command;
++        public void AssertForkable()
++        {
++            if (Command is not null) throw new InvalidOperationException("Cannot fork during Quietus attack resolution.");
++        }
++        public object Fork(PredictionForkContext context)
++        {
++            AssertForkable();
++            return new State();
++        }
++    }
++}
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Attack/VigorPowerMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Attack/VigorPowerMirrors.cs
+index 3df6643..20e520c 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Attack/VigorPowerMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Attack/VigorPowerMirrors.cs
+@@ -1,100 +1,96 @@
++// Adapted from CombatSolver v0.51.9 (Torch1230 and contributors, MIT). See the upstream notices.
++using CoopBots.Kernel.Vendor;
++using CoopBots.Kernel.Vendor.Engine.Common;
++using CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Damage;
++using CoopBots.Kernel.Vendor.Engine.InCombat.Simulation;
+ using MegaCrit.Sts2.Core.Commands.Builders;
+ using MegaCrit.Sts2.Core.Models;
++using MegaCrit.Sts2.Core.Models.Cards;
+ using MegaCrit.Sts2.Core.Models.Powers;
+ using MegaCrit.Sts2.Core.ValueProps;
+-using CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Damage;
+-using CoopBots.Kernel.Vendor.Engine.Common;
+ 
+ namespace CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Attack;
+ 
+ internal static class VigorPowerMirrors
+ {
+-    public static void BeforeAttack(VigorPower power, BeforeAttackMirrorContext context)
++    internal static void CaptureRoot(CombatPredictionSimulator simulator, VigorPower target, VigorPower source)
+     {
+-        if (power.Amount > 0 && ShouldTrigger(power, context.Command))
++        var command = source.GetInternalData<VigorPower.Data>().commandToModify;
++        _ = simulator.StateStore.GetReadOnly(target, () => new State
+         {
+-            var state = GetState(power, context);
+-            if (state.CommandToModify is null)
+-            {
+-                state.CommandToModify = context.Command;
+-                state.AmountWhenAttackStarted = power.Amount;
+-            }
+-        }
++            HasLatchedCommand = command is not null,
++            SourceIdentity = command?.ModelSource as CardModel
++        });
+     }
+ 
+-    public static void AfterAttack(VigorPower power, AfterAttackMirrorContext context)
+-        => CompleteOrAbort(power, context, completed: true);
+-
+-    public static void CompleteOrAbort(
+-        VigorPower power,
+-        AfterAttackMirrorContext context,
+-        bool completed)
++    internal static void BeforeAttack(VigorPower power, BeforeAttackMirrorContext c)
+     {
+-        var state = GetState(power, context);
+-        if (context.Command == state.CommandToModify)
+-        {
+-            if (completed)
+-            {
+-                if (context.CombatState is not ICombatPredictionEffectSink effects)
+-                    throw new InvalidOperationException("活力攻击结算缺少可写预测状态。");
+-                effects.SetPowerAmount(power, Math.Max(0, power.Amount - state.AmountWhenAttackStarted));
+-            }
+-            state.CommandToModify = null;
+-            state.AmountWhenAttackStarted = 0;
+-        }
++        var command = c.Command;
++        if (command.Attacker != power.Owner || !command.DamageProps.IsPoweredAttack()
++            || command.ModelSource is not (null or CardModel)) return;
++        var state = c.StateStore.Get<State>(power);
++        if (state.HasLatchedCommand) return;
++        state.HasLatchedCommand = true;
++        state.SourceIdentity = command.ModelSource as CardModel;
++        state.ActiveCommand = command;
++        state.StartingAmount = power.Amount;
+     }
+ 
+-    public static decimal ModifyDamageAdditive(VigorPower power, ModifyDamageMirrorContext context)
++    internal static decimal ModifyDamageAdditive(VigorPower power, ModifyDamageMirrorContext c)
+     {
+-        if (power.Amount <= 0 || context.Dealer != power.Owner || !context.Props.IsPoweredAttack())
+-        {
+-            return 0;
+-        }
+-
+-        var commandToModify = GetState(power, context).CommandToModify;
+-        if (commandToModify is not null &&
+-            context.CardSource is not null &&
+-            !context.CardSource.References(commandToModify.ModelSource))
+-        {
+-            return 0;
+-        }
+-
+-        if (commandToModify is not null && commandToModify.Attacker != context.Dealer)
+-        {
+-            return 0;
+-        }
+-
++        if (c.Dealer != power.Owner || !c.Props.IsPoweredAttack()) return 0;
++        var state = c.StateStore.Get<State>(power);
++        if (state.HasLatchedCommand && c.CardSource is not null && !c.CardSource.References(state.SourceIdentity)) return 0;
+         return power.Amount;
+     }
+ 
+-    private static State GetState(VigorPower power, CombatMirrorContext context)
+-    {
+-        return context.StateStore.Get<State>(power);
+-    }
++    internal static void AfterAttack(VigorPower power, AfterAttackMirrorContext c) => CompleteOrAbort(power, c, true);
+ 
+-    private static bool ShouldTrigger(VigorPower power, AttackCommand command)
++    internal static void CompleteOrAbort(VigorPower power, AfterAttackMirrorContext c, bool completed)
+     {
+-        return command.Attacker == power.Owner &&
+-            command.DamageProps.IsPoweredAttack() &&
+-            command.ModelSource is null or CardModel;
++        var state = c.StateStore.Get<State>(power);
++        if (state.ActiveCommand != c.Command) return;
++        state.ActiveCommand = null;
++        if (completed) ((SimulatedCombatState)c.CombatState).SetPowerAmount(power, power.Amount - state.StartingAmount);
++        else { state.HasLatchedCommand = false; state.SourceIdentity = null; }
++        state.StartingAmount = 0;
+     }
+ 
+-    private sealed class State : IPredictionStateForkable, IPredictionForkBoundary
++    internal static string Describe(VigorPower power, CombatPredictionSimulator? simulator)
+     {
+-        public AttackCommand? CommandToModify { get; set; }
+-
+-        public int AmountWhenAttackStarted { get; set; }
+-
+-        public object Fork(PredictionForkContext context)
++        bool latched;
++        CardModel? source;
++        if (simulator is null)
++        {
++            var command = power.GetInternalData<VigorPower.Data>().commandToModify;
++            latched = command is not null;
++            source = command?.ModelSource as CardModel;
++        }
++        else
+         {
+-            AssertForkable();
+-            return MemberwiseClone();
++            var state = simulator.StateStore.Peek(power, static () => new State());
++            state.AssertForkable();
++            latched = state.HasLatchedCommand;
++            source = state.SourceIdentity;
+         }
++        if (!latched) return "ready";
++        if (source is null) return "latched:null";
++        int index = simulator is null
++            ? Array.IndexOf(power.Owner.Player!.PlayerCombatState!.AllCards.ToArray(), source)
++            : Array.FindIndex(simulator.State.GetPlayerCombatState(power.Owner.Player!).AllCards.ToArray(), card => card.References(source));
++        return $"latched:{index}";
++    }
+ 
++    private sealed class State : IPredictionStateForkable, IPredictionForkBoundary
++    {
++        public bool HasLatchedCommand;
++        public CardModel? SourceIdentity;
++        public AttackCommand? ActiveCommand;
++        public int StartingAmount;
+         public void AssertForkable()
+         {
+-            if (CommandToModify is not null || AmountWhenAttackStarted != 0)
+-                throw new InvalidOperationException("Cannot fork during Vigor attack resolution.");
++            if (ActiveCommand is not null) throw new InvalidOperationException("Cannot fork during Vigor attack resolution.");
+         }
++        public object Fork(PredictionForkContext context) { AssertForkable(); return MemberwiseClone(); }
+     }
+ }
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Block/ModifyBlockMultiplicativeMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Block/ModifyBlockMultiplicativeMirrors.cs
+index 642fa05..117efb8 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Block/ModifyBlockMultiplicativeMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Block/ModifyBlockMultiplicativeMirrors.cs
+@@ -4,7 +4,6 @@ using MegaCrit.Sts2.Core.Hooks;
+ using MegaCrit.Sts2.Core.Models;
+ using MegaCrit.Sts2.Core.Models.Powers;
+ using MegaCrit.Sts2.Core.Models.Relics;
+-using MegaCrit.Sts2.Core.Models.Singleton;
+ using MegaCrit.Sts2.Core.ValueProps;
+ using CoopBots.Kernel.Vendor.Engine.Common;
+ using CoopBots.Kernel.Vendor.Engine.Common.Mirrors;
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Block/StretchPowerMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Block/StretchPowerMirrors.cs
+new file mode 100644
+index 0000000..22c76de
+--- /dev/null
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Block/StretchPowerMirrors.cs
+@@ -0,0 +1,66 @@
++// Adapted from CombatSolver v0.51.9 (Torch1230 and contributors, MIT).
++using CoopBots.Kernel.Vendor.Engine.Common;
++using CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Card;
++using CoopBots.Kernel.Vendor.Engine.InCombat.Simulation;
++using MegaCrit.Sts2.Core.Entities.Cards;
++using MegaCrit.Sts2.Core.Models;
++using MegaCrit.Sts2.Core.Models.Powers;
++using MegaCrit.Sts2.Core.ValueProps;
++
++namespace CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Block;
++
++internal static class StretchPowerMirrors
++{
++    internal static void Before(StretchPower power, BeforeCardPlayedMirrorContext context)
++    {
++        if (context.CardPlay.Player.Creature != power.Owner || !GainsBlock(context.PreviewCard)) return;
++        var state = context.StateStore.Get<State>(power);
++        if (state.Play is not null) return;
++        state.Play = context.CardPlay;
++        state.StartingAmount = power.Amount;
++    }
++
++    internal static decimal Modify(StretchPower power, ModifyBlockMultiplicativeMirrorContext context)
++    {
++        if (context.CardSource?.Preview.Owner != power.Owner.Player || !context.Props.IsPoweredCardOrMonsterMoveBlock()) return 0;
++        var state = context.StateStore.Get<State>(power);
++        if (state.Play is not null && !ReferenceEquals(state.Play, context.CardPlay)) return 0;
++        if (context.CardPlay is null) return GainsBlock(context.CardSource!.Preview) ? power.Amount : 0;
++        if (state.Play is null || state.Play.Player != context.CardSource!.Preview.Owner) return 0;
++        state.GaveBlock = true;
++        return state.StartingAmount;
++    }
++
++    internal static void After(StretchPower power, AfterCardPlayedMirrorContext context)
++        => Complete(context.Simulator, power, context.StateStore.Get<State>(power), context.CardPlay, true);
++
++    internal static void Cleanup(CombatPredictionSimulator simulator, CardPlay play, bool completed)
++    {
++        foreach ((AbstractModel model, State state) in simulator.StateStore.ReadEntries<State>())
++            Complete(simulator, (StretchPower)model, state, play, completed);
++    }
++
++    private static void Complete(CombatPredictionSimulator simulator, StretchPower power, State state, CardPlay play, bool completed)
++    {
++        if (!ReferenceEquals(state.Play, play)) return;
++        state.Play = null;
++        if (completed && state.GaveBlock)
++            ((SimulatedCombatState)simulator.State.CombatState).SetPowerAmount(power, power.Amount - state.StartingAmount);
++        state.GaveBlock = false;
++        state.StartingAmount = 0;
++    }
++
++    private static bool GainsBlock(CardModel card) => card.GainsBlock || card.Enchantment?.GainsBlock == true;
++
++    private sealed class State : IPredictionStateForkable, IPredictionForkBoundary
++    {
++        public CardPlay? Play;
++        public int StartingAmount;
++        public bool GaveBlock;
++        public object Fork(PredictionForkContext context) { AssertForkable(); return MemberwiseClone(); }
++        public void AssertForkable()
++        {
++            if (Play is not null) throw new InvalidOperationException("Stretch is resolving a card at the Fork boundary.");
++        }
++    }
++}
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/AfterCardGeneratedForCombatMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/AfterCardGeneratedForCombatMirrors.cs
+index c449110..e0a7b3d 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/AfterCardGeneratedForCombatMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/AfterCardGeneratedForCombatMirrors.cs
+@@ -31,6 +31,17 @@ internal static class AfterCardGeneratedForCombatMirrors
+     private static Registry CreateRegistry()
+     {
+         var registry = new Registry(AfterCardGeneratedForCombat);
++        registry.Register<AllIsWellPower>((power, c) =>
++        {
++            if (c.Creator?.Creature == power.Owner && c.Card.Preview is Sadness)
++                c.Simulator.GainBlock(power.Owner, power.Amount, MegaCrit.Sts2.Core.ValueProps.ValueProp.Unpowered);
++        });
++        registry.Register<Fertilizer>((relic, c) =>
++        {
++            if (c.Creator == relic.Owner && c.Card.Preview is Sadness)
++                ((SimulatedCombatState)c.CombatState).Apply<StrengthPower>(relic.Owner.Creature,
++                    relic.DynamicVars.Strength.IntValue, relic.Owner.Creature);
++        });
+ 
+         registry.Register<Aeonglass>(HandleAeonglass);
+         registry.Register<ArsenalPower>(HandleArsenalPower);
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/AfterCardPlayedMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/AfterCardPlayedMirrors.cs
+index f07d1e6..b506986 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/AfterCardPlayedMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/AfterCardPlayedMirrors.cs
+@@ -1,6 +1,7 @@
+ using MegaCrit.Sts2.Core.Combat;
+ using MegaCrit.Sts2.Core.Entities.Cards;
+ using MegaCrit.Sts2.Core.Entities.Enchantments;
++using MegaCrit.Sts2.Core.Extensions;
+ using MegaCrit.Sts2.Core.GameActions.Multiplayer;
+ using MegaCrit.Sts2.Core.Models;
+ using MegaCrit.Sts2.Core.Models.Achievements;
+@@ -77,6 +78,44 @@ internal static class AfterCardPlayedMirrors
+     private static Registry CreateRegistry()
+     {
+         var registry = new Registry(AfterCardPlayed);
++        registry.Register<StretchPower>(Block.StretchPowerMirrors.After);
++        registry.Register<EncorePower>((power, c) => FoolPowerHooks.AfterEncore(power, c));
++        registry.Register<SongPathPower>((power, c) =>
++        {
++            if (c.CardPlay.Player.Creature == power.Owner
++                && ((SimulatedCombatState)c.CombatState).IsFirstMelodyPlay(c.CardPlay, CardTag.Cho))
++                c.Simulator.GainBlock(power.Owner, power.Amount, ValueProp.Unpowered);
++        });
++        registry.Register<ViolentChordPower>((power, c) =>
++        {
++            if (c.CardPlay.Player.Creature == power.Owner
++                && ((SimulatedCombatState)c.CombatState).IsFirstMelodyPlay(c.CardPlay, CardTag.Wah))
++                c.Simulator.Damage(c.State.HittableEnemies.ToArray(), power.Amount, ValueProp.Unpowered, power.Owner);
++        });
++        registry.Register<LullabyPower>(FoolPowerHooks.AfterLullaby);
++        registry.Register<ConductorsBaton>((relic, c) =>
++        {
++            if (c.CardPlay.Player != relic.Owner || c.Simulator.IsOverOrEnding
++                || ((SimulatedCombatState)c.CombatState).MelodyCount(relic.Owner) < 3) return;
++            var gate = c.StateStore.Get<FoolTurnTriggerState>(relic);
++            if (gate.Triggered) return;
++            gate.Triggered = true;
++            ((SimulatedCombatState)c.CombatState).Apply<ConductorsBatonPower>(relic.Owner.Creature, 1, relic.Owner.Creature);
++        });
++        registry.Register<MotifPower>((power, c) => FoolPowerHooks.FirstMelodyReward(power, c, autoPlay: false));
++        registry.Register<LostLutePower>((power, c) => FoolPowerHooks.FirstMelodyReward(power, c, autoPlay: true));
++        registry.Register<EnsemblePower>((power, c) =>
++        {
++            if (c.CardPlay.Player.Creature != power.Owner && c.CardPlay.IsLastInSeries)
++                ((SimulatedCombatState)c.CombatState).SetPowerAmount(power, power.Amount - 1);
++        });
++        registry.Register<TunePower>((power, c) =>
++        {
++            if (c.CardPlay.Player.Creature != power.Owner || !((SimulatedCombatState)c.CombatState).IsFirstMelodyPlay(c.CardPlay, CardTag.Ki))
++                return;
++            var cards = c.State.GetPlayerCombatState(c.CardPlay.Player).Hand.Cards.Where(card => card.Preview.IsUpgradable);
++            foreach (var card in cards.TakeRandom(power.Amount, c.Rng.CombatCardSelection)) card.Upgrade();
++        });
+ 
+         registry.RegisterIgnored<Play20CardsSingleTurnAchievement>();
+         registry.RegisterIgnored<SkillSilent1Achievement>();
+@@ -491,7 +530,7 @@ internal static class AfterCardPlayedMirrors
+     {
+         if (context.PreviewCard.Owner == relic.Owner)
+         {
+-            var state = context.StateStore.Get(relic, () => new CounterPredictionState(relic._cardsPlayedThisTurn));
++            var state = context.StateStore.Get(relic, () => new CounterPredictionState(0));
+             state.Value++;
+         }
+     }
+@@ -885,7 +924,6 @@ internal static class AfterCardPlayedMirrors
+     {
+         if (context.Card.References(enchantment.Card) && context.MutablePreviewCard.Enchantment is Glam preview)
+         {
+-            preview._usedThisCombat = true;
+             preview._status = EnchantmentStatus.Disabled;
+         }
+     }
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/AfterShuffleMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/AfterShuffleMirrors.cs
+index 509df8b..d585460 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/AfterShuffleMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/AfterShuffleMirrors.cs
+@@ -29,6 +29,12 @@ internal static class AfterShuffleMirrors
+     private static Registry CreateRegistry()
+     {
+         var registry = new Registry(AfterShuffle);
++        registry.Register<WhittlingKnife>((relic, c) =>
++        {
++            if (relic.Owner == c.Player)
++                ((SimulatedCombatState)c.CombatState).ApplyPowerFromSource(typeof(AimPower), c.Player.Creature,
++                    relic.DynamicVars["AimPower"].IntValue, c.Player.Creature, null);
++        });
+ 
+         registry.Register<BiiigHug>(HandleBiiigHug);
+         registry.Register<StratagemPower>(HandleStratagemPower);
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/BeforeCardPlayedMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/BeforeCardPlayedMirrors.cs
+index 5b6c767..0d9a755 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/BeforeCardPlayedMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/BeforeCardPlayedMirrors.cs
+@@ -43,6 +43,12 @@ internal static class BeforeCardPlayedMirrors
+     private static Registry CreateRegistry()
+     {
+         var registry = new Registry(BeforeCardPlayed);
++        registry.Register<StretchPower>(Block.StretchPowerMirrors.Before);
++        registry.Register<EncorePower>((power, c) =>
++        {
++            if (c.CardPlay.Player.Creature == power.Owner)
++                c.StateStore.Get<FoolEncoreState>(power).Ongoing.Add(c.CardPlay);
++        });
+ 
+         registry.RegisterIgnored<SkillSilent1Achievement>();
+ 
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/FoolPowerHooks.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/FoolPowerHooks.cs
+new file mode 100644
+index 0000000..d2933c8
+--- /dev/null
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/FoolPowerHooks.cs
+@@ -0,0 +1,59 @@
++using MegaCrit.Sts2.Core.Entities.Cards;
++using MegaCrit.Sts2.Core.Models;
++using MegaCrit.Sts2.Core.Models.Powers;
++using MegaCrit.Sts2.Core.ValueProps;
++using CoopBots.Kernel.Vendor.Engine.Common;
++
++namespace CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Card;
++
++internal static class FoolPowerHooks
++{
++    internal static void AfterEncore(EncorePower power, AfterCardPlayedMirrorContext c)
++    {
++        if (c.CardPlay.Player.Creature != power.Owner) return;
++        var state = c.StateStore.Get<FoolEncoreState>(power);
++        if (!state.Ongoing.Remove(c.CardPlay)) return;
++        state.Finished++;
++        ((SimulatedCombatState)c.CombatState).SetPowerDynamicVar(c.Simulator, power, "PlaysRemaining",
++            Math.Max(0, power.Amount - state.Finished));
++    }
++
++    internal static void AfterLullaby(LullabyPower power, AfterCardPlayedMirrorContext c)
++    {
++        if (c.CardPlay.Player.Creature != power.Owner || c.Simulator.IsOverOrEnding) return;
++        var combat = (SimulatedCombatState)c.CombatState;
++        if (combat.MelodyCount(c.CardPlay.Player) < 3) return;
++        var gate = c.StateStore.Get<FoolTurnTriggerState>(power);
++        if (gate.Triggered) return;
++        gate.Triggered = true;
++        c.Simulator.GainBlock(power.Owner, power.Amount, ValueProp.Unpowered);
++    }
++
++    internal static void FirstMelodyReward(PowerModel power, AfterCardPlayedMirrorContext context, bool autoPlay)
++    {
++        var player = context.CardPlay.Player;
++        if (player.Creature != power.Owner) return;
++        var combat = (SimulatedCombatState)context.CombatState;
++        int count = SimulatedCombatState.MelodyTags.Count(tag => combat.IsFirstMelodyPlay(context.CardPlay, tag)) * power.Amount;
++        if (count == 0) return;
++        if (autoPlay) context.Simulator.AutoPlayFromDrawPile(player, count, CardPilePosition.Top);
++        else context.Simulator.Draw(player, count);
++    }
++}
++
++internal sealed class FoolTurnTriggerState : IPredictionStateForkable
++{
++    public bool Triggered;
++    public object Fork(PredictionForkContext context) => MemberwiseClone();
++}
++
++internal sealed class FoolEncoreState : IPredictionStateForkable
++{
++    public int Finished;
++    public HashSet<CardPlay> Ongoing = new(ReferenceEqualityComparer.Instance);
++    public object Fork(PredictionForkContext context) => new FoolEncoreState
++    {
++        Finished = Finished,
++        Ongoing = new(Ongoing.Select(context.RemapOrSelf), ReferenceEqualityComparer.Instance)
++    };
++}
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/ModifyCardPlayCountMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/ModifyCardPlayCountMirrors.cs
+index b0499da..ea52807 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/ModifyCardPlayCountMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/ModifyCardPlayCountMirrors.cs
+@@ -46,6 +46,7 @@ internal static class ModifyCardPlayCountMirrors
+     private static Registry CreateRegistry()
+     {
+         var registry = new Registry(ModifyCardPlayCount);
++        registry.Register<KiVersePower>(HandleConsumablePower);
+ 
+         registry.Register<BurstPower>(HandleConsumablePower);
+         registry.Register<DuplicationPower>(HandleConsumablePower);
+@@ -62,6 +63,7 @@ internal static class ModifyCardPlayCountMirrors
+     private static AfterRegistry CreateAfterRegistry()
+     {
+         var registry = new AfterRegistry(AfterModifyingCardPlayCount);
++        registry.Register<KiVersePower>(HandleDecrementPower);
+ 
+         registry.Register<BurstPower>(HandleDecrementPower);
+         registry.Register<DuplicationPower>(HandleDecrementPower);
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/ModifyEnergyCostInCombatMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/ModifyEnergyCostInCombatMirrors.cs
+index b9cf946..a90537a 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/ModifyEnergyCostInCombatMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/ModifyEnergyCostInCombatMirrors.cs
+@@ -1,5 +1,6 @@
+ using MegaCrit.Sts2.Core.Entities.Cards;
+ using MegaCrit.Sts2.Core.Models;
++using MegaCrit.Sts2.Core.Models.Cards;
+ using MegaCrit.Sts2.Core.Models.Powers;
+ using MegaCrit.Sts2.Core.Models.Relics;
+ using CoopBots.Kernel.Vendor.Engine.Common;
+@@ -24,6 +25,12 @@ internal static class ModifyEnergyCostInCombatMirrors
+     private static readonly Registry Registry = new(ModifyEnergyCostInCombat);
+     private static readonly Registry LateRegistry = CreateLateRegistry();
+ 
++    static ModifyEnergyCostInCombatMirrors()
++    {
++        Registry.Register<Coda>((card, c) => c.Card.References(card)
++            ? Math.Max(0, c.Cost - 2 * ((SimulatedCombatState)c.CombatState).MelodyCount(card.Owner)) : c.Cost);
++    }
++
+     public static decimal Invoke(AbstractModel listener, ModifyEnergyCostInCombatMirrorContext context)
+     {
+         if (Registry.TryInvokeRegistered(listener, context, out var result))
+@@ -49,6 +56,9 @@ internal static class ModifyEnergyCostInCombatMirrors
+     private static Registry CreateLateRegistry()
+     {
+         var registry = new Registry(ModifyEnergyCostInCombatLate);
++        registry.Register<EnsemblePower>((power, c) =>
++            c.Card.Preview.Owner.Creature != power.Owner && c.Card.GetPile(c.State)?.Type is PileType.Hand or PileType.Play
++            ? 0m : c.Cost);
+ 
+         registry.Register<FreeAttackPower>(HandleFreeAttackPower);
+         registry.Register<FreePowerPower>(HandleFreePowerPower);
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/ShouldPlayMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/ShouldPlayMirrors.cs
+index a84e4bc..1f8cbf2 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/ShouldPlayMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/ShouldPlayMirrors.cs
+@@ -34,6 +34,12 @@ internal static class ShouldPlayMirrors
+     private static Registry CreateRegistry()
+     {
+         var registry = new Registry(ShouldPlay);
++        registry.Register<EncorePower>((power, c) =>
++        {
++            if (c.Card.Preview.Owner.Creature != power.Owner) return true;
++            var state = c.StateStore.Peek(power, static () => new FoolEncoreState());
++            return state.Finished + state.Ongoing.Count < power.Amount;
++        });
+ 
+         registry.Register<ChainsOfBindingPower>(HandleChainsOfBindingPower);
+         registry.Register<RingingPower>(HandleRingingPower);
+@@ -87,7 +93,7 @@ internal static class ShouldPlayMirrors
+     private static bool HandleVelvetChoker(VelvetChoker relic, ShouldPlayMirrorContext context)
+     {
+         return context.Card.Preview.Owner != relic.Owner ||
+-            context.StateStore.Get(relic, static value => new CounterPredictionState(value._cardsPlayedThisTurn)).Value <
++            context.StateStore.Get(relic, static _ => new CounterPredictionState(0)).Value <
+             relic.DynamicVars.Cards.IntValue;
+     }
+ }
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Damage/AfterDamageReceivedMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Damage/AfterDamageReceivedMirrors.cs
+index a2ddd46..d215f0f 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Damage/AfterDamageReceivedMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Damage/AfterDamageReceivedMirrors.cs
+@@ -57,6 +57,7 @@ internal static class AfterDamageReceivedMirrors
+     private static Registry CreateRegistry()
+     {
+         var registry = new Registry(AfterDamageReceived);
++        registry.Register<ImpaledPower>((power, context) => context.Simulator.AfterImpaledDamage(power, context));
+ 
+         registry.Register<AsleepPower>(HandleAsleepPower);
+         registry.Register<BeatingRemnant>(HandleBeatingRemnant);
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Damage/ModifyDamageMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Damage/ModifyDamageMirrors.cs
+index 87c0f94..466f9e4 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Damage/ModifyDamageMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Damage/ModifyDamageMirrors.cs
+@@ -1,3 +1,4 @@
++using MegaCrit.Sts2.Core.Models.Cards;
+ using MegaCrit.Sts2.Core.Entities.Cards;
+ using MegaCrit.Sts2.Core.Entities.Creatures;
+ using MegaCrit.Sts2.Core.Models;
+@@ -81,6 +82,7 @@ internal static class ModifyDamageMirrors
+     private static Registry CreateAdditiveRegistry()
+     {
+         var registry = new Registry(ModifyDamageAdditive);
++        registry.Register<AimPower>(AimPowerMirrors.ModifyDamageAdditive);
+ 
+         registry.Register<PhantomBladesPower>(HandlePhantomBladesPower);
+         registry.Register<VigorPower>(VigorPowerMirrors.ModifyDamageAdditive);
+@@ -91,6 +93,24 @@ internal static class ModifyDamageMirrors
+     private static Registry CreateMultiplicativeRegistry()
+     {
+         var registry = new Registry(ModifyDamageMultiplicative);
++        registry.Register<QuietusPower>(QuietusPowerMirrors.ModifyDamageMultiplicative);
++        registry.Register<DislikeYouPower>((power, c) => c.Target == power.Owner
++            && c.Props.IsPoweredAttack() && c.Props.HasFlag(ValueProp.FromArrow)
++            ? 1m + power.Amount / 100m : 1m);
++        registry.Register<WahHammer>((card, c) =>
++            c.CardSource?.References(card) == true && c.Target != null
++            && ((SimulatedCombatState)c.CombatState).EffectivePowers().Any(power => power is ImpaledPower && power.Owner == c.Target)
++            ? 2m : 1m);
++        registry.Register<HoningPower>((power, c) =>
++            c.Dealer == power.Owner && c.Props.IsPoweredAttack() && c.Props.HasFlag(ValueProp.FromArrow)
++            ? 1m + power.Amount / 100m : 1m);
++        registry.Register<SerratedArrowsPower>((power, c) =>
++            c.Props.IsPoweredAttack() && (c.Dealer == power.Owner || c.Dealer?.PetOwner?.Creature == power.Owner)
++            && c.Target != null && ((SimulatedCombatState)c.CombatState).EffectivePowers()
++                .Any(effect => effect is ImpaledPower && effect.Owner == c.Target)
++            ? 1m + power.Amount / 100m : 1m);
++        registry.Register<ConductorsBatonPower>((power, c) => c.Target == power.Owner && c.Props.IsPoweredAttack()
++            ? power.DynamicVars["DamageDecrease"].BaseValue : 1m);
+ 
+         registry.Register<FlutterPower>(HandleFlutterPower);
+         registry.Register<GigantificationPower>(GigantificationPowerMirrors.ModifyDamageMultiplicative);
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Death/AfterDeathMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Death/AfterDeathMirrors.cs
+index 8c72a38..dc6fe0a 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Death/AfterDeathMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Death/AfterDeathMirrors.cs
+@@ -35,6 +35,26 @@ internal static class AfterDeathMirrors
+     private static Registry CreateRegistry()
+     {
+         var registry = new Registry(AfterDeath);
++        registry.Register<ShowOffPower>((power, c) =>
++        {
++            var combat = (SimulatedCombatState)c.CombatState;
++            if (c.Creature.Side == power.Owner.Side ||
++                combat.EffectivePowers().Any(effect => effect.Owner == c.Creature && !effect.ShouldOwnerDeathTriggerFatal()))
++                return;
++            combat.GrowShowOff(power);
++            combat.SetPowerAmount(power, 0);
++        });
++        registry.Register<CompostPower>((power, context) =>
++        {
++            if (context.Creature.Side == power.Owner.Side) return;
++            foreach (var ally in context.CombatState.GetTeammatesOf(power.Owner))
++            {
++                if (ally.Player is { } player && context.State.GetCreature(ally).IsAlive)
++                    context.Simulator.GainEnergy(player, power.Amount);
++                if (context.Simulator.HasPendingChoice) return;
++            }
++        });
++        registry.Register<ImpaledPower>((power, context) => context.Simulator.AfterImpaledDeath(power, context));
+ 
+         registry.RegisterIgnored<Aeonglass>();
+         registry.RegisterIgnored<DecimillipedeSegment>();
+@@ -141,4 +161,5 @@ internal sealed class AfterDeathMirrorContext : CombatMirrorContext
+     public required Creature Creature { get; init; }
+ 
+     public required bool WasRemovalPrevented { get; init; }
++    public PredictedCard? Source { get; init; }
+ }
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/TurnEnd/AfterAutoPostPlayPhaseEnteredMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/TurnEnd/AfterAutoPostPlayPhaseEnteredMirrors.cs
+index a49df54..387b8a7 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/TurnEnd/AfterAutoPostPlayPhaseEnteredMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/TurnEnd/AfterAutoPostPlayPhaseEnteredMirrors.cs
+@@ -30,6 +30,22 @@ internal static class AfterAutoPostPlayPhaseEnteredMirrors
+     private static Registry CreateRegistry()
+     {
+         var registry = new Registry(AfterAutoPostPlayPhaseEntered);
++        registry.Register<SimpletonPower>((power, c) =>
++        {
++            if (c.Player.Creature != power.Owner) return;
++            var state = c.State.GetPlayerCombatState(c.Player);
++            for (int index = 0; index < power.Amount; index++)
++            {
++                var cheapest = state.Hand.Cards.Where(card => !card.HasKeyword(c.State, CardKeyword.Unplayable))
++                    .GroupBy(card => card.Preview.EnergyCost.CostsX ? 999999999 : card.GetEnergyCostWithModifiers(c.Simulator, state))
++                    .OrderBy(group => group.Key).FirstOrDefault();
++                if (cheapest is null) continue;
++                var card = c.Rng.CombatCardSelection.NextItem(cheapest);
++                if (card is null) continue;
++                c.Simulator.AutoPlay(card, nestedChoiceSourceId: power.Id.Entry);
++                if (c.Simulator.HasPendingChoice) return;
++            }
++        });
+ 
+         registry.Register<HowlFromBeyond>(HandleHowlFromBeyond);
+         registry.Register<IAmInvincible>(HandleIAmInvincible);
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Potions/OnUse/FoolPotionMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Potions/OnUse/FoolPotionMirrors.cs
+new file mode 100644
+index 0000000..8524d49
+--- /dev/null
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Potions/OnUse/FoolPotionMirrors.cs
+@@ -0,0 +1,46 @@
++// Adapted from CombatSolver v0.51.9 (Torch1230 and contributors, MIT).
++using CoopBots.Kernel.Vendor.Engine.Common;
++using CoopBots.Kernel.Vendor.Engine.InCombat.Extensions;
++using CoopBots.Kernel.Vendor.Engine.InCombat.Simulation;
++using MegaCrit.Sts2.Core.Entities.Cards;
++using MegaCrit.Sts2.Core.Models.Cards;
++using MegaCrit.Sts2.Core.Models.Potions;
++using MegaCrit.Sts2.Core.Models.Powers;
++
++namespace CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Potions.OnUse;
++
++internal static class FoolPotionMirrors
++{
++    internal static void Precision(PrecisionPotion potion, PotionOnUseMirrorContext c)
++        => ((SimulatedCombatState)c.CombatState).ApplyPowerFromSource(typeof(AimPower), c.TargetPlayer.Creature,
++            potion.DynamicVars["AimPower"].IntValue, potion.Owner.Creature, null);
++
++    internal static void CrystallineEuphoria(CrystallineEuphoria potion, PotionOnUseMirrorContext c)
++    {
++        var player = c.TargetPlayer;
++        c.Simulator.CreateAndAddGeneratedCardsToCombat<Joy>(player, PileType.Hand,
++            potion.DynamicVars.Cards.IntValue, potion.Owner);
++        if (c.Simulator.HasPendingChoice) return;
++        int remaining = CardPile.MaxCardsInHand - c.State.GetPlayerCombatState(player).Hand.Cards.Count;
++        c.Simulator.CreateAndAddGeneratedCardsToCombat<Sadness>(player, PileType.Hand, remaining, potion.Owner);
++    }
++
++    internal static void BottledSong(BottledSong potion, PotionOnUseMirrorContext c)
++    {
++        var combat = (SimulatedCombatState)c.CombatState;
++        var player = c.TargetPlayer;
++        List<PredictedCard> cards = [];
++        foreach (CardTag tag in new[] { CardTag.Wah, CardTag.Cho, CardTag.Ki })
++        {
++            var generated = player.UnlockState.CharacterCardPools.SelectMany(pool => pool.GetUnlockedCards(player.UnlockState, combat.CardMultiplayerConstraint))
++                .Where(card => card.Tags.Contains(tag))
++                .GetDistinctForCombat(player, 1, c.Rng.CombatCardGeneration, combat.CardMultiplayerConstraint)
++                .FirstOrDefault();
++            if (generated is null) continue;
++            generated.SetToFreeThisTurn();
++            cards.Add(generated);
++        }
++        c.Simulator.AddGeneratedCardsToCombat(cards, PileType.Hand, potion.Owner,
++            resultKind: CardGenerationResultKind.Random);
++    }
++}
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Potions/OnUse/PotionOnUseMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Potions/OnUse/PotionOnUseMirrors.cs
+index 1ff2879..da903bd 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Potions/OnUse/PotionOnUseMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Potions/OnUse/PotionOnUseMirrors.cs
+@@ -56,6 +56,9 @@ internal static class PotionOnUseMirrors
+     private static Registry CreateRegistry()
+     {
+         var registry = new Registry(OnUse);
++        registry.Register<BottledSong>(FoolPotionMirrors.BottledSong);
++        registry.Register<CrystallineEuphoria>(FoolPotionMirrors.CrystallineEuphoria);
++        registry.Register<PrecisionPotion>(FoolPotionMirrors.Precision);
+ 
+         registry.Register<AttackPotion>(CardGenerationPotionMirrors.OnUse);
+         registry.Register<SkillPotion>(CardGenerationPotionMirrors.OnUse);
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.Arrows.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.Arrows.cs
+new file mode 100644
+index 0000000..e117678
+--- /dev/null
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.Arrows.cs
+@@ -0,0 +1,158 @@
++// Adapted from CombatSolver v0.51.9 (Torch1230 and contributors, MIT).
++// Arrow lifecycle aligned with CombatSolver v1.0.3 and the original v0.114.0 game.
++using CoopBots.Kernel.Vendor.Engine.Common;
++using CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks;
++using CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Damage;
++using CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Death;
++using MegaCrit.Sts2.Core.Commands.Builders;
++using MegaCrit.Sts2.Core.Entities.Creatures;
++using MegaCrit.Sts2.Core.Entities.FoolArrows;
++using MegaCrit.Sts2.Core.Entities.Players;
++using MegaCrit.Sts2.Core.Models;
++using MegaCrit.Sts2.Core.Models.Powers;
++using MegaCrit.Sts2.Core.ValueProps;
++
++namespace CoopBots.Kernel.Vendor.Engine.InCombat.Simulation;
++
++internal sealed partial class CombatPredictionSimulator
++{
++    private SimulatedCombatState ArrowCombat => (SimulatedCombatState)State.CombatState;
++
++    internal static int SlotIndex(IReadOnlyList<ArrowSlot> slots, ArrowSlot arrow)
++    {
++        for (int index = 0; index < slots.Count; index++)
++            if (ReferenceEquals(slots[index], arrow)) return index;
++        throw new InvalidOperationException("Impaled arrow has no slot in the owner's quiver.");
++    }
++
++    // Store indices into the applying player's quiver. Forking a player clones
++    // the quiver, so no arrow in an enemy's power can point into another fork.
++    internal void CaptureImpaledArrows(ImpaledPower target, ImpaledPower source)
++        => StateStore.GetReadOnly(target, () => new ImpaledArrowState(source.Arrows
++            .Select(arrow => SlotIndex(arrow.owner.PlayerCombatState!.Arrows, arrow))));
++
++    internal IReadOnlyList<int> ImpaledSlots(ImpaledPower power)
++        => StateStore.Peek(power, static () => new ImpaledArrowState()).Slots;
++
++    internal ImpaledPower? ImpaledBy(Creature target, Player player)
++        => ArrowCombat.EffectivePowers().OfType<ImpaledPower>()
++            .FirstOrDefault(power => power.Owner == target && power.Applier == player.Creature);
++
++    internal ArrowSlot? ShootArrow(Player player, PredictedCard source)
++    {
++        ArrowSlot? arrow = State.GetPlayerCombatState(player).Arrows.LastOrDefault(slot => slot.IsAvailable);
++        if (arrow is not null)
++            arrow.Status = ArrowStatus.Away;
++        ArrowMirrors.AfterShot(new() { Simulator = this, Player = player, Arrow = arrow, Source = source });
++        RequireSettledArrowEffect();
++        return arrow;
++    }
++
++    internal bool ShootArrowAt(Creature target, Player player, PredictedCard source, AttackCommand attack)
++    {
++        if (State.GetCreature(target).IsDead) return false;
++        ArrowSlot? arrow = ShootArrow(player, source);
++        if (HasPendingChoice || arrow is null) return false;
++        if (State.GetCreature(target).IsDead)
++        {
++            arrow.Status = ArrowStatus.Retrieved;
++            return true;
++        }
++        ExecuteAttack(attack);
++        RequireSettledArrowEffect();
++        ImpaleArrow(target, arrow, source, hookSource: null);
++        return true;
++    }
++
++    internal void ImpaleArrow(Creature target, ArrowSlot arrow, PredictedCard source, PredictedCard? hookSource)
++    {
++        ImpaledPower? power = ImpaledBy(target, arrow.owner);
++        if (power is null)
++        {
++            if (State.GetCreature(target).IsAlive && !IsEnding)
++            {
++                ArrowCombat.ApplyPowerFromSource(typeof(ImpaledPower), target, 1, arrow.owner.Creature, source.Preview);
++                power = ImpaledBy(target, arrow.owner)
++                    ?? throw new InvalidOperationException("Arrow application did not create its target state.");
++            }
++            else
++            {
++                power = (ImpaledPower)ModelDb.Power<ImpaledPower>().ToMutable();
++                power._owner = target;
++                power._applier = arrow.owner.Creature;
++            }
++        }
++
++        var slots = StateStore.Get<ImpaledArrowState>(power).Slots;
++        slots.Add(SlotIndex(State.GetPlayerCombatState(arrow.owner).Arrows, arrow));
++        ArrowMirrors.AfterImpaled(new()
++        {
++            Simulator = this, Player = arrow.owner, Arrow = arrow, Impaled = power, Source = hookSource
++        });
++        RequireSettledArrowEffect();
++        if (State.GetCreature(target).IsDead && arrow.Status == ArrowStatus.Away)
++            DislodgeAll(power, source);
++    }
++
++    internal void RecallArrows(Creature target, Player player, PredictedCard source)
++    {
++        if (ImpaledBy(target, player) is { } power)
++            DislodgeAll(power, source);
++    }
++
++    private void DislodgeAll(ImpaledPower power, PredictedCard? source)
++    {
++        while (ImpaledSlots(power).Count > 0 && !HasPendingChoice)
++            Dislodge(power, source);
++    }
++
++    private void Dislodge(ImpaledPower power, PredictedCard? source)
++    {
++        var slots = StateStore.Get<ImpaledArrowState>(power).Slots;
++        Player player = power.Applier!.Player!;
++        ArrowSlot arrow = State.GetPlayerCombatState(player).Arrows[slots[0]];
++        slots.RemoveAt(0);
++        ArrowMirrors.AfterDislodged(new()
++        {
++            Simulator = this, Player = player, Arrow = arrow, Impaled = power, Source = source
++        });
++        RequireSettledArrowEffect();
++        if (arrow.Status != ArrowStatus.Away)
++            throw new InvalidOperationException("An impaled arrow is no longer away from its owner.");
++        arrow.Status = ArrowStatus.Retrieved;
++        if (slots.Count == 0 && ArrowCombat.EffectivePowers().Contains(power))
++            ArrowCombat.SetPowerAmount(power, 0);
++    }
++
++    // An in-flight arrow must never become a settled state on a child branch.
++    internal void RequireSettledArrowEffect()
++    {
++        if (HasPendingChoice)
++            throw new InvalidOperationException("An arrow effect paused for a choice inside its resolution.");
++    }
++
++    internal void AfterImpaledDamage(ImpaledPower power, AfterDamageReceivedMirrorContext context)
++    {
++        if (context.Target != power.Owner || context.Dealer is null
++            || context.Source?.Preview.Owner.Creature != power.Applier || !context.Props.IsPoweredAttack())
++            return;
++        power = ArrowCombat.MutableImpaledPower(power);
++        if (--power.HitCounter > 0) return;
++        power.HitCounter = 3;
++        Dislodge(power, context.Source);
++    }
++
++    internal void AfterImpaledDeath(ImpaledPower power, AfterDeathMirrorContext context)
++    {
++        if (context.Creature == power.Owner && power.Applier is { } applier && !State.GetCreature(applier).IsDead)
++            DislodgeAll(power, context.Source);
++    }
++}
++
++internal sealed class ImpaledArrowState(IEnumerable<int>? slots = null) : IPredictionStateForkable
++{
++    // PredictionStateStore constructs the empty state when applying a new power.
++    public ImpaledArrowState() : this(null) { }
++    public List<int> Slots { get; } = slots?.ToList() ?? [];
++    public object Fork(PredictionForkContext context) => new ImpaledArrowState(Slots);
++}
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.Attack.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.Attack.cs
+index 680ed63..977bac7 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.Attack.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.Attack.cs
+@@ -1,4 +1,4 @@
+-﻿using MegaCrit.Sts2.Core.Commands.Builders;
++using MegaCrit.Sts2.Core.Commands.Builders;
+ using MegaCrit.Sts2.Core.Entities.Cards;
+ using MegaCrit.Sts2.Core.Entities.Creatures;
+ using MegaCrit.Sts2.Core.GameActions.Multiplayer;
+@@ -30,7 +30,7 @@ internal sealed partial class CombatPredictionSimulator
+     {
+         _ = command.Attacker
+             ?? throw new InvalidOperationException("Attack context must have an attacker.");
+-        var paired = State.IterateHookListeners().Where(p => p is VigorPower or GigantificationPower).ToArray();
++        var paired = State.IterateHookListeners().Where(p => p is VigorPower or GigantificationPower or AimPower or QuietusPower).ToArray();
+         if (paired.Length > 0) (pairedAttackListeners ??= new())[command] = paired;
+         HookMirrors.BeforeAttack(this, command);
+         return command;
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.AutoPlay.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.AutoPlay.cs
+index 9ac5d55..1a57036 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.AutoPlay.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.AutoPlay.cs
+@@ -118,7 +118,7 @@ internal sealed partial class CombatPredictionSimulator
+         Player player,
+         int count,
+         CardPilePosition position,
+-        bool forceExhaust = false)
++        bool forceExhaust = false, bool upgrade = false)
+     {
+         if (IsOverOrEnding)
+         {
+@@ -130,10 +130,10 @@ internal sealed partial class CombatPredictionSimulator
+         IReadOnlyList<PredictedCard> cards = MoveCardsForAutoPlay(player, count, position);
+         if (HasPendingChoice)
+         {
+-            AppendExecutionContinuation(new AutoPlayCardsExecutionFrame(cards, forceExhaust, 0));
++            AppendExecutionContinuation(new AutoPlayCardsExecutionFrame(cards, forceExhaust, 0, upgrade));
+             return;
+         }
+-        ContinueAutoPlayCards(cards, forceExhaust, 0);
++        ContinueAutoPlayCards(cards, forceExhaust, 0, upgrade);
+     }
+ 
+     // Mirrors CardPileCmd.AutoPlayFromDrawPile until the card is moved to the play pile.
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.AutoPlayContinuation.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.AutoPlayContinuation.cs
+index 998be27..56f332c 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.AutoPlayContinuation.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.AutoPlayContinuation.cs
+@@ -33,16 +33,17 @@ internal sealed partial class CombatPredictionSimulator
+         return true;
+     }
+ 
+-    private bool ContinueAutoPlayCards(IReadOnlyList<PredictedCard> cards, bool forceExhaust, int nextIndex)
++    private bool ContinueAutoPlayCards(IReadOnlyList<PredictedCard> cards, bool forceExhaust, int nextIndex, bool upgrade)
+     {
+         for (int index = nextIndex; index < cards.Count; index++)
+         {
+             PredictedCard card = cards[index];
+             if (State.GetCreature(card.Preview.Owner.Creature).IsDead) break;
++            if (upgrade && card.Preview.IsUpgradable) card.Upgrade();
+             card.MutablePreview.ExhaustOnNextPlay = forceExhaust;
+             AutoPlay(card, nestedChoiceSourceId: card.Preview.Id.Entry);
+             if (!HasPendingChoice) continue;
+-            AppendExecutionContinuation(new AutoPlayCardsExecutionFrame(cards, forceExhaust, index + 1));
++            AppendExecutionContinuation(new AutoPlayCardsExecutionFrame(cards, forceExhaust, index + 1, upgrade));
+             return false;
+         }
+         return true;
+@@ -58,7 +59,7 @@ internal sealed partial class CombatPredictionSimulator
+             => simulator.ContinueMoveCardsForAutoPlay(Player, Count, Position, Cards, NextIndex);
+     }
+ 
+-    private sealed record AutoPlayCardsExecutionFrame(IReadOnlyList<PredictedCard> Cards, bool ForceExhaust, int NextIndex)
++    private sealed record AutoPlayCardsExecutionFrame(IReadOnlyList<PredictedCard> Cards, bool ForceExhaust, int NextIndex, bool Upgrade)
+         : ICombatPredictionExecutionFrame
+     {
+         public void PrepareFork(PredictionForkContext context)
+@@ -70,6 +71,6 @@ internal sealed partial class CombatPredictionSimulator
+         public ICombatPredictionExecutionFrame Fork(PredictionForkContext context)
+             => this with { Cards = Cards is List<PredictedCard> list ? context.RequireRemap(list)
+                 : Cards.Select(context.RequireRemap).ToArray() };
+-        public bool Resume(CombatPredictionSimulator simulator) => simulator.ContinueAutoPlayCards(Cards, ForceExhaust, NextIndex);
++        public bool Resume(CombatPredictionSimulator simulator) => simulator.ContinueAutoPlayCards(Cards, ForceExhaust, NextIndex, Upgrade);
+     }
+ }
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.CardPile.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.CardPile.cs
+index be146c3..f41006a 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.CardPile.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.CardPile.cs
+@@ -138,7 +138,7 @@ internal sealed partial class CombatPredictionSimulator
+     /// <summary>
+     /// Mirrors <see cref="CardPileCmd.ShuffleIfNecessary"/>.
+     /// </summary>
+-    private void ShuffleIfNecessary(Player player)
++    internal void ShuffleIfNecessary(Player player)
+     {
+         var state = State.GetPlayerCombatState(player);
+         if (state.DrawPile.IsEmpty && !state.DiscardPile.IsEmpty)
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.CardTailContinuation.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.CardTailContinuation.cs
+index 11482cb..0f9b7ee 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.CardTailContinuation.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.CardTailContinuation.cs
+@@ -47,6 +47,7 @@ internal sealed partial class CombatPredictionSimulator
+         {
+             completionHistoryStart = History.Entries.Count;
+             History.CardPlayFinished(card, play, card.HasKeyword(State, CardKeyword.Ethereal));
++            ((SimulatedCombatState)State.CombatState).RecordMelodyFinished(play);
+             HookMirrors.AfterCardPlayed(this, card, play);
+             if (HasPendingChoice) return Suspend(CardPlayTailStage.AfterPlayed);
+             stage = CardPlayTailStage.AfterPlayed;
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.Damage.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.Damage.cs
+index e8c3076..6efb69c 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.Damage.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.Damage.cs
+@@ -58,7 +58,8 @@ internal sealed partial class CombatPredictionSimulator
+         ValueProp props,
+         Creature? dealer,
+         PredictedCard? cardSource,
+-        CardPlay? cardPlay)
++        CardPlay? cardPlay,
++        bool capOnly = false)
+     {
+         if (dealer != null && State.GetCreature(dealer).IsDead || targets.Count == 0)
+         {
+@@ -80,7 +81,7 @@ internal sealed partial class CombatPredictionSimulator
+                     cardSource,
+                     cardPlay,
+                     source,
+-                    out IReadOnlyList<DamageResult> targetResults))
++                    out IReadOnlyList<DamageResult> targetResults, capOnly))
+             {
+                 return results;
+             }
+@@ -127,7 +128,8 @@ internal sealed partial class CombatPredictionSimulator
+         PredictedCard? cardSource,
+         CardPlay? cardPlay,
+         CombatDamageSource source,
+-        out IReadOnlyList<DamageResult> results)
++        out IReadOnlyList<DamageResult> results,
++        bool capOnly = false)
+     {
+         results = [];
+         var originalTargetState = State.GetCreature(originalTarget);
+@@ -136,7 +138,9 @@ internal sealed partial class CombatPredictionSimulator
+             return true;
+         }
+ 
+-        var modifiedAmount = HookMirrors.ModifyDamage(
++        var modifiedAmount = capOnly
++            ? HookMirrors.ApplyDamageCap(this, originalTarget, dealer, amount, props, cardSource?.Preview, cardPlay)
++            : HookMirrors.ModifyDamage(
+             this,
+             originalTarget,
+             dealer, amount,
+@@ -326,7 +330,7 @@ internal sealed partial class CombatPredictionSimulator
+ 
+         if (killedCreatures != null)
+         {
+-            if (!Kill(killedCreatures))
++            if (!Kill(killedCreatures, cardSource: cardSource))
+                 return false;
+         }
+         else if (State.Players.All(player => State.GetCreature(player.Creature).IsDead))
+@@ -345,11 +349,11 @@ internal sealed partial class CombatPredictionSimulator
+     }
+ 
+     // Mirrors CreatureCmd.Kill.
+-    public bool Kill(IReadOnlyList<Creature> creatures, bool force = false)
++    public bool Kill(IReadOnlyList<Creature> creatures, bool force = false, PredictedCard? cardSource = null)
+     {
+         foreach (var creature in creatures)
+         {
+-            if (!KillWithoutCheckingWinCondition(creature, force))
++            if (!KillWithoutCheckingWinCondition(creature, force, cardSource: cardSource))
+                 return false;
+         }
+ 
+@@ -363,7 +367,7 @@ internal sealed partial class CombatPredictionSimulator
+     }
+ 
+     // Mirrors CreatureCmd.KillWithoutCheckingWinCondition, without recursion checks.
+-    private bool KillWithoutCheckingWinCondition(Creature creature, bool force, int recursion = 0)
++    private bool KillWithoutCheckingWinCondition(Creature creature, bool force, int recursion = 0, PredictedCard? cardSource = null)
+     {
+         var creatureState = State.GetCreature(creature);
+         var currentHp = creatureState.CurrentHp;
+@@ -402,7 +406,7 @@ internal sealed partial class CombatPredictionSimulator
+             if (HasPendingChoice)
+                 return false;
+ 
+-            HookMirrors.AfterDeath(this, creature, wasRemovalPrevented: false);
++            HookMirrors.AfterDeath(this, creature, wasRemovalPrevented: false, cardSource: cardSource);
+             if (HasPendingChoice)
+                 return false;
+ 
+@@ -449,7 +453,7 @@ internal sealed partial class CombatPredictionSimulator
+                 throw new InvalidOperationException(
+                     "死亡被阻止但没有返回对应的阻止者。");
+             }
+-            HookMirrors.AfterDeath(this, creature, wasRemovalPrevented: true);
++            HookMirrors.AfterDeath(this, creature, wasRemovalPrevented: true, cardSource: cardSource);
+             if (HasPendingChoice)
+                 return false;
+             HookMirrors.AfterPreventingDeath(this, preventer, creature);
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/SimPlayerCombatState.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/SimPlayerCombatState.cs
+index 1035f66..6400ea6 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/SimPlayerCombatState.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/SimPlayerCombatState.cs
+@@ -1,4 +1,5 @@
+ using MegaCrit.Sts2.Core.Entities.Cards;
++using MegaCrit.Sts2.Core.Entities.FoolArrows;
+ using MegaCrit.Sts2.Core.Combat;
+ using MegaCrit.Sts2.Core.Entities.Players;
+ using MegaCrit.Sts2.Core.Models;
+@@ -17,6 +18,12 @@ internal sealed class SimPlayerCombatState
+     private SimCardPile? _playPile;
+     private SimCardPile[]? _allPiles;
+ 
++    // Every slot is private to one predicted combat branch.
++    private List<ArrowSlot>? _arrows;
++    public IReadOnlyList<ArrowSlot> Arrows => _arrows ?? (IReadOnlyList<ArrowSlot>)Array.Empty<ArrowSlot>();
++    public void GainArrowSlot(Player player) => (_arrows ??= []).Add(new ArrowSlot(player));
++    private static ArrowSlot CloneArrow(ArrowSlot arrow) => new(arrow.owner) { Status = arrow.Status };
++
+     public SimOrbQueue OrbQueue => _orbQueue ??= new SimOrbQueue(_liveState.OrbQueue);
+ 
+     public SimCardPile Hand => _hand ??= new SimCardPile(_liveState.Hand);
+@@ -90,6 +97,7 @@ internal sealed class SimPlayerCombatState
+     public SimPlayerCombatState(PlayerCombatState liveState)
+     {
+         _liveState = liveState;
++        _arrows = liveState.Arrows.Count == 0 ? null : liveState.Arrows.Select(CloneArrow).ToList();
+         Energy = liveState.Energy;
+         Stars = liveState.Stars;
+         Phase = liveState.Phase;
+@@ -183,6 +191,7 @@ internal sealed class SimPlayerCombatState
+         SimPlayerCombatState fork = new(_liveState, Energy, Stars)
+         {
+             Phase = Phase,
++            _arrows = _arrows?.Select(CloneArrow).ToList(),
+             _orbQueue = _orbQueue?.Fork(context),
+             _hand = _hand?.Fork(context),
+             _drawPile = _drawPile?.Fork(context),
+diff --git a/src/CoopBots.Kernel/Vendor/OutOfCombat/Common/HoverTips/PredictionHoverTipFactory.cs b/src/CoopBots.Kernel/Vendor/OutOfCombat/Common/HoverTips/PredictionHoverTipFactory.cs
+index 759a289..cad3241 100644
+--- a/src/CoopBots.Kernel/Vendor/OutOfCombat/Common/HoverTips/PredictionHoverTipFactory.cs
++++ b/src/CoopBots.Kernel/Vendor/OutOfCombat/Common/HoverTips/PredictionHoverTipFactory.cs
+@@ -107,18 +107,11 @@ internal static class PredictionHoverTipFactory
+         var description = ModLocalization.Text($"{key}.description");
+         configureDescription?.Invoke(description);
+ 
+-        var tip = new HoverTip(title, description)
+-        {
+-            Id = $"{HoverTipIdPrefix}:{key}",
+-            IsInstanced = true
+-        };
+-        return tip;
++        return new HoverTip(title, description);
+     }
+ 
+     private static HoverTip FromModelHoverTip(HoverTip tip, AbstractModel? model = null)
+     {
+-        tip.Id = $"{Entry.ModId}:Prediction:{tip.Id}";
+-        tip.IsInstanced = true;
+         // Vanilla records hover tips with canonical models as discovered progress.
+         // Prediction tips are informational only, so they must not reveal cards/relics/potions in the save.
+         tip.CanonicalModel = null;
+diff --git a/src/CoopBots.Kernel/Vendor/OutOfCombat/OutOfCombat/CardRewardPrediction.cs b/src/CoopBots.Kernel/Vendor/OutOfCombat/OutOfCombat/CardRewardPrediction.cs
+index 3a2d3e5..180795d 100644
+--- a/src/CoopBots.Kernel/Vendor/OutOfCombat/OutOfCombat/CardRewardPrediction.cs
++++ b/src/CoopBots.Kernel/Vendor/OutOfCombat/OutOfCombat/CardRewardPrediction.cs
+@@ -158,7 +158,7 @@ internal static class CardRewardPrediction
+ 
+         var blacklistSet = blacklist.ToHashSet();
+         var possibleCards = options.GetPossibleCards(player).Except(blacklistSet);
+-        var filteredCards = CardFactory.FilterForPlayerCount(player.RunState, possibleCards).ToArray();
++        var filteredCards = CardFactory.FilterForRun(player.RunState, possibleCards).ToArray();
+         var selectedRarity = CardRarity.None;
+ 
+         IEnumerable<CardModel> candidates;
+diff --git a/src/CoopBots.Kernel/Vendor/OutOfCombat/OutOfCombat/RelicPickupPrediction.cs b/src/CoopBots.Kernel/Vendor/OutOfCombat/OutOfCombat/RelicPickupPrediction.cs
+index ea1e754..0f9bc2b 100644
+--- a/src/CoopBots.Kernel/Vendor/OutOfCombat/OutOfCombat/RelicPickupPrediction.cs
++++ b/src/CoopBots.Kernel/Vendor/OutOfCombat/OutOfCombat/RelicPickupPrediction.cs
+@@ -293,7 +293,11 @@ internal static class RelicPickupPrediction
+             .OfType<RelicModel>()
+             .Where(relic => relic.IsAllowedAtNeow(context.Player) && relic is not NeowsBones)
+             .ToList();
+-        context.Rng.Rewards.Shuffle(validRelics);
++        for (int i = validRelics.Count - 1; i > 0; i--)
++        {
++            int j = context.Rng.Rewards.NextInt(i + 1);
++            (validRelics[i], validRelics[j]) = (validRelics[j], validRelics[i]);
++        }
+ 
+         var predictedRelics = validRelics.Take(relic.DynamicVars["Relics"].IntValue).ToList();
+         var tips = predictedRelics.ToPredictionHoverTips().ToList();
+diff --git a/src/CoopBots.Kernel/Vendor/Prediction/CalculatedVarSpecRegistry.cs b/src/CoopBots.Kernel/Vendor/Prediction/CalculatedVarSpecRegistry.cs
+index 1826826..9b2b272 100644
+--- a/src/CoopBots.Kernel/Vendor/Prediction/CalculatedVarSpecRegistry.cs
++++ b/src/CoopBots.Kernel/Vendor/Prediction/CalculatedVarSpecRegistry.cs
+@@ -29,6 +29,7 @@ internal static class CalculatedVarSpecRegistry
+         typeof(PullFromBelow), typeof(Normality), typeof(Synchronize), typeof(Protector), typeof(NoEscape),
+         typeof(Flechettes), typeof(Rend), typeof(GoldAxe), typeof(FlakCannon), typeof(LunarBlast), typeof(Murder),
+         typeof(CompileDriver), typeof(Finisher), typeof(Bully), typeof(BeatIntoShape), typeof(DeathMarch),
++        typeof(TheTower), typeof(Anguish), typeof(RhythmStrike), typeof(WahSymphony), typeof(HarmonicShield), typeof(MelodicShot), typeof(SteadyCadence),
+         typeof(DemonicShield), typeof(Barrage), typeof(CrescentSpear), typeof(BodySlam), typeof(AshenStrike),
+     ];
+ 
+@@ -72,6 +73,11 @@ internal static class CalculatedVarSpecRegistry
+         Creature owner = card.Preview.Owner.Creature;
+         multiplier = model switch
+         {
++            TheTower => combat.CapturedTotalFloor,
++            Anguish => combat.SadnessGenerated(simulator, model.Owner),
++            HarmonicShield or MelodicShot or SteadyCadence or RhythmStrike => combat.MelodyCount(model.Owner),
++            WahSymphony => playerState.AllCards.Count(candidate =>
++                candidate.Preview.Tags.Contains(CardTag.Cho) || candidate.Preview.Tags.Contains(CardTag.Ki)),
+             PreciseCut => -playerState.Hand.Cards.Count,
+             Stack => playerState.DiscardPile.Cards.Count,
+             Squeeze => playerState.AllCards.Count(candidate =>
+diff --git a/src/CoopBots.Kernel/Vendor/Prediction/EndTurnPowerSupport.Batch048.cs b/src/CoopBots.Kernel/Vendor/Prediction/EndTurnPowerSupport.Batch048.cs
+index d285a82..7def766 100644
+--- a/src/CoopBots.Kernel/Vendor/Prediction/EndTurnPowerSupport.Batch048.cs
++++ b/src/CoopBots.Kernel/Vendor/Prediction/EndTurnPowerSupport.Batch048.cs
+@@ -24,6 +24,19 @@ internal static partial class EndTurnPowerSupport
+             bool ownerParticipates = participants.Contains(owner);
+             switch (power)
+             {
++                case ChoBarbsPower when side != owner.Side:
++                    int temporaryThorns = power.Amount;
++                    combat.SetPowerAmount(power, 0);
++                    if (combat.GetPower<ThornsPower>(owner) is { } thorns)
++                        combat.SetPowerAmount(thorns, thorns.Amount - temporaryThorns);
++                    break;
++                case DislikeYouPower when side == CombatSide.Player:
++                case EncorePower or KiVersePower or ShowOffPower when ownerParticipates:
++                    combat.SetPowerAmount(power, 0);
++                    break;
++                case QuietusPower when ownerParticipates:
++                    combat.SetPowerAmount(power, 0);
++                    break;
+                 case DebilitatePower when ownerParticipates:
+                     combat.SetPowerAmount(power, power.Amount - 1);
+                     break;
+diff --git a/src/CoopBots.Kernel/Vendor/Prediction/PotionOnUseSupport.cs b/src/CoopBots.Kernel/Vendor/Prediction/PotionOnUseSupport.cs
+index ab2429d..a33818f 100644
+--- a/src/CoopBots.Kernel/Vendor/Prediction/PotionOnUseSupport.cs
++++ b/src/CoopBots.Kernel/Vendor/Prediction/PotionOnUseSupport.cs
+@@ -102,7 +102,7 @@ internal static class PotionOnUseSupport
+                     playerTarget,
+                     simulator.State.GetCreature(playerTarget).MaxHp
+                         * value.DynamicVars["HealPercent"].BaseValue / 100m);
+-                combat.Apply<AmbergrisPower>(playerTarget, 1, owner);
++                combat.Apply<ExtraTurnPower>(playerTarget, 1, owner);
+                 break;
+             case Ashwater or DropletOfPrecognition or GamblersBrew or LiquidMemories or TouchOfInsanity:
+                 break;
+diff --git a/src/CoopBots.Kernel/Vendor/Prediction/PowerPredictionStateSupport.cs b/src/CoopBots.Kernel/Vendor/Prediction/PowerPredictionStateSupport.cs
+index 677a890..42b0c24 100644
+--- a/src/CoopBots.Kernel/Vendor/Prediction/PowerPredictionStateSupport.cs
++++ b/src/CoopBots.Kernel/Vendor/Prediction/PowerPredictionStateSupport.cs
+@@ -1,7 +1,7 @@
+ using MegaCrit.Sts2.Core.Models;
+ using MegaCrit.Sts2.Core.Models.Powers;
+-using CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Attack;
+ using CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Card;
++using CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Attack;
+ using CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Damage;
+ using CoopBots.Kernel.Vendor.Engine.InCombat.Simulation;
+ 
+@@ -29,6 +29,26 @@ internal static class PowerPredictionStateSupport
+                     && data.amountsForPlayedCards.Count == 0)
+                     _ = simulator.StateStore.GetReadOnly(value, static () => new CardPlayPairPredictionState());
+                 break;
++            case (EncorePower value, EncorePower original):
++                _ = simulator.StateStore.GetReadOnly(value, () => new FoolEncoreState
++                    { Finished = original.GetInternalData<EncorePower.Data>().numberOfCardsPlayedSinceApplied });
++                break;
++            case (LullabyPower value, LullabyPower original):
++                _ = simulator.StateStore.GetReadOnly(value, () => new FoolTurnTriggerState { Triggered = original._proccdThisTurn });
++                break;
++            case (YahPower value, YahPower original):
++                _ = simulator.StateStore.GetReadOnly(value, () => new FoolTurnTriggerState
++                    { Triggered = original.GetInternalData<YahPower.Data>().triggeredThisTurn });
++                break;
++            case (VigorPower value, VigorPower original):
++                VigorPowerMirrors.CaptureRoot(simulator, value, original);
++                break;
++            case (AimPower value, AimPower original):
++                AimPowerMirrors.CaptureRoot(simulator, value, original);
++                break;
++            case (ImpaledPower value, ImpaledPower original):
++                simulator.CaptureImpaledArrows(value, original);
++                break;
+             case (DarkEmbracePower value, DarkEmbracePower original):
+                 _ = simulator.StateStore.GetReadOnly(value, () => new DarkEmbracePredictionState(original));
+                 break;
+diff --git a/src/CoopBots.Kernel/Vendor/Prediction/RelicPredictionStateSupport.cs b/src/CoopBots.Kernel/Vendor/Prediction/RelicPredictionStateSupport.cs
+index 62ab9c0..f8600c4 100644
+--- a/src/CoopBots.Kernel/Vendor/Prediction/RelicPredictionStateSupport.cs
++++ b/src/CoopBots.Kernel/Vendor/Prediction/RelicPredictionStateSupport.cs
+@@ -1,8 +1,8 @@
++using CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Card;
+ using System.Text;
+ using MegaCrit.Sts2.Core.Entities.Players;
+ using MegaCrit.Sts2.Core.Models;
+ using MegaCrit.Sts2.Core.Models.Relics;
+-using CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Card;
+ using CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Damage;
+ using CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Death;
+ using CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Orb;
+@@ -49,6 +49,9 @@ internal static class RelicPredictionStateSupport
+     {
+         switch (predicted, live)
+         {
++            case (ConductorsBaton target, ConductorsBaton source):
++                _ = simulator.StateStore.GetReadOnly(target, () => new FoolTurnTriggerState { Triggered = source._triggeredThisTurn });
++                break;
+             case (BeatingRemnant target, BeatingRemnant source):
+                 _ = simulator.StateStore.GetReadOnly((AbstractModel)target, () => new BeatingRemnantPredictionState(source));
+                 break;
+@@ -128,7 +131,7 @@ internal static class RelicPredictionStateSupport
+                 _ = simulator.StateStore.GetReadOnly((AbstractModel)target, () => new VambracePredictionState(source));
+                 break;
+             case (VelvetChoker target, VelvetChoker source):
+-                CaptureCounter(target, source._cardsPlayedThisTurn);
++                CaptureCounter(target, source.DisplayAmount);
+                 break;
+             case (_, _) when !IsTracked(predicted):
+                 break;
+@@ -198,7 +201,7 @@ internal static class RelicPredictionStateSupport
+                 Counter(simulator, value, value._attacksPlayedThisTurn).Value = 0;
+                 break;
+             case VelvetChoker value:
+-                Counter(simulator, value, value._cardsPlayedThisTurn).Value = 0;
++                Counter(simulator, value, 0).Value = 0;
+                 break;
+         }
+     }
+@@ -364,7 +367,7 @@ internal static class RelicPredictionStateSupport
+                     .BlockGainedThisCombat);
+                 break;
+             case VelvetChoker value:
+-                fingerprint.Add(CounterValueReadOnly(simulator, value, value._cardsPlayedThisTurn));
++                fingerprint.Add(CounterValueReadOnly(simulator, value, 0));
+                 break;
+         }
+     }
+@@ -484,7 +487,7 @@ internal static class RelicPredictionStateSupport
+             ThrowingAxe value => Bool(value._usedThisCombat),
+             TuningFork value => value.SkillsPlayed.ToString(),
+             Vambrace value => Bool(value._blockGainedThisCombat),
+-            VelvetChoker value => value._cardsPlayedThisTurn.ToString(),
++            VelvetChoker value => 0.ToString(),
+             _ => throw new ArgumentOutOfRangeException(nameof(relic), relic.GetType().FullName),
+         };
+ 
+@@ -532,7 +535,7 @@ internal static class RelicPredictionStateSupport
+             TuningFork value => CounterValueReadOnly(simulator, value, value.SkillsPlayed).ToString(),
+             Vambrace value => Bool(simulator.StateStore
+                 .Peek((AbstractModel)value, () => new VambracePredictionState(value)).BlockGainedThisCombat),
+-            VelvetChoker value => CounterValueReadOnly(simulator, value, value._cardsPlayedThisTurn).ToString(),
++            VelvetChoker value => CounterValueReadOnly(simulator, value, 0).ToString(),
+             _ => throw new ArgumentOutOfRangeException(nameof(relic), relic.GetType().FullName),
+         };
+ 
+diff --git a/src/CoopBots.Kernel/Vendor/Prediction/SemanticStateFieldPolicy.cs b/src/CoopBots.Kernel/Vendor/Prediction/SemanticStateFieldPolicy.cs
+index d62fb1a..c2b002f 100644
+--- a/src/CoopBots.Kernel/Vendor/Prediction/SemanticStateFieldPolicy.cs
++++ b/src/CoopBots.Kernel/Vendor/Prediction/SemanticStateFieldPolicy.cs
+@@ -16,6 +16,7 @@ internal static class SemanticStateFieldPolicy
+     private static readonly HashSet<(Type ModelType, string FieldName)> PresentationOnlyFields =
+     [
+         (typeof(KnockdownPower), "Applier"),
++        (typeof(ImpaledPower), "Applier"),
+         (typeof(GuardedPower), "Applier"),
+         (typeof(InterceptPower), "Covering"),
+         (typeof(VitalSparkPower), "AfflictionTitle"),
+diff --git a/src/CoopBots.Kernel/Vendor/Prediction/TurnStartPowerSupport.cs b/src/CoopBots.Kernel/Vendor/Prediction/TurnStartPowerSupport.cs
+index 69c5e87..cbb156f 100644
+--- a/src/CoopBots.Kernel/Vendor/Prediction/TurnStartPowerSupport.cs
++++ b/src/CoopBots.Kernel/Vendor/Prediction/TurnStartPowerSupport.cs
+@@ -1,3 +1,4 @@
++using MegaCrit.Sts2.Core.Models.Relics;
+ using MegaCrit.Sts2.Core.Combat;
+ using MegaCrit.Sts2.Core.Entities.Cards;
+ using MegaCrit.Sts2.Core.Entities.Creatures;
+@@ -8,8 +9,8 @@ using MegaCrit.Sts2.Core.Models.Cards;
+ using MegaCrit.Sts2.Core.Models.Powers;
+ using MegaCrit.Sts2.Core.ValueProps;
+ using CoopBots.Kernel.Vendor.Engine.Common;
+-using CoopBots.Kernel.Vendor.Engine.InCombat.Extensions;
+ using CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Card;
++using CoopBots.Kernel.Vendor.Engine.InCombat.Extensions;
+ using CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Damage;
+ using CoopBots.Kernel.Vendor.Engine.InCombat.Simulation;
+ 
+@@ -54,6 +55,10 @@ internal static partial class TurnStartPowerSupport
+             }
+         }
+ 
++        foreach (var player in combat.Players.Where(player => participants.Contains(player.Creature)))
++            foreach (var relic in combat.RelicsOf(player).OfType<ConductorsBaton>().Where(relic => !relic.IsMelted))
++                simulator.StateStore.Get<FoolTurnTriggerState>(relic).Triggered = false;
++
+         IReadOnlyList<PowerModel> aggressionPowers = combat.EffectivePowers();
+         for (int powerIndex = 0; powerIndex < aggressionPowers.Count; powerIndex++)
+         {
+@@ -94,6 +99,9 @@ internal static partial class TurnStartPowerSupport
+ 
+             switch (power)
+             {
++                case YahPower or LullabyPower when participants.Contains(power.Owner):
++                    simulator.StateStore.Get<FoolTurnTriggerState>(power).Triggered = false;
++                    break;
+                 case HardenedShellPower shell:
+                     simulator.StateStore
+                         .Get(shell, () => new HardenedShellPredictionState(shell))
+@@ -140,6 +148,32 @@ internal static partial class TurnStartPowerSupport
+             if (power.Amount <= 0 || !ReferenceEquals(power.Owner.Player, player))
+                 continue;
+ 
++            if (power is EnnuiPower)
++            {
++                simulator.CreateAndAddGeneratedCardsToCombat<Sadness>(player, PileType.Hand, power.DynamicVars.Cards.IntValue, player);
++                if (simulator.HasPendingChoice)
++                {
++                    simulator.AppendExecutionContinuation(new BeforeHandDrawPowerFrame(player, powers, powerIndex + 1, ForegoneStage.Start));
++                    return true;
++                }
++                continue;
++            }
++            if (power is MythicFormPower)
++            {
++                for (int index = 0; index < power.Amount; index++)
++                {
++                    var tarot = simulator.Rng.CombatCardSelection.NextItem(TarotCards.All.Where(card => card.IsAllowedInRun(player.RunState)));
++                    if (tarot != null)
++                        simulator.AddGeneratedCardToCombat(PredictedCard.Create(tarot, player), PileType.Hand, player);
++                    if (simulator.HasPendingChoice)
++                    {
++                        simulator.RejectExecutionContinuation();
++                        return true;
++                    }
++                }
++                continue;
++            }
++
+             if (power is NightmarePower or InfiniteBladesPower or SentryModePower)
+             {
+                 if (combat.GenerateTurnStartPowerCards(simulator, player, power))
+@@ -275,6 +309,21 @@ internal static partial class TurnStartPowerSupport
+ 
+             switch (power)
+             {
++                case EcstasyPower:
++                    var sadness = simulator.State.GetPlayerCombatState(player).Hand.Cards
++                        .Where(candidate => candidate.Preview is Sadness).ToList();
++                    if (sadness.Count == 0) break;
++                    var selected = sadness.StableShuffle(simulator.Rng.CombatCardSelection).Take(power.Amount).ToArray();
++                    if (!CardChoiceSupport.TransformCards(simulator, selected, CanonicalModels.Card<Joy>(), false))
++                    {
++                        simulator.RejectExecutionContinuation();
++                        return true;
++                    }
++                    break;
++                case GodByrdPower when power.AmountOnTurnStart != 0:
++                    simulator.Damage(simulator.State.HittableEnemies.ToArray(), power.Amount, ValueProp.Unpowered, owner);
++                    if (!simulator.HasPendingChoice) combat.SetPowerAmount(power, 0);
++                    break;
+                 case EntropyPower:
+                     if (!TurnStartChoiceSupport.Resolve(
+                             simulator,
+@@ -405,6 +454,28 @@ internal static partial class TurnStartPowerSupport
+         CombatSide side,
+         IReadOnlyList<Creature> participants)
+     {
++        foreach (var power in combat.EffectivePowers().ToArray())
++        {
++            if (!participants.Contains(power.Owner)) continue;
++            if (power is ArcheryPower)
++                combat.Apply<AimPower>(power.Owner, power.Amount, power.Owner);
++            else if (power is HiddenRootsPower)
++                combat.Apply<StretchPower>(power.Owner, power.Amount, power.Owner);
++            else if (power is ConductorsBatonPower)
++                combat.SetPowerAmount(power, 0);
++            if (simulator.HasPendingChoice) return false;
++        }
++        foreach (var player in combat.Players)
++        {
++            if (!participants.Contains(player.Creature)) continue;
++            foreach (var relic in combat.RelicsOf(player))
++            {
++                if (relic.IsMelted) continue;
++                if (relic is ExerciseMat && combat.GetPlayerTurnNumber(player) <= 1)
++                    combat.Apply<StretchPower>(player.Creature, relic.DynamicVars["StretchPower"].IntValue, player.Creature);
++                if (simulator.HasPendingChoice) return false;
++            }
++        }
+         foreach (CountdownPower countdown in combat.EffectivePowers().OfType<CountdownPower>().ToArray())
+         {
+             if (countdown.Amount <= 0 || !participants.Contains(countdown.Owner))
+diff --git a/src/CoopBots.Kernel/Vendor/Runtime/ContinuationStamp.cs b/src/CoopBots.Kernel/Vendor/Runtime/ContinuationStamp.cs
+index 8e3d0fe..8b6fb17 100644
+--- a/src/CoopBots.Kernel/Vendor/Runtime/ContinuationStamp.cs
++++ b/src/CoopBots.Kernel/Vendor/Runtime/ContinuationStamp.cs
+@@ -1,4 +1,6 @@
+ using System.Text;
++using MegaCrit.Sts2.Core.Entities.FoolArrows;
++using CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Attack;
+ using MegaCrit.Sts2.Core.Combat;
+ using MegaCrit.Sts2.Core.Context;
+ using MegaCrit.Sts2.Core.Entities.Cards;
+@@ -93,6 +95,12 @@ internal sealed record ContinuationStamp(string StateText)
+         AppendLivePile(text, pcs.ExhaustPile, 'X');
+         SimulatedCombatState.AppendLiveTurnCardHistory(text, state, player);
+         AppendOrbs(text, pcs.OrbQueue.Capacity, pcs.OrbQueue.Orbs);
++        AppendArrows(text, pcs.Arrows);
++        SimulatedCombatState.AppendLiveMelodyState(text, player, state);
++        text.Append(";sadness=").Append(CombatManager.Instance.History.Entries
++            .OfType<MegaCrit.Sts2.Core.Combat.History.Entries.CardGeneratedEntry>().Count(entry => entry.Creator == player && entry.Card is Sadness));
++        if (player.Creature.Powers.Any(power => power is ShowOffPower))
++            SimulatedCombatState.AppendLiveShowOffState(text, player);
+         AppendPotions(text, player, player.GetPotionAtSlotIndex);
+         SimulatedCombatState.AppendLiveStatefulRelics(text, player);
+         RelicPredictionStateSupport.AppendLiveContinuation(text, player);
+@@ -166,6 +174,12 @@ internal sealed record ContinuationStamp(string StateText)
+         AppendPredictedPile(text, pcs.ExhaustPile, 'X');
+         combat.AppendPredictedTurnCardHistory(text, player);
+         AppendPredictedOrbs(text, simulator, pcs.OrbQueue.Capacity, pcs.OrbQueue.Orbs);
++        AppendArrows(text, pcs.Arrows);
++        ((SimulatedCombatState)simulator.State.CombatState).AppendMelodyState(text, player);
++        text.Append(";sadness=").Append(((SimulatedCombatState)simulator.State.CombatState).SadnessGenerated(simulator, player));
++        if (((SimulatedCombatState)simulator.State.CombatState).EffectivePowers()
++            .Any(power => power is ShowOffPower && power.Owner == player.Creature))
++            ((SimulatedCombatState)simulator.State.CombatState).AppendShowOffState(text, player, simulator);
+         AppendPotions(text, player, slot => combat.GetPotionAtSlot(player, slot));
+         combat.AppendPredictedStatefulRelics(text, player);
+         RelicPredictionStateSupport.AppendPredictedContinuation(
+@@ -450,6 +464,13 @@ internal sealed record ContinuationStamp(string StateText)
+                 .Append(OrbMirrors.GetEvokeValue(simulator, orb)).Append("],");
+     }
+ 
++    private static void AppendArrows(StringBuilder text, IReadOnlyList<ArrowSlot> arrows)
++    {
++        if (arrows.Count == 0) return;
++        text.Append(";arrows=");
++        foreach (var slot in arrows) text.Append((int)slot.Status).Append(',');
++    }
++
+     private static void AppendPowers(StringBuilder text, IEnumerable<PowerModel> powers, CombatPredictionSimulator? simulator = null)
+     {
+         // CoopBots multiplayer port: canonical order, because DescribeDifferences compares
+@@ -480,6 +501,18 @@ internal sealed record ContinuationStamp(string StateText)
+                     text.Append(':').Append(stringVar.StringValue);
+                 text.Append(',');
+             }
++            if (power is VigorPower vigor)
++                text.Append("Vigor=").Append(VigorPowerMirrors.Describe(vigor, simulator)).Append(',');
++            if (power is AimPower aim)
++                text.Append("Aim=").Append(AimPowerMirrors.Describe(aim, simulator)).Append(',');
++            if (power is ImpaledPower impaled)
++            {
++                text.Append("Shooter=").Append(impaled.Applier?.CombatId).Append("/Slots=");
++                var slots = simulator != null ? simulator.ImpaledSlots(impaled) :
++                    impaled.Arrows.Select(arrow => CombatPredictionSimulator.SlotIndex(arrow.owner.PlayerCombatState!.Arrows, arrow)).ToArray();
++                foreach (int slot in slots) text.Append(slot).Append(':');
++                text.Append(',');
++            }
+             if (power is SurroundedPower surrounded)
+                 text.Append("Facing=").Append(simulator == null ? surrounded.Facing
+                     : PowerPredictionStateSupport.SurroundedFacing(simulator, surrounded)).Append(',');
+diff --git a/src/CoopBots.Kernel/Vendor/Search/CardChoiceResolution.cs b/src/CoopBots.Kernel/Vendor/Search/CardChoiceResolution.cs
+index cc35b26..2c3c98a 100644
+--- a/src/CoopBots.Kernel/Vendor/Search/CardChoiceResolution.cs
++++ b/src/CoopBots.Kernel/Vendor/Search/CardChoiceResolution.cs
+@@ -178,13 +178,14 @@ internal static partial class CardChoiceSupport
+     {
+         CardModel replacement = source switch
+         {
++            Florescence => CanonicalModels.Card<TheShot>(),
+             Begone => CanonicalModels.Card<MinionStrike>(),
+             Charge => CanonicalModels.Card<MinionDiveBomb>(),
+             Guards => CanonicalModels.Card<MinionSacrifice>(),
+             Seance => CanonicalModels.Card<Soul>(),
+             _ => throw new InvalidOperationException($"卡牌 {source.Id.Entry} 没有选牌变换定义。"),
+         };
+-        bool upgrade = source.IsUpgraded && source is Begone or Charge or Guards;
++        bool upgrade = source.IsUpgraded && source is Begone or Charge or Guards or Florescence;
+         return TransformCards(simulator, selected, replacement, upgrade);
+     }
+ 
+@@ -221,8 +222,8 @@ internal static partial class CardChoiceSupport
+             if (simulator.HasPendingChoice)
+                 return false;
+         }
+-        original.MutablePreview.AfterTransformedFrom();
+-        replacement.MutablePreview.AfterTransformedTo();
++        original.MutablePreview.AfterThisWasTransformedInto(replacement.MutablePreview);
++        replacement.MutablePreview.AfterThisWasTransformedFrom(original.MutablePreview);
+         HookMirrors.AfterCardGeneratedForCombat(
+             simulator,
+             replacement,
+diff --git a/src/CoopBots.Kernel/Vendor/Search/CardChoiceSupport.cs b/src/CoopBots.Kernel/Vendor/Search/CardChoiceSupport.cs
+index cf5995c..f701c6d 100644
+--- a/src/CoopBots.Kernel/Vendor/Search/CardChoiceSupport.cs
++++ b/src/CoopBots.Kernel/Vendor/Search/CardChoiceSupport.cs
+@@ -102,7 +102,8 @@ internal static partial class CardChoiceSupport
+             TrueGrit when card.IsUpgraded => Spec(owner, PlanChoiceEffect.Exhaust, PileType.Hand, 1, owner.Hand.Cards),
+             Hologram => Spec(owner, PlanChoiceEffect.MoveToHand, PileType.Discard, 1, discardBeforeResolution),
+             Graveblast => Spec(owner, PlanChoiceEffect.MoveToHand, PileType.Discard, 1, discardBeforeResolution),
+-            Headbutt => Spec(owner, PlanChoiceEffect.MoveToDrawTop, PileType.Discard, 1, discardBeforeResolution),
++            Headbutt or WahKi => Spec(owner, PlanChoiceEffect.MoveToDrawTop, PileType.Discard, 1, discardBeforeResolution),
++            Florescence => Spec(owner, PlanChoiceEffect.Transform, PileType.Hand, 1, owner.Hand.Cards),
+             CosmicIndifference => Spec(owner, PlanChoiceEffect.MoveToDrawTop, PileType.Discard, 1, discardBeforeResolution),
+             SecretWeapon => Spec(owner, PlanChoiceEffect.MoveToHand, PileType.Draw, 1,
+                 owner.DrawPile.Cards.Where(item => item.Preview.Type == CardType.Attack)),
+diff --git a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.CardLifecycle.cs b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.CardLifecycle.cs
+index b35397e..a1d679e 100644
+--- a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.CardLifecycle.cs
++++ b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.CardLifecycle.cs
+@@ -142,7 +142,6 @@ internal sealed partial class SimulatedCombatState
+     public void RecordCardLifecycle(CombatPredictionSimulator simulator, PredictedCard card)
+     {
+         Creature owner = card.Preview.Owner.Creature;
+-        (_cardsPlayedThisTurn ??= [])[owner] = GetCardsPlayedThisTurn(owner) + 1;
+         if (card.Preview is Fetch)
+             GetFetchCardsPlayedThisTurn().Add(card.Original);
+         RecordRelicCardPlayed(simulator, card.Preview.Owner, card.Preview);
+@@ -196,6 +195,7 @@ internal sealed partial class SimulatedCombatState
+     void ICombatPredictionCardExecutionSink.RecordCardPlayStarted(PredictedCard card, CardPlay cardPlay)
+     {
+         Creature owner = card.Preview.Owner.Creature;
++        RecordMelodyStarted(cardPlay);
+         (_cardPlayStartsThisTurn ??= [])[owner] = GetCardPlayStartsThisTurn(owner) + 1;
+         if (card.Preview.Type == CardType.Attack)
+             (_attackPlayStartsThisTurn ??= [])[owner] = GetAttackPlayStartsThisTurn(owner) + 1;
+@@ -208,6 +208,7 @@ internal sealed partial class SimulatedCombatState
+         }
+         if (!cardPlay.IsFirstInSeries)
+             return;
++        (_cardsPlayedThisTurn ??= [])[owner] = GetCardsPlayedThisTurn(owner) + 1;
+         (_cardPlaySeriesStartedThisTurn ??= [])[owner] = GetCardPlaySeriesStartedThisTurn(owner) + 1;
+         if (!cardPlay.IsAutoPlay)
+         {
+diff --git a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.Fork.cs b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.Fork.cs
+index fc2370f..0a35e0f 100644
+--- a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.Fork.cs
++++ b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.Fork.cs
+@@ -81,6 +81,9 @@ internal sealed partial class SimulatedCombatState
+             _simulatedOsties = _simulatedOsties?.Fork(),
+             _cardsPlayedThisTurn = _cardsPlayedThisTurn?.Fork(),
+             _manualCardsPlayedThisTurn = _manualCardsPlayedThisTurn?.Fork(),
++            _rootSadnessCounts = _rootSadnessCounts,
++            _showOffSources = _showOffSources?.ToDictionary(pair => pair.Key, pair => context.RequireRemap(pair.Value)),
++            _melodies = _melodies?.ToDictionary(pair => pair.Key, pair => pair.Value.Fork(context)),
+             _fetchCardsPlayedThisTurn = _fetchCardsPlayedThisTurn?.Fork(),
+             _simulatedPlayerGold = _simulatedPlayerGold?.Fork(),
+             _liveCardsAtSnapshot = _liveCardsAtSnapshot,
+diff --git a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.Melodies.cs b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.Melodies.cs
+new file mode 100644
+index 0000000..5002eae
+--- /dev/null
++++ b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.Melodies.cs
+@@ -0,0 +1,117 @@
++// Adapted from CombatSolver v0.51.9 (Torch1230 and contributors, MIT).
++using System.Text;
++using CoopBots.Kernel.Vendor.Engine.Common;
++using MegaCrit.Sts2.Core.Combat;
++using MegaCrit.Sts2.Core.Combat.History.Entries;
++using MegaCrit.Sts2.Core.Models.Cards;
++using MegaCrit.Sts2.Core.Entities.Cards;
++using MegaCrit.Sts2.Core.Entities.Players;
++
++namespace CoopBots.Kernel.Vendor;
++
++internal sealed partial class SimulatedCombatState
++{
++    private Dictionary<Player, MelodyState>? _melodies;
++    private IReadOnlyDictionary<Player, int>? _rootSadnessCounts;
++
++    internal int SadnessGenerated(Engine.InCombat.Simulation.CombatPredictionSimulator simulator, Player player)
++        => (_rootSadnessCounts?.GetValueOrDefault(player) ?? 0)
++           + simulator.History.OfType<Engine.InCombat.Simulation.CombatPredictionCardGeneratedEntry>()
++               .Count(entry => entry.Creator == player && entry.Card.Original is Sadness);
++    internal static readonly CardTag[] MelodyTags = [CardTag.Wah, CardTag.Cho, CardTag.Ki];
++
++    private sealed class MelodyState
++    {
++        public int[] Started = new int[3];
++        public int[] Finished = new int[3];
++        public CardPlay?[] First = new CardPlay?[3];
++        public int CardsFinished;
++
++        public MelodyState Fork(PredictionForkContext context) => new()
++        {
++            Started = (int[])Started.Clone(), Finished = (int[])Finished.Clone(),
++            First = First.Select(play => play is null ? null : context.RemapOrSelf(play)).ToArray(),
++            CardsFinished = CardsFinished
++        };
++    }
++
++    private void CaptureMelodies(CombatState combat)
++    {
++        _rootSadnessCounts = CombatManager.Instance.History.Entries.OfType<CardGeneratedEntry>()
++            .Where(entry => entry.Creator != null && entry.Card is Sadness)
++            .GroupBy(entry => entry.Creator!).ToDictionary(group => group.Key, group => group.Count());
++        foreach (var entry in _rootHistory.CardPlaysStarted)
++            if (entry.HappenedThisTurn(combat)) RecordMelodyStarted(entry.CardPlay);
++        foreach (var entry in _rootHistory.CardPlaysFinished)
++            if (entry.HappenedThisTurn(combat)) RecordMelodyFinished(entry.CardPlay);
++    }
++
++    private void RecordMelodyStarted(CardPlay play)
++    {
++        for (int index = 0; index < MelodyTags.Length; index++)
++        {
++            if (!play.Card.Tags.Contains(MelodyTags[index])) continue;
++            var state = GetMelodyState(play.Player);
++            state.Started[index]++;
++            state.First[index] ??= play;
++        }
++    }
++
++    internal void RecordMelodyFinished(CardPlay play)
++    {
++        bool any = false;
++        for (int index = 0; index < MelodyTags.Length; index++)
++        {
++            if (!play.Card.Tags.Contains(MelodyTags[index])) continue;
++            GetMelodyState(play.Player).Finished[index]++;
++            any = true;
++        }
++        if (any) GetMelodyState(play.Player).CardsFinished++;
++    }
++
++    private MelodyState GetMelodyState(Player player)
++    {
++        _melodies ??= [];
++        if (!_melodies.TryGetValue(player, out var state)) _melodies.Add(player, state = new());
++        return state;
++    }
++
++    public int MelodyStartedCount(Player player, CardTag tag)
++        => _melodies?.GetValueOrDefault(player)?.Started[Array.IndexOf(MelodyTags, tag)] ?? 0;
++    public bool PlayedMelody(Player player, CardTag tag)
++        => (_melodies?.GetValueOrDefault(player)?.Started[Array.IndexOf(MelodyTags, tag)] ?? 0) > 0;
++    public int MelodyCount(Player player) => _melodies?.GetValueOrDefault(player)?.Started.Count(count => count > 0) ?? 0;
++    public int MelodyCardsPlayed(Player player) => _melodies?.GetValueOrDefault(player)?.CardsFinished ?? 0;
++    public bool IsFirstMelodyPlay(CardPlay play, CardTag tag)
++        => ReferenceEquals(_melodies?.GetValueOrDefault(play.Player)?.First[Array.IndexOf(MelodyTags, tag)], play);
++
++    internal void AppendMelodyState(StringBuilder text, Player player)
++    {
++        var state = _melodies?.GetValueOrDefault(player);
++        AppendMelodyState(text, state?.Started ?? [0, 0, 0], state?.Finished ?? [0, 0, 0], state?.CardsFinished ?? 0);
++    }
++
++    internal static void AppendLiveMelodyState(StringBuilder text, Player player, CombatState combat)
++    {
++        var history = CombatManager.Instance.History;
++        var started = history.CardPlaysStarted.Where(entry => entry.HappenedThisTurn(combat) && entry.CardPlay.Player == player).ToArray();
++        var finished = history.CardPlaysFinished.Where(entry => entry.HappenedThisTurn(combat) && entry.CardPlay.Player == player).ToArray();
++        AppendMelodyState(text, MelodyTags.Select(tag => started.Count(entry => entry.CardPlay.Card.Tags.Contains(tag))).ToArray(),
++            MelodyTags.Select(tag => finished.Count(entry => entry.CardPlay.Card.Tags.Contains(tag))).ToArray(),
++            finished.Count(entry => MelodyTags.Any(tag => entry.CardPlay.Card.Tags.Contains(tag))));
++    }
++
++    private static void AppendMelodyState(StringBuilder text, int[] started, int[] finished, int cards)
++        => text.Append(";melodies=").AppendJoin(',', started).Append('/').AppendJoin(',', finished).Append('/').Append(cards);
++
++    internal void AddMelodyFingerprint(ref StateFingerprintBuilder fingerprint, Player player)
++    {
++        var state = _melodies?.GetValueOrDefault(player);
++        for (int index = 0; index < 3; index++)
++        {
++            fingerprint.Add(state?.Started[index] ?? 0);
++            fingerprint.Add(state?.Finished[index] ?? 0);
++        }
++        fingerprint.Add(state?.CardsFinished ?? 0);
++    }
++}
+diff --git a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.PowerForkCow.cs b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.PowerForkCow.cs
+index acefa72..60dbc80 100644
+--- a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.PowerForkCow.cs
++++ b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.PowerForkCow.cs
+@@ -66,6 +66,9 @@ internal sealed partial class SimulatedCombatState
+                 .Select(pair => pair.Key).ToArray())
+                 _powers[key] = replacement;
+         }
++        if (old is ShowOffPower oldShowOff && replacement is ShowOffPower newShowOff
++            && _showOffSources?.Remove(oldShowOff, out var source) == true)
++            _showOffSources[newShowOff] = source;
+         ReplaceInList(_addedPowerInstances, old, replacement);
+         ReplaceInList(_powerListenerOrder, old, replacement);
+         if (_rootMultiInstancePowerClones is not null)
+diff --git a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.ReactiveRelics.cs b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.ReactiveRelics.cs
+index c971123..1b233e7 100644
+--- a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.ReactiveRelics.cs
++++ b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.ReactiveRelics.cs
+@@ -32,7 +32,7 @@ internal sealed partial class SimulatedCombatState
+         out bool extraTurn,
+         out bool hasActiveEmotionChip)
+     {
+-        extraTurn = GetAmount<AmbergrisPower>(player.Creature) > 0;
++        extraTurn = GetAmount<ExtraTurnPower>(player.Creature) > 0;
+         hasActiveEmotionChip = false;
+         foreach (RelicModel relic in RelicsOf(player))
+         {
+@@ -55,7 +55,7 @@ internal sealed partial class SimulatedCombatState
+         bool paelsEyeTriggers,
+         out bool extraTurn)
+     {
+-        extraTurn = GetAmount<AmbergrisPower>(player.Creature) > 0;
++        extraTurn = GetAmount<ExtraTurnPower>(player.Creature) > 0;
+         if (!paelsEyeTriggers)
+             return true;
+ 
+@@ -100,9 +100,9 @@ internal sealed partial class SimulatedCombatState
+ 
+     public void ConsumeExtraTurnSources(Player player)
+     {
+-        int ambergris = GetAmount<AmbergrisPower>(player.Creature);
++        int ambergris = GetAmount<ExtraTurnPower>(player.Creature);
+         if (ambergris > 0)
+-            SetAmount<AmbergrisPower>(player.Creature, ambergris - 1);
++            SetAmount<ExtraTurnPower>(player.Creature, ambergris - 1);
+         foreach (PaelsEye relic in RelicsOf(player).OfType<PaelsEye>().Where(static relic => !relic.IsMelted))
+         {
+             StatefulRelicState state = GetStatefulRelicState(relic);
+diff --git a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.Relics.cs b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.Relics.cs
+index 5c92d9b..855bdbf 100644
+--- a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.Relics.cs
++++ b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.Relics.cs
+@@ -61,6 +61,17 @@ internal sealed partial class SimulatedCombatState
+                     state = GetStatefulRelicState(relic);
+                     SetStatefulRelicState(relic, state with { Current = state.Current + 1 });
+                     break;
++                case BizarreLamp when turn <= 1:
++                    simulator.AddGeneratedCardsToCombat(
++                        [PredictedCard.Create(CanonicalModels.Card<Joy>(), player), PredictedCard.Create(CanonicalModels.Card<Sadness>(), player)],
++                        PileType.Hand, player);
++                    break;
++                case Ocarina when turn <= 1:
++                    var pool = player.UnlockState.CharacterCardPools.SelectMany(cardPool => cardPool.GetUnlockedCards(player.UnlockState, CardMultiplayerConstraint))
++                        .Where(card => MelodyTags.Any(card.Tags.Contains));
++                    simulator.AddGeneratedCardsToCombat(pool.GetDistinctForCombat(player, 1,
++                        simulator.Rng.CombatCardGeneration, CardMultiplayerConstraint).ToArray(), PileType.Hand, player);
++                    break;
+                 case BlessedAntler when turn <= 1:
+                     simulator.CreateAndAddGeneratedCardsToCombat<Dazed>(
+                         player,
+diff --git a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.ShowOff.cs b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.ShowOff.cs
+new file mode 100644
+index 0000000..b272156
+--- /dev/null
++++ b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.ShowOff.cs
+@@ -0,0 +1,76 @@
++// Adapted from CombatSolver v0.51.9 (Torch1230 and contributors, MIT).
++using System.Text;
++using CoopBots.Kernel.Vendor.Engine.Common;
++using CoopBots.Kernel.Vendor.Engine.InCombat.Simulation;
++using MegaCrit.Sts2.Core.Entities.Players;
++using MegaCrit.Sts2.Core.Models;
++using MegaCrit.Sts2.Core.Models.Cards;
++using MegaCrit.Sts2.Core.Models.Powers;
++
++namespace CoopBots.Kernel.Vendor;
++
++internal sealed partial class SimulatedCombatState
++{
++    private Dictionary<ShowOffPower, PredictedCard>? _showOffSources;
++
++    internal void ApplyShowOff(PredictedCard card)
++    {
++        var model = (ShowOff)card.Preview;
++        BeginCardPowerApplication(model);
++        using var scope = new CardPowerApplicationScope(this, model);
++        ApplyWithBeforeApplied<ShowOffPower>(model.Owner.Creature, model.DynamicVars["ShowOffPower"].IntValue,
++            model.Owner.Creature, null, (_, power) =>
++            {
++                var showOff = (ShowOffPower)power;
++                showOff.ShowOffInstance = (ShowOff)card.MutablePreview;
++                (_showOffSources ??= []).Add(showOff, card);
++            });
++    }
++
++    internal void GrowShowOff(ShowOffPower power)
++    {
++        if (_showOffSources is null || !_showOffSources.TryGetValue(power, out var card)) return;
++        var source = (ShowOff)card.MutablePreview;
++        source.IncreasedAim += power.Amount;
++        source.CurrentAim = source.DynamicVars["BaseAim"].IntValue + source.IncreasedAim;
++        if (source.DeckVersion is not null)
++        {
++            RecordLongTermResource(power.Amount);
++        }
++    }
++
++    internal void AppendShowOffState(StringBuilder text, Player player, CombatPredictionSimulator simulator)
++    {
++        text.Append(";showOff=");
++        var cards = simulator.State.GetPlayerCombatState(player).AllCards.ToArray();
++        foreach (var power in EffectivePowers().OfType<ShowOffPower>().Where(power => power.Owner == player.Creature))
++        {
++            if (_showOffSources is null || !_showOffSources.TryGetValue(power, out var source)) { text.Append("null/"); continue; }
++            text.Append(Array.IndexOf(cards, source)).Append(':').Append(CardChoiceSupport.ChoiceCardKey(source)).Append('/');
++        }
++    }
++
++    internal static void AppendLiveShowOffState(StringBuilder text, Player player)
++    {
++        text.Append(";showOff=");
++        var cards = player.PlayerCombatState!.AllCards.ToArray();
++        foreach (var power in player.Creature.Powers.OfType<ShowOffPower>())
++        {
++            if (power.ShowOffInstance is not { } source) { text.Append("null/"); continue; }
++            text.Append(Array.IndexOf(cards, source)).Append(':').Append(CardChoiceSupport.ChoiceCardKey(source)).Append('/');
++        }
++    }
++
++    internal void AddShowOffFingerprint(ref StateFingerprintBuilder key, Player player, CombatPredictionSimulator simulator)
++    {
++        if (_showOffSources is not { Count: > 0 }) return;
++        var cards = simulator.State.GetPlayerCombatState(player).AllCards.ToArray();
++        key.Add("showOff");
++        foreach (var power in EffectivePowers().OfType<ShowOffPower>().Where(power => power.Owner == player.Creature))
++        {
++            if (!_showOffSources.TryGetValue(power, out var source)) { key.Add(-2); continue; }
++            key.Add(Array.IndexOf(cards, source));
++            key.Add(CardChoiceSupport.ChoiceCardKey(source));
++        }
++    }
++}
+diff --git a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.cs b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.cs
+index 2b93efa..9d5addc 100644
+--- a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.cs
++++ b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.cs
+@@ -12,7 +12,6 @@ using MegaCrit.Sts2.Core.Models.Monsters;
+ using MegaCrit.Sts2.Core.Models.Powers;
+ using MegaCrit.Sts2.Core.Models.Relics;
+ using MegaCrit.Sts2.Core.MonsterMoves.MonsterMoveStateMachine;
+-using MegaCrit.Sts2.Core.Models.Singleton;
+ using MegaCrit.Sts2.Core.Runs;
+ using MegaCrit.Sts2.Core.Saves.Runs;
+ using MegaCrit.Sts2.Core.Rooms;
+@@ -22,6 +21,7 @@ using MegaCrit.Sts2.Core.Map;
+ using MegaCrit.Sts2.Core.Platform;
+ using MegaCrit.Sts2.Core.Nodes;
+ using CoopBots.Kernel.Vendor.Engine.Common;
++using CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Attack;
+ using CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Card;
+ using CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Damage;
+ using CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks;
+@@ -44,10 +44,12 @@ internal sealed partial class SimulatedCombatState
+       ICombatPredictionRootMaterializable, IPredictionForkBoundary
+ {
+     private readonly IRunState _runState;
++    internal int CapturedTotalFloor { get; }
+     private readonly IReadOnlyList<Creature> _playerCreatures;
+     private readonly IReadOnlyList<Player> _players;
+     private readonly IReadOnlyList<ModifierModel> _modifiers;
+     private readonly MultiplayerScalingModel? _multiplayerScalingModel;
++    private readonly RunModel[] _runModels;
+     private readonly EncounterModel? _encounter;
+     private readonly IReadOnlyList<string> _encounterSlots;
+     private readonly RootCombatHistorySnapshot _rootHistory;
+@@ -167,10 +169,10 @@ internal sealed partial class SimulatedCombatState
+             BindingFlags.Instance | BindingFlags.Public)
+         ?? throw new MissingMemberException(typeof(Creature).FullName, nameof(Creature.MonsterMaxHpBeforeModification));
+     private static readonly FieldInfo MultiplayerScalingRunStateField =
+-        typeof(MultiplayerScalingModel).GetField("_runState", BindingFlags.Instance | BindingFlags.NonPublic)
++        typeof(RunModel).GetField("_runState", BindingFlags.Instance | BindingFlags.NonPublic)
+         ?? throw new MissingFieldException(typeof(MultiplayerScalingModel).FullName, "_runState");
+     private static readonly FieldInfo MultiplayerScalingCombatStateField =
+-        typeof(MultiplayerScalingModel).GetField("_combatState", BindingFlags.Instance | BindingFlags.NonPublic)
++        typeof(RunModel).GetField("_combatState", BindingFlags.Instance | BindingFlags.NonPublic)
+         ?? throw new MissingFieldException(typeof(MultiplayerScalingModel).FullName, "_combatState");
+ 
+     private enum SteamEruptionPhase
+@@ -252,6 +254,7 @@ internal sealed partial class SimulatedCombatState
+         if (!NGame.IsMainThread())
+             throw new InvalidOperationException("Live combat state can only be captured on the main thread.");
+         _runState = inner.RunState;
++        CapturedTotalFloor = inner.RunState.TotalFloor;
+         _runRngSnapshot = inner.RunState.Rng.ToSerializable();
+         _currentActIndex = inner.RunState.CurrentActIndex;
+         _currentRoomType = inner.RunState.CurrentRoom?.RoomType;
+@@ -268,6 +271,7 @@ internal sealed partial class SimulatedCombatState
+         _encounter = inner.Encounter;
+         _encounterSlots = inner.Encounter?.Slots.ToArray() ?? [];
+         _rootHistory = RootCombatHistorySnapshot.Capture();
++        CaptureMelodies(inner);
+         _brightestFlameMaxHpSpent = CaptureBrightestFlameMaxHpSpent(_rootHistory.CardPlaysStarted);
+         _rootCreatures = inner.Creatures
+             .Concat(inner.Players.Select(player => player.Osty).OfType<Creature>())
+@@ -276,19 +280,15 @@ internal sealed partial class SimulatedCombatState
+         Dictionary<AbstractModel, AbstractModel> rootModelClones = [];
+         foreach (BadgeModel badge in inner.BadgeModels)
+             rootModelClones.Add(badge, PredictionUtils.CloneModelForSimulation(badge));
+-        if (inner.MultiplayerScalingModel is { } liveMultiplayerScaling)
+-        {
+-            MultiplayerScalingModel detachedMultiplayerScaling =
+-                PredictionUtils.CloneModelForSimulation(liveMultiplayerScaling);
+-            MultiplayerScalingRunStateField.SetValue(detachedMultiplayerScaling, null);
+-            MultiplayerScalingCombatStateField.SetValue(detachedMultiplayerScaling, null);
+-            _multiplayerScalingModel = detachedMultiplayerScaling;
+-            rootModelClones.Add(liveMultiplayerScaling, detachedMultiplayerScaling);
+-        }
+-        else
+-        {
+-            _multiplayerScalingModel = null;
+-        }
++        _runModels = inner.RunModels.Select(live =>
++        {
++            RunModel detached = PredictionUtils.CloneModelForSimulation(live);
++            MultiplayerScalingRunStateField.SetValue(detached, null);
++            MultiplayerScalingCombatStateField.SetValue(detached, null);
++            rootModelClones.Add(live, detached);
++            return detached;
++        }).ToArray();
++        _multiplayerScalingModel = _runModels.OfType<MultiplayerScalingModel>().SingleOrDefault();
+         ModifierModel[] modifiers = inner.Modifiers
+             .Select(PredictionUtils.CloneModelForSimulation)
+             .ToArray();
+@@ -331,6 +331,7 @@ internal sealed partial class SimulatedCombatState
+             .GroupBy(power => (power.Owner, power.GetType()))
+             .Where(group => group.Skip(1).Any())
+             .SelectMany(group => group)
++            .Concat(rootPowers.Where(power => power is ImpaledPower))
+             .ToHashSet<PowerModel>(ReferenceEqualityComparer.Instance);
+         _playerNames = inner.Players.ToDictionary(
+             player => player,
+@@ -441,6 +442,7 @@ internal sealed partial class SimulatedCombatState
+         ForkableList<Creature> escapedCreatures)
+     {
+         _runState = source._runState;
++        CapturedTotalFloor = source.CapturedTotalFloor;
+         _runRngSnapshot = source._runRngSnapshot;
+         _currentActIndex = source._currentActIndex;
+         _currentRoomType = source._currentRoomType;
+@@ -454,6 +456,7 @@ internal sealed partial class SimulatedCombatState
+         _players = source._players;
+         _modifiers = source._modifiers;
+         _multiplayerScalingModel = source._multiplayerScalingModel;
++        _runModels = source._runModels;
+         _encounter = source._encounter;
+         _encounterSlots = source._encounterSlots;
+         _rootHistory = source._rootHistory;
+@@ -477,6 +480,7 @@ internal sealed partial class SimulatedCombatState
+     }
+ 
+     public IRunState RunState => _runState;
++    public IReadOnlyList<RunModel> RunModels => _runModels;
+     internal int CurrentActIndex => _currentActIndex;
+     internal RoomType? CurrentRoomType => _currentRoomType;
+     internal MapCoord? CurrentMapCoord => _currentMapCoord;
+@@ -644,7 +648,8 @@ internal sealed partial class SimulatedCombatState
+         {
+             return 0;
+         }
+-        bool instanced = incoming.InstanceType == MegaCrit.Sts2.Core.Entities.Powers.PowerInstanceType.Instanced;
++        bool instanced = incoming.InstanceType == MegaCrit.Sts2.Core.Entities.Powers.PowerInstanceType.Instanced
++            || incoming is ImpaledPower;
+         bool firstApplication = instanced || GetAmount<T>(target) == 0;
+         // Native PowerCmd.Apply scales only a newly acquired enemy power.
+         // An existing instance goes through ModifyAmount with the unscaled offset.
+@@ -657,6 +662,8 @@ internal sealed partial class SimulatedCombatState
+             incoming.DynamicVars["Decrement"].BaseValue = Players.Count;
+         if (firstApplication)
+             beforeApplied?.Invoke(amount);
++        if (incoming is ChoBarbsPower)
++            Apply<ThornsPower>(target, amount, applier);
+         PowerModel simulated;
+         if (instanced)
+         {
+@@ -679,6 +686,13 @@ internal sealed partial class SimulatedCombatState
+         UpdatePowerListenerOrder(simulated, previousAmount, simulated._amount);
+         InvalidateHookListenersForAmountTransition(previousAmount, simulated._amount);
+         int applied = simulated._amount - previousAmount;
++        if (_stateStore != null && simulated is EncorePower encore)
++            encore.DynamicVars["PlaysRemaining"].BaseValue =
++                Math.Max(0, encore.Amount - _stateStore.Get<CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Card.FoolEncoreState>(encore).Finished);
++        if (_stateStore != null && previousAmount == 0 && target.Player is { } melodyOwner
++            && simulated is LullabyPower or YahPower)
++            _stateStore.Get<FoolTurnTriggerState>(simulated).Triggered =
++                simulated is LullabyPower && MelodyCount(melodyOwner) == 3;
+         RecordPowerAmountChange(simulated, applied, applier);
+         RecordPossessedStatChange(simulated, applied, applier);
+         if (simulated is DoomPower && applied > 0 && applier != null)
+@@ -882,6 +896,8 @@ internal sealed partial class SimulatedCombatState
+         simulator.StateStore.RemapModel(power, mutable);
+     }
+ 
++    internal ImpaledPower MutableImpaledPower(ImpaledPower power) => (ImpaledPower)GetMutablePowerInstance(power);
++
+     private PowerModel GetMutablePowerInstance(PowerModel power)
+     {
+         if (_addedPowerInstances?.Contains(power) == true)
+@@ -1259,6 +1275,7 @@ internal sealed partial class SimulatedCombatState
+     public void BeginSideTurn(Creature owner)
+     {
+         ResetCardLifecycleTurn(owner);
++        if (owner.Player is { } player) _melodies?.Remove(player);
+         ResetTurnCounter(ref _attacksPlayedThisTurn, owner);
+         ResetTurnCounter(ref _shivsPlayedThisTurn, owner);
+         ResetTurnCounter(ref _blockCardsPlayedThisTurn, owner);
+@@ -2063,6 +2080,9 @@ internal sealed partial class SimulatedCombatState
+         {
+             PowerModel mutable = GetMutablePowerInstance(power);
+             PowerPredictionStateSupport.CaptureRootState(simulator, mutable, power);
++            if (power is ShowOffPower { ShowOffInstance: { } source } && mutable is ShowOffPower showOff
++                && simulator.State.GetPlayerCombatState(source.Owner).FindCard(source) is { } preview)
++                (_showOffSources ??= [])[showOff] = preview;
+             if (power is NightmarePower nightmare)
+                 CaptureNightmareRootState((NightmarePower)mutable, nightmare);
+             if (power is OrbitPower orbit)
+@@ -2269,6 +2289,16 @@ internal sealed partial class SimulatedCombatState
+             fingerprint.Add("onplay_configuration");
+             fingerprint.Add(adaptedOnPlay.Stamp);
+         }
++        foreach (var player in Players)
++        {
++            if (_melodies?.ContainsKey(player) == true) AddMelodyFingerprint(ref fingerprint, player);
++            var arrows = simulator.State.GetPlayerCombatState(player).Arrows;
++            if (arrows.Count == 0) continue;
++            fingerprint.Add("arrow-quiver");
++            fingerprint.Add(player.NetId);
++            fingerprint.Add(arrows.Count);
++            foreach (var arrow in arrows) fingerprint.Add((int)arrow.Status);
++        }
+         fingerprint.Add('P');
+         int powerCount = 0;
+         IReadOnlyList<PowerModel> effectivePowers = EffectivePowers();
+@@ -2364,6 +2394,15 @@ internal sealed partial class SimulatedCombatState
+             item.Add(ritual._wasJustAppliedByEnemy);
+         if (power is SurroundedPower surrounded)
+             item.Add((int)PowerPredictionStateSupport.SurroundedFacing(simulator, surrounded));
++        if (power is VigorPower vigor) item.Add(VigorPowerMirrors.Describe(vigor, simulator));
++        if (power is AimPower aim)
++            item.Add(AimPowerMirrors.Describe(aim, simulator));
++        if (power is ImpaledPower impaled)
++        {
++            var slots = simulator.ImpaledSlots(impaled);
++            item.Add(slots.Count);
++            foreach (int slot in slots) item.Add(slot);
++        }
+         ulong dynamicFirst = 0;
+         ulong dynamicSecond = 0;
+         int dynamicCount = 0;
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/BespokeCardMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/BespokeCardMirrors.cs
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/BespokeCardMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/BespokeCardMirrors.cs
+@@ -208,7 +208,7 @@
+     {
+         bool allEnemies = GetPowerAmount<SeekingEdgePower>(context, card.Owner.Creature) > 0;
+         var attack = DamageCmd.Attack(card.DynamicVars.Damage.BaseValue)
+-            .WithHitCount(card.DynamicVars.Repeat.IntValue)
++            .WithHitCount(card.DynamicVars.HitCount.IntValue)
+             .FromCard(card, context.CardPlay);
+         if (allEnemies)
+             attack.TargetingAllOpponents(context.CombatState);
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/RandomTargetAttackCardMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/RandomTargetAttackCardMirrors.cs
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/RandomTargetAttackCardMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/RandomTargetAttackCardMirrors.cs
+@@ -27,12 +27,12 @@
+ 
+     public static void RicochetOnPlay(Ricochet card, CardOnPlayMirrorContext context)
+     {
+-        context.AttackRandomOpponents(card.DynamicVars.Repeat.IntValue);
++        context.AttackRandomOpponents(card.DynamicVars.HitCount.IntValue);
+     }
+ 
+     public static void RipAndTearOnPlay(RipAndTear card, CardOnPlayMirrorContext context)
+     {
+-        context.AttackRandomOpponents(hitCount: 2);
++        context.AttackRandomOpponents(card.DynamicVars.HitCount.IntValue);
+     }
+ 
+     public static void StardustOnPlay(Stardust card, CardOnPlayMirrorContext context)
+@@ -53,7 +53,7 @@
+ 
+     public static void SwordBoomerangOnPlay(SwordBoomerang card, CardOnPlayMirrorContext context)
+     {
+-        context.AttackRandomOpponents(card.DynamicVars.Repeat.IntValue);
++        context.AttackRandomOpponents(card.DynamicVars.HitCount.IntValue);
+     }
+ 
+     public static void VolleyOnPlay(Volley card, CardOnPlayMirrorContext context)
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/BespokeCardMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/BespokeCardMirrors.cs
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/BespokeCardMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/BespokeCardMirrors.cs
+@@ -12,11 +12,34 @@
+ 
+ internal static class BespokeCardMirrors
+ {
+-    public static void AstralPulseOnPlay(AstralPulse _, CardOnPlayMirrorContext context)
+-        => context.AttackAllOpponents(hitCount: 2);
+-
+-    public static void DaggerSprayOnPlay(DaggerSpray _, CardOnPlayMirrorContext context)
+-        => context.AttackAllOpponents(hitCount: 2);
++    public static void AstralPulseOnPlay(AstralPulse card, CardOnPlayMirrorContext context)
++        => context.AttackAllOpponents(card.DynamicVars.HitCount.IntValue);
++
++    public static void DaggerSprayOnPlay(DaggerSpray card, CardOnPlayMirrorContext context)
++        => context.AttackAllOpponents(card.DynamicVars.HitCount.IntValue);
++
++    public static void ExpectAFightOnPlay(ExpectAFight card, CardOnPlayMirrorContext context)
++    {
++        context.GainBlock(card.Owner.Creature);
++        if (context.Simulator.HasPendingChoice)
++            return;
++        foreach (PredictedCard candidate in context.OwnerState.Hand)
++        {
++            if (candidate.Preview.Type == CardType.Attack && !candidate.Preview.EnergyCost.CostsX)
++                candidate.MutablePreview.EnergyCost.AddUntilPlayed(-card.DynamicVars.Energy.IntValue);
++        }
++    }
++
++    public static void MementoMoriOnPlay(MementoMori card, CardOnPlayMirrorContext context)
++    {
++        Creature? target = context.CombatState.HittableEnemies
++            .MinBy(enemy => context.State.GetCreature(enemy).CurrentHp);
++        if (target != null)
++            DamageCmd.Attack(card.DynamicVars.Damage.BaseValue)
++                .FromCard(card, context.CardPlay)
++                .Targeting(target)
++                .Simulate(context.Simulator);
++    }
+ 
+     // Vanilla wraps the whole body in Osty.CheckMissingWithAnim, so the attack and the block are both
+     // skipped once the Osty is gone. The sacrifice stays in CardEffectSpecRegistry, which runs after
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/CardOnPlayMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/CardOnPlayMirrors.cs
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/CardOnPlayMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/CardOnPlayMirrors.cs
+@@ -97,6 +97,8 @@
+         registry.Register<AstralPulse>(BespokeCardMirrors.AstralPulseOnPlay);
+         registry.Register<BoneShards>(BespokeCardMirrors.BoneShardsOnPlay);
+         registry.Register<DaggerSpray>(BespokeCardMirrors.DaggerSprayOnPlay);
++        registry.Register<ExpectAFight>(BespokeCardMirrors.ExpectAFightOnPlay);
++        registry.Register<MementoMori>(BespokeCardMirrors.MementoMoriOnPlay);
+         registry.Register<PactsEnd>(BespokeCardMirrors.PactsEndOnPlay);
+         registry.Register<TwinStrike>(BespokeCardMirrors.TwinStrikeOnPlay);
+         registry.Register<HeavenlyDrill>(BespokeCardMirrors.HeavenlyDrillOnPlay);
+diff --git a/src/CoopBots.Kernel/Vendor/Prediction/CalculatedVarSpecRegistry.cs b/src/CoopBots.Kernel/Vendor/Prediction/CalculatedVarSpecRegistry.cs
+--- a/src/CoopBots.Kernel/Vendor/Prediction/CalculatedVarSpecRegistry.cs
++++ b/src/CoopBots.Kernel/Vendor/Prediction/CalculatedVarSpecRegistry.cs
+@@ -24,8 +24,8 @@
+     [
+         typeof(PreciseCut), typeof(Stack), typeof(Squeeze), typeof(Mirage), typeof(Rattle), typeof(MindBlast),
+         typeof(GangUp), typeof(Mimic), typeof(KnifeTrap), typeof(Unleash), typeof(Radiate), typeof(PerfectedStrike),
+-        typeof(SovereignBlade), typeof(Supermassive), typeof(Sacrifice), typeof(TimesUp), typeof(MementoMori),
+-        typeof(SoulStorm), typeof(Voltaic), typeof(TearAsunder), typeof(ExpectAFight), typeof(HelixDrill),
++        typeof(SovereignBlade), typeof(Supermassive), typeof(Sacrifice), typeof(TimesUp),
++        typeof(SoulStorm), typeof(Voltaic), typeof(TearAsunder), typeof(HelixDrill),
+         typeof(PullFromBelow), typeof(Normality), typeof(Synchronize), typeof(Protector), typeof(NoEscape),
+         typeof(Flechettes), typeof(Rend), typeof(GoldAxe), typeof(FlakCannon), typeof(LunarBlast), typeof(Murder),
+         typeof(CompileDriver), typeof(Finisher), typeof(Bully), typeof(BeatIntoShape), typeof(DeathMarch),
+@@ -107,11 +107,9 @@
+                 ? combat.GetOstyMaxHp(simulator, model.Owner) * 3
+                 : 0,
+             TimesUp => target == null ? 0 : combat.GetAmount<DoomPower>(target),
+-            MementoMori => combat.GetCardsDiscardedThisTurn(owner),
+             SoulStorm => playerState.ExhaustPile.Cards.Count(candidate => candidate.Preview is Soul),
+             Voltaic => CountLightningChannels(simulator, model.Owner),
+             TearAsunder => 1 + CountUnblockedDamageEvents(simulator, owner),
+-            ExpectAFight => Math.Max(0, combat.GetAmount<StrengthPower>(owner)),
+             HelixDrill => Math.Max(0, combat.GetEnergySpentThisTurn(model.Owner)
+                 - card.GetEnergyCostWithModifiers(simulator, playerState)),
+             PullFromBelow => CountEtherealPlays(simulator, model.Owner),
+@@ -149,8 +147,8 @@
+         };
+         return model is PreciseCut or Stack or Squeeze or Mirage or Rattle or MindBlast or GangUp
+             or Mimic or KnifeTrap or Unleash or Radiate or PerfectedStrike or SovereignBlade
+-            or Supermassive or Sacrifice or TimesUp or MementoMori or SoulStorm or Voltaic
+-            or TearAsunder or ExpectAFight or HelixDrill or PullFromBelow or Normality
++            or Supermassive or Sacrifice or TimesUp or SoulStorm or Voltaic
++            or TearAsunder or HelixDrill or PullFromBelow or Normality
+             or Synchronize or Protector or NoEscape or Flechettes or Rend or GoldAxe or FlakCannon
+             or LunarBlast or Murder or CompileDriver or Finisher or Bully or BeatIntoShape
+             or DeathMarch or DemonicShield or Barrage or CrescentSpear or BodySlam or AshenStrike;
+diff --git a/src/CoopBots.Kernel/Vendor/Prediction/CardOnPlaySupport.Batch043.cs b/src/CoopBots.Kernel/Vendor/Prediction/CardOnPlaySupport.Batch043.cs
+--- a/src/CoopBots.Kernel/Vendor/Prediction/CardOnPlaySupport.Batch043.cs
++++ b/src/CoopBots.Kernel/Vendor/Prediction/CardOnPlaySupport.Batch043.cs
+@@ -63,13 +63,13 @@
+                 break;
+             }
+             case VoidForm:
++                combat.Apply<VoidFormPower>(
++                    card.Owner.Creature,
++                    card.DynamicVars["VoidFormPower"].IntValue,
++                    card.Owner.Creature);
+                 TurnStartPowerSupport.PrepareVoidFormApplication(
+                     simulator,
+                     combat,
+-                    card.Owner.Creature);
+-                combat.Apply<VoidFormPower>(
+-                    card.Owner.Creature,
+-                    card.DynamicVars["VoidFormPower"].IntValue,
+                     card.Owner.Creature);
+                 combat.RequestPlayerTurnEnd();
+                 break;
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/GeneralCardMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/GeneralCardMirrors.cs
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/GeneralCardMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/GeneralCardMirrors.cs
+@@ -74,7 +74,7 @@
+             command.FromCard(card, context.CardPlay);
+         }
+ 
+-        if (TryGetDynamicVar(card, ["CalculatedHits", "Repeat"], out var repeat))
++        if (TryGetDynamicVar(card, ["CalculatedHits", "HitCount", "Repeat"], out var repeat))
+         {
+             command.WithHitCount((int)context.Calculate(repeat));
+         }
+diff --git a/src/CoopBots.Kernel/Vendor/Strategy/CardMechanismFacts.cs b/src/CoopBots.Kernel/Vendor/Strategy/CardMechanismFacts.cs
+--- a/src/CoopBots.Kernel/Vendor/Strategy/CardMechanismFacts.cs
++++ b/src/CoopBots.Kernel/Vendor/Strategy/CardMechanismFacts.cs
+@@ -1,3 +1,5 @@
++using MegaCrit.Sts2.Core.Models;
++
+ namespace CoopBots.Kernel.Vendor;
+ 
+ // Reviewed value-only facts shared by run advice and branch-local combat evaluation.
+@@ -11,12 +13,18 @@
+         return ordinary + (drawsAtTurnEnd ? etherealInHand : 0);
+     }
+ 
+-    internal static int AttackHits(string id, int repeat) => id switch
++    internal static int AttackHits(CardModel card)
+     {
+-        "TWIN_STRIKE" or "RIP_AND_TEAR" => 2,
+-        "SWORD_BOOMERANG" or "SOVEREIGN_BLADE" => Math.Max(0, repeat),
+-        _ => 1,
+-    };
++        if (card.DynamicVars.TryGetValue("HitCount", out var hits))
++            return Math.Max(0, hits.IntValue);
++        return card.Id.Entry switch
++        {
++            "TWIN_STRIKE" or "RIP_AND_TEAR" => 2,
++            "SWORD_BOOMERANG" or "SOVEREIGN_BLADE"
++                when card.DynamicVars.TryGetValue("Repeat", out var repeat) => Math.Max(0, repeat.IntValue),
++            _ => 1,
++        };
++    }
+ 
+     internal static int ImmediateShivSupply(string id, int cards, int shivs) => id switch
+     {
+diff --git a/src/CoopBots.Kernel/Vendor/Search/CombatBeamSolver.StateEvaluation.cs b/src/CoopBots.Kernel/Vendor/Search/CombatBeamSolver.StateEvaluation.cs
+--- a/src/CoopBots.Kernel/Vendor/Search/CombatBeamSolver.StateEvaluation.cs
++++ b/src/CoopBots.Kernel/Vendor/Search/CombatBeamSolver.StateEvaluation.cs
+@@ -1133,8 +1133,7 @@
+                 || card.GetEnergyCostWithModifiers(simulator, playerState) > energy)
+                 continue;
+             int hits = card.Preview is Eradicate ? Math.Max(0, energy)
+-                : CardMechanismFacts.AttackHits(card.Preview.Id.Entry,
+-                    card.Preview.DynamicVars.TryGetValue("Repeat", out var repeat) ? repeat.IntValue : 0);
++                : CardMechanismFacts.AttackHits(card.Preview);
+             int damage = (int)Math.Floor(CardChoiceSupport.DynamicVarBaseValue(card.Preview.DynamicVars, "Damage"));
+             best = Math.Max(best, damage * hits);
+         }
+diff --git a/src/CoopBots.Kernel/Vendor/Search/StrategicEffectModel.cs b/src/CoopBots.Kernel/Vendor/Search/StrategicEffectModel.cs
+--- a/src/CoopBots.Kernel/Vendor/Search/StrategicEffectModel.cs
++++ b/src/CoopBots.Kernel/Vendor/Search/StrategicEffectModel.cs
+@@ -253,8 +253,7 @@
+                     if (requirements.HasFlag(StrategicEffectRequirements.AttackHits)
+                         && !card.Tags.Contains(CardTag.OstyAttack) && !card.Tags.Contains(CardTag.Shiv))
+                         attackHitCount += card.GetType().Assembly == typeof(CardModel).Assembly
+-                            ? CardMechanismFacts.AttackHits(card.Id.Entry,
+-                                card.DynamicVars.TryGetValue("Repeat", out var repeatVar) ? repeatVar.IntValue : 0)
++                            ? CardMechanismFacts.AttackHits(card)
+                             : 1;
+                     break;
+                 case CardType.Skill:
+diff --git a/src/CoopBots.Kernel/Vendor/Search/PowerCardValuation/Projection/PowerCardProjectionSupport.cs b/src/CoopBots.Kernel/Vendor/Search/PowerCardValuation/Projection/PowerCardProjectionSupport.cs
+--- a/src/CoopBots.Kernel/Vendor/Search/PowerCardValuation/Projection/PowerCardProjectionSupport.cs
++++ b/src/CoopBots.Kernel/Vendor/Search/PowerCardValuation/Projection/PowerCardProjectionSupport.cs
+@@ -248,11 +248,7 @@
+                     projectedHandCount);
+                 int attackHits = baseDamage == 0
+                     ? 0
+-                    : CardMechanismFacts.AttackHits(
+-                        card.Preview.Id.Entry,
+-                        card.Preview.DynamicVars.TryGetValue("Repeat", out var repeatVar)
+-                            ? repeatVar.IntValue
+-                            : 0);
++                    : CardMechanismFacts.AttackHits(card.Preview);
+                 int unblockedAttackHits = baseDamage == 0
+                     || (long)baseDamage * attackHits <= minimumEnemyBlock
+                         ? 0
+diff --git a/src/CoopBots.Kernel/Vendor/Prediction/MonsterMoveEffects.StaticValues.cs b/src/CoopBots.Kernel/Vendor/Prediction/MonsterMoveEffects.StaticValues.cs
+--- a/src/CoopBots.Kernel/Vendor/Prediction/MonsterMoveEffects.StaticValues.cs
++++ b/src/CoopBots.Kernel/Vendor/Prediction/MonsterMoveEffects.StaticValues.cs
+@@ -11,7 +11,7 @@
+             ["ToughEgg"] = ["HatchlingMinHp", "HatchlingMaxHp"],
+             ["TestSubject"] = ["BurningGrowlBurnCount", "BurningGrowlStrengthGain"],
+             ["BowlbugEgg"] = ["ProtectBlock"],
+-            ["InfestedPrism"] = ["RadiateBlock", "PulsateBlock", "VitalSparkAmount"],
++            ["InfestedPrism"] = ["VitalSparkAmount"],
+             ["KinFollower"] = ["DanceStrength"],
+             ["KinPriest"] = ["RitualStrength"],
+             ["KnowledgeDemon"] = ["PonderStrength"],
+diff --git a/src/CoopBots.Kernel/Vendor/Prediction/MonsterMoveEffects.cs b/src/CoopBots.Kernel/Vendor/Prediction/MonsterMoveEffects.cs
+--- a/src/CoopBots.Kernel/Vendor/Prediction/MonsterMoveEffects.cs
++++ b/src/CoopBots.Kernel/Vendor/Prediction/MonsterMoveEffects.cs
+@@ -37,7 +37,6 @@
+             ("HauntedShip", "HAUNT_MOVE") or
+             ("HunterKiller", "TENDERIZING_GOOP_MOVE") or
+             ("Guardbot", "GUARD_MOVE") or
+-            ("InfestedPrism", "RADIATE_MOVE") or
+             ("InfestedPrism", "PULSATE_MOVE") or
+             ("KinFollower", "POWER_DANCE_MOVE") or
+             ("KinPriest", "ORB_OF_FRAILTY_MOVE") or
+@@ -454,11 +453,9 @@
+                         simulator.GainBlock(enemy, 15, ValueProp.Unpowered);
+                 }
+                 return true;
+-            case ("InfestedPrism", "RADIATE_MOVE"):
+-                GainBlock(simulator, move.Owner, combat.GetMonsterStaticInt(move.Owner, "RadiateBlock"));
+-                return true;
+             case ("InfestedPrism", "PULSATE_MOVE"):
+-                GainBlock(simulator, move.Owner, combat.GetMonsterStaticInt(move.Owner, "PulsateBlock"));
++                foreach (var target in targets)
++                    Debuff<VulnerablePower>(combat, target, 1, move.Owner);
+                 combat.Apply<VitalSparkPower>(
+                     move.Owner,
+                     combat.GetMonsterStaticInt(move.Owner, "VitalSparkAmount"),
+diff --git a/src/CoopBots.Kernel/Vendor/Prediction/IntentForecaster.cs b/src/CoopBots.Kernel/Vendor/Prediction/IntentForecaster.cs
+--- a/src/CoopBots.Kernel/Vendor/Prediction/IntentForecaster.cs
++++ b/src/CoopBots.Kernel/Vendor/Prediction/IntentForecaster.cs
+@@ -170,7 +170,7 @@
+             ("GlobeHead", "THUNDER_STRIKE" or "SHOCKING_SLAP" or "GALVANIC_BURST") or
+             ("HauntedShip", "SWIPE_MOVE" or "STOMP_MOVE") or
+             ("HunterKiller", "BITE_MOVE" or "PUNCTURE_MOVE") or
+-            ("InfestedPrism", "JAB_MOVE" or "RADIATE_MOVE" or "WHIRLWIND_MOVE" or "PULSATE_MOVE") or
++            ("InfestedPrism", "JAB_MOVE" or "JAB_MOVE_2" or "WHIRLWIND_MOVE" or "PULSATE_MOVE") or
+             ("Inklet", "JAB_MOVE" or "WHIRLWIND_MOVE" or "PIERCING_GAZE_MOVE") or
+             ("KinFollower", "QUICK_SLASH_MOVE" or "BOOMERANG_MOVE") or
+             ("KinPriest", "ORB_OF_FRAILTY_MOVE" or "ORB_OF_WEAKNESS_MOVE" or "BEAM_MOVE") or

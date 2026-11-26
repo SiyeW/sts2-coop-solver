@@ -11,15 +11,16 @@ internal sealed partial class AnytimeSearch
     internal int ReusedNodes {get;private set;}
     internal int ReusedRoundRows {get;private set;}
     internal bool ReusedSuffix {get;private set;}
-    internal bool Recovering=>recovery!=null;
+    internal bool Recovering=>System.Threading.Volatile.Read(ref recovery)!=null;
     private IEnumerator<bool>? recovery;
     private AnytimeSearch? transferSource;
     private readonly Dictionary<ulong,List<Node>> boards=new();
     private readonly Dictionary<ulong,List<long>> roundBoards=new();
     private readonly Dictionary<long,ulong> roundShapes=new();
+    private long boardSlots,roundBoardSlots;
     private readonly List<ulong> replayedShapes=new();
     private readonly List<Node> bestPathNodes=new();
-    private readonly long?[] activeRoundIds=new long?[3];
+    private readonly long?[] activeRoundIds=new long?[PrefixLane+1];
 
     // Fast prefilter only. Exact kernel evidence includes physical cards, RNG,
     // turn history, piles, powers, intents, potions and seat readiness.
@@ -30,7 +31,7 @@ internal sealed partial class AnytimeSearch
         Add(s.TurnNumber);
         foreach(var p in s.Party)
         {
-            Add(s.Hp(p.Creature));Add(s.Block(p.Creature));Add(s.Energy(p));Add(s.Hand(p).Count);
+            Add(s.Hp(p.Creature));Add(s.Block(p.Creature));Add(s.Energy(p));Add(s.Simulator.State.GetPlayerCombatState(p).Hand.Cards.Count);
             Add(s.IsReady(p)?1:0);Add(s.HeldPotionCount(p));
         }
         foreach(var e in s.Enemies){Add((int)(e.CombatId??0));Add(s.Hp(e));Add(s.Block(e));}
@@ -41,20 +42,29 @@ internal sealed partial class AnytimeSearch
         if(n.Shape==hash && hash!=0)return;
         n.Shape=hash;
         if(!boards.TryGetValue(hash,out var group))boards.Add(hash,group=new());
-        group.Add(n);
+        int capacity=group.Capacity;group.Add(n);boardSlots+=group.Capacity-capacity;
     }
     private void IndexRound(long id,KernelSession s)=>IndexRound(id,ShapeOf(s));
     private void IndexRound(long id,ulong hash)
     {
         roundShapes[id]=hash;
         if(!roundBoards.TryGetValue(hash,out var group))roundBoards.Add(hash,group=new());
-        group.Add(id);
+        int capacity=group.Capacity;group.Add(id);roundBoardSlots+=group.Capacity-capacity;
     }
 
     internal void InheritCompatibleWork(AnytimeSearch previous)
     {
         transferSource=previous;
         recovery=Recover(previous).GetEnumerator();
+    }
+    internal bool ResumeRecovery(System.Diagnostics.Stopwatch watch,TimeSpan slice)
+    {
+        while(recovery!=null)
+        {
+            if(!recovery.MoveNext()){recovery.Dispose();recovery=null;break;}
+            if(watch.Elapsed>=slice)return false;
+        }
+        return true;
     }
     private Edge[] DiskPath(long id)
     {
@@ -83,7 +93,7 @@ internal sealed partial class AnytimeSearch
             {
                 var predicted=old.root.ForkForReplay();
                 bool legal=true;
-                foreach(var edge in Path(n))
+                foreach(var edge in old.Path(n))
                 {
                     legal=edge.Replay(predicted,out _,out _);
                     yield return false;
@@ -150,7 +160,7 @@ internal sealed partial class AnytimeSearch
                 while(todo.TryPop(out var n))
                 {
                     kept.Add(n);Nodes++;ReusedNodes++;
-                    if(!recipesOnly)HelperMeter?.Retain(n.DirectWork);else n.DirectWork=0;
+                    if(!recipesOnly)HelperMeter?.Retain(n.DirectWork);else n.DirectWork=n.SubtreeWork=0;
                     // Keep exact continuations and menu cursors. Old return
                     // averages included the old root's health/bottle baselines.
                     n.Visits=1;n.Sum=neutral;
@@ -158,10 +168,10 @@ internal sealed partial class AnytimeSearch
                     {
                         // Value-only paths are hints. A generated card such as Dazed
                         // can be a new native object even with identical pile/RNG state.
-                        n.Closed=false;n.Frontier=null;
+                        n.Closed=false;n.BestTerminal=null;n.ReachedEnd=null;n.ResetMenu();
                         n.Children.RemoveAll(c=>c.Step?.Exact==null);
                     }
-                    else if(n.Closed){n.Closed=false;n.Frontier=null;}
+                    else if(n.Closed){n.Closed=false;if(n.Legal==null)n.ResetMenu();}
                     foreach(var child in n.Children)
                     {
                         child.Depth=n.Depth+1;MaxDepth=Math.Max(MaxDepth,child.Depth);
