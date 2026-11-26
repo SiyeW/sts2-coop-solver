@@ -2,6 +2,8 @@
 
 [中文](#中文) | [English](#english)
 
+<div lang="zh-CN">
+
 ## 中文
 
 **《杀戮尖塔 2》多人战斗求解器，支持单人模式。**
@@ -98,7 +100,11 @@
 
 本项目原创代码采用 [Apache License 2.0](LICENSE) 开源，第三方组件遵循各自的开源许可，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
+</div>
+
 ---
+
+<div lang="en">
 
 ## English
 
@@ -195,3 +201,5 @@ Thanks to the developers of CombatSolver, Co-op Bots, Random Foreseer, [RitsuLib
 ### License
 
 Original code in this project is licensed under the [Apache License 2.0](LICENSE). Third-party components are subject to their respective licenses. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for details.
+
+</div>
