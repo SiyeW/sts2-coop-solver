@@ -8,7 +8,7 @@
 
 通过后台模拟战斗、搜索路线，实时展示当前找到的最优战斗路线，包含出牌顺序、攻击目标、选牌操作、药水方案及预计战损。多人联机时，房主可将路线同步给队友。
 
-<p align="center"><img src="docs/images/coopsolver-logo-zh.jpg" alt="CoopSolver 中文图标" width="168" height="168"></p>
+<p align="center"><img src="docs/images/coopsolver-logo-zh.jpg" alt="CoopSolver 中文图标"></p>
 
 ### 功能特性
 
@@ -106,7 +106,7 @@
 
 CoopSolver runs combat simulations and searches in the background, displaying the best combat plan found so far in real time, including card play order, targets, card selections, potion usage, and predicted HP loss. In multiplayer, the host can synchronize combat plans with teammates.
 
-<p align="center"><img src="docs/images/coopsolver-logo-en.jpg" alt="CoopSolver logo" width="168" height="168"></p>
+<p align="center"><img src="docs/images/coopsolver-logo-en.jpg" alt="CoopSolver logo"></p>
 
 ### Features
 
