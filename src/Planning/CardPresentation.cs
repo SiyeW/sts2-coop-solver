@@ -57,38 +57,33 @@ internal static class CardPresentation
     }
     // Read the display fields from the identity captured immediately before the play.
     // Matching always uses the entire unchanged key, including fields with no UI label.
-    internal static string Describe(string key,CardModel card,string fee="")
+    internal static HudCardLabel Capture(CardModel card,string key,string fee="",int? upgrade=null)
     {
-        if(string.IsNullOrEmpty(key))return "";
+        int level=upgrade??RecordedUpgrade(key,card);
+        if(string.IsNullOrEmpty(key))return new(card.Id.Entry,level);
         var fields=key.Split('|');
-        var parts=new List<string>();
+        var modifiers=new List<HudCardModifier>();
         int vars=Array.FindIndex(fields,f=>f.StartsWith("vars=",StringComparison.Ordinal));
         if(vars>=0 && vars+2<fields.Length)
         {
             AddModifier(fields[vars+1],true);
             AddModifier(fields[vars+2],false);
         }
-        foreach(string field in fields)
-        {
-            if(field.StartsWith("replay=",StringComparison.Ordinal) &&
-                int.TryParse(field.AsSpan(7),out int replay) && replay>0)
-                parts.Add(replay==1?"重放":$"重放 {replay}");
-        }
-        if(fee.Length!=0)parts.Add(fee+"费");
-        return parts.Count==0?"":"（"+string.Join("、",parts)+"）";
+        string? replayField=fields.FirstOrDefault(field=>field.StartsWith("replay=",StringComparison.Ordinal));
+        int replay=replayField!=null && int.TryParse(replayField.AsSpan(7),out int count)?Math.Max(0,count):0;
+        return new(card.Id.Entry,level,modifiers.Count==0?null:modifiers.ToArray(),replay,fee);
 
         void AddModifier(string field,bool enchantment)
         {
             var tokens=field.Split(':');
             string id=tokens[0];
             if(id.Length==0 || id=="-")return;
-            string? name=enchantment
-                ? ModelDb.GetByIdOrNull<EnchantmentModel>(new ModelId("ENCHANTMENT",id))?.Title.GetFormattedText()
-                : ModelDb.GetByIdOrNull<AfflictionModel>(new ModelId("AFFLICTION",id))?.Title.GetFormattedText();
-            string amount=(enchantment || id!="BOUND") && tokens.Length>1 && int.TryParse(tokens[1],out int n) && n>1?" "+n:"";
-            parts.Add((name??id)+amount);
+            int? amount=(enchantment || id!="BOUND") && tokens.Length>1 && int.TryParse(tokens[1],out int n) && n>1?n:null;
+            modifiers.Add(new(enchantment,id,amount));
         }
     }
+
+    internal static string Describe(string key,CardModel card,string fee="")=>Capture(card,key,fee).Suffix(legacy:true);
 
     // Bound.Amount is copied from the applying power. The card rule is the same at every amount.
     internal static bool SameDisplayedVariant(string a,string b)=>

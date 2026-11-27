@@ -15,10 +15,10 @@ internal sealed record GoalResult(CombatGoal Kind,int Lost,bool Escaped=false)
 {
     internal string Label()=>Kind switch
     {
-        CombatGoal.Card=>Lost>0?Ui.T($"丢{Lost}张牌",$"Lost {Lost} card(s)"):Escaped?Ui.T("保住卡牌 · 逃走","Card safe · escaped"):Ui.T("保住卡牌","Card safe"),
-        CombatGoal.Gold=>Lost>0?Ui.T($"丢{Lost}金",$"Lost {Lost} gold"):Escaped?Ui.T("保住金币 · 逃走","Gold safe · escaped"):Ui.T("保住金币","Gold safe"),
-        CombatGoal.Training=>Escaped?Ui.T("超时 · 无奖励","Timed out · no prize"):Ui.T("限时击破 · 有奖励","Beat timer · prize"),
-        CombatGoal.MaxHp=>Lost>0?Ui.T($"上限−{Lost}",$"Max HP −{Lost}"):Ui.T("保住血量上限","Max HP intact"),
+        CombatGoal.Card=>Lost>0?Ui.Text("ui.002",Lost):Escaped?Ui.Text("ui.003"):Ui.Text("ui.004"),
+        CombatGoal.Gold=>Lost>0?Ui.Text("ui.005",Lost):Escaped?Ui.Text("ui.006"):Ui.Text("ui.007"),
+        CombatGoal.Training=>Escaped?Ui.Text("ui.008"):Ui.Text("ui.009"),
+        CombatGoal.MaxHp=>Lost>0?Ui.Text("ui.010",Lost):Ui.Text("ui.011"),
         _=>""
     };
     internal int CompareLoss(GoalResult other)=>Lost!=other.Lost?Lost.CompareTo(other.Lost):Escaped.CompareTo(other.Escaped);

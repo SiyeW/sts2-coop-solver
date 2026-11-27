@@ -36,6 +36,11 @@ internal sealed class SearchProgressView
         return new(step*count,step,count);
     }
 
+    internal static IEnumerable<double> InteriorTicks(double end,double step)
+    {
+        for(int index=1;index*step<end;index++)yield return index*step;
+    }
+
     internal SearchProgressView(Control overlay,Func<Color> backdrop)
     {
         this.backdrop=backdrop;
@@ -57,8 +62,8 @@ internal sealed class SearchProgressView
     }
 
     private static string Number(double n)=>n.ToString("0",CultureInfo.InvariantCulture);
-    private static string Remaining(double n)=>Ui.T($"剩{Number(n)}",$"{Number(n)} left");
-    private static string Loss(double n)=>Ui.T($"扣{Number(n)}",$"Loss {Number(n)}");
+    private static string Remaining(double n)=>Ui.Text("ui.108",Number(n));
+    private static string Loss(double n)=>Ui.Text("ui.109",Number(n));
     private static float TextWidth(Font font,string text)=>font.GetStringSize(text,fontSize:FontSize).X;
 
     private void Draw()
@@ -93,8 +98,8 @@ internal sealed class SearchProgressView
         float memoryLabels=TextWidth(font,Number(treeTop));
         float resultLabels=Math.Max(hasEnemy?TextWidth(font,Remaining(enemy.Top)):0,hasLoss?TextWidth(font,Loss(loss.Top)):0);
         float labels=Math.Max(memoryLabels,resultLabels);
-        string resultTitle=Ui.T("扣血/敌人剩血","HP loss / Enemy HP");
-        string memoryTitle=Ui.T("搜索树内存(MB)","Search tree memory (MB)");
+        string resultTitle=Ui.Text("ui.110");
+        string memoryTitle=Ui.Text("ui.111");
         float resultTitleWidth=TextWidth(font,resultTitle),memoryTitleWidth=TextWidth(font,memoryTitle);
         float titleGap=line*.72f;
         bool separateTitles=resultTitleWidth+memoryTitleWidth+titleGap+4>size.Y;
@@ -130,13 +135,12 @@ internal sealed class SearchProgressView
             Tick(font,resultPlot,LossY(value),Loss(value),boundary:value==0);
         }
         Tick(font,memoryPlot,MemoryY(treeTop),Number(treeTop),boundary:cap>0);
-        for(int i=0;i<tree.Count;i++)
+        Tick(font,memoryPlot,MemoryY(0),Number(0),boundary:true);
+        foreach(double value in InteriorTicks(treeTop,tree.Step))
         {
-            double value=i*tree.Step;
-            if(value>=treeTop)break;
             float y=MemoryY(value);
-            string? label=i==0 || y-memoryPlot.Position.Y>line*.9f?Number(value):null;
-            Tick(font,memoryPlot,y,label,boundary:i==0);
+            string? label=y-memoryPlot.Position.Y>line*.9f?Number(value):null;
+            Tick(font,memoryPlot,y,label);
         }
         if(hasEnemy && hasLoss)Horizontal(resultPlot,separator,Boundary);
 
@@ -158,7 +162,7 @@ internal sealed class SearchProgressView
         VerticalTitle(font,resultTitle,titleX,resultEnd);
         VerticalTitle(font,memoryTitle,titleX+(separateTitles?line:0),memoryEnd);
 
-        string xTitle=Ui.T("搜索量","Search work");
+        string xTitle=Ui.Text("ui.112");
         float xLabelY=memoryPlot.End.Y+font.GetAscent(FontSize)+4;
         float titleY=xLabelY+FontSize+5;
         Panel.DrawString(font,new((left+right-TextWidth(font,xTitle))/2,titleY),xTitle,fontSize:FontSize,modulate:AxisInk);
@@ -171,16 +175,14 @@ internal sealed class SearchProgressView
             float endWidth=TextWidth(font,end);
             Panel.DrawString(font,new(right-endWidth,xLabelY),end,fontSize:FontSize,modulate:AxisInk);
             var ticks=Marks(max,Math.Clamp((int)((right-left)/105),1,8));
-            for(int i=1;i<ticks.Count;i++)
+            foreach(double at in InteriorTicks(max,ticks.Step))
             {
-                double at=ticks.Step*i;
-                if(at>=max)break;
                 float x=X(at);
+                Panel.DrawLine(new(x,resultPlot.Position.Y),new(x,resultPlot.End.Y),Grid,1,true);
+                Panel.DrawLine(new(x,memoryPlot.Position.Y),new(x,memoryPlot.End.Y),Grid,1,true);
                 string label=Work((long)at);
                 float width=TextWidth(font,label);
                 if(x-width/2<left+TextWidth(font,"0")+8 || x+width/2>right-endWidth-8)continue;
-                Panel.DrawLine(new(x,resultPlot.Position.Y),new(x,resultPlot.End.Y),Grid,1,true);
-                Panel.DrawLine(new(x,memoryPlot.Position.Y),new(x,memoryPlot.End.Y),Grid,1,true);
                 Panel.DrawString(font,new(x-width/2,xLabelY),label,fontSize:FontSize,modulate:AxisInk);
             }
         }
@@ -317,11 +319,11 @@ internal sealed class SearchProgressView
 
     private static List<string[]> TooltipRows(HudSearchHistory trace,long work,bool onResult)
     {
-        var rows=new List<string[]>{new[]{Ui.T($"搜索量{work:N0}",$"{work:N0} searches")}};
+        var rows=new List<string[]>{new[]{Ui.Text("ui.113",work)}};
         if(onResult && At(trace.Results,p=>p.Visits,work) is {} point)
         {
-            string HpChange(int n)=>n<0?Ui.T($"回{-n}血",$"+{-n} HP"):Ui.T($"扣{n}血",$"Loss {n}");
-            if(point.EnemyHp is int enemy)rows.Add(new[]{Ui.T($"敌人剩{enemy}血",$"Enemy HP {enemy}")});
+            string HpChange(int n)=>n<0?Ui.Text("ui.114",-n):Ui.Text("ui.115",n);
+            if(point.EnemyHp is int enemy)rows.Add(new[]{Ui.Text("ui.116",enemy)});
             int? teamLoss=point.Loss;
             if(teamLoss==null && point.SeatLoss.All(v=>v.HasValue))teamLoss=point.SeatLoss.Sum(v=>v.GetValueOrDefault());
             var total=new List<string>(2);
@@ -329,14 +331,14 @@ internal sealed class SearchProgressView
             if(point.Potions.All(v=>v.HasValue))
             {
                 int bottles=point.Potions.Sum(v=>v.GetValueOrDefault());
-                total.Add(Ui.T($"用药{bottles}",$"Potions {bottles}"));
+                total.Add(Ui.Text("ui.117",bottles));
             }
             if(total.Count>0)rows.Add(total.ToArray());
             if(point.SeatLoss.Length>1)
                 for(int i=0;i<point.SeatLoss.Length;i++)
                 {
                     string seat=$"P{i+1}",change=point.SeatLoss[i] is int n?HpChange(n):Ui.Missing;
-                    rows.Add(point.Potions[i] is int pots?new[]{seat,change,Ui.T($"用药{pots}",$"Pots {pots}")}:new[]{seat,change});
+                    rows.Add(point.Potions[i] is int pots?new[]{seat,change,Ui.Text("ui.118",pots)}:new[]{seat,change});
                 }
         }
         if(!onResult && At(trace.Memory,p=>p.Visits,work) is {} sample)

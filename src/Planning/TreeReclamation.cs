@@ -13,6 +13,7 @@ internal sealed class TreeReclamation(long target)
     private readonly object visited=new();
     private readonly HashSet<Node> pinned=new();
     private readonly HashSet<Scope> scopes=new();
+    private readonly SearchTreeMemory.Survey estimate=new(null,Array.Empty<AnytimeSearch>());
     private readonly Stack<Node> pending=new();
     private readonly PriorityQueue<Node,(int Confidence,double Score,int Depth)> candidates=new();
     private readonly HashSet<Node> ancestors=new();
@@ -53,30 +54,33 @@ internal sealed class TreeReclamation(long target)
 
     private void Offer(Node node)
     {
-        if(node.Children.Count==0 && node.Frontier==null)return;
+        if(IsLeaf(node) && (node.Parent==null || pinned.Contains(node.Parent)))return;
         var end=node.BestTerminal?.ReachedEnd;
-        double score=node.Parent is {} parent && node.Visits>0?
-            AnytimeSearch.SelectionScore(node,parent.Visits):double.PositiveInfinity;
+        double score=node.Visits>0?node.Sum/node.Visits:0;
         int band=node.Evidence?.Full==true?0:node.Evidence?.Solved!=null?1:end is {Victory:true,Verified:true}?3:2;
         candidates.Enqueue(node,(band,score,-node.Depth));
     }
 
-    private static long MenuBytes(Node node)=>SearchTreeMemory.Survey.Buffer(node.Children.Capacity,8)+
-        (node.Legal==null?0:32+SearchTreeMemory.Survey.Buffer(node.Legal.Capacity,8))+
-        (node.Frontier?.RetainedBytes??0);
+    private static bool IsLeaf(Node node)=>node.Children.Count==0 && node.Frontier==null && node.Legal==null;
 
-    private long EstimateCut(Node keep,long max)
+    private long EstimateCut(Node keep,long max,bool removeLeaf)
     {
+        estimate.ResetNodeEstimate();
+        if(removeLeaf)
+        {
+            estimate.MeasureNode(keep,scopes);
+            return estimate.Bytes;
+        }
+        estimate.MeasureMenu(keep);
         pending.Clear();
         foreach(var child in keep.Children)pending.Push(child);
-        long bytes=MenuBytes(keep);
         while(pending.TryPop(out var node))
         {
-            bytes+=216+MenuBytes(node)+(node.Step==null?0:96)+(node.Evidence==null?0:88);
-            if(bytes>max){pending.Clear();return bytes;}
+            estimate.MeasureNode(node,scopes);
+            if(estimate.Bytes>max){pending.Clear();return estimate.Bytes;}
             foreach(var child in node.Children)pending.Push(child);
         }
-        return bytes;
+        return estimate.Bytes;
     }
 
     private void Forget(Node keep)
@@ -88,6 +92,20 @@ internal sealed class TreeReclamation(long target)
             foreach(var child in node.Children)pending.Push(child);
         }
         keep.Children.Clear();keep.Children.TrimExcess();
+        ForgetMenu(keep);
+    }
+
+    private void ForgetLeaf(Node leaf)
+    {
+        var parent=leaf.Parent!;
+        leaf.WalkStamp=Removed;Nodes++;
+        parent.Children.Remove(leaf);
+        if(parent.Children.Count<parent.Children.Capacity/2)parent.Children.TrimExcess();
+        ForgetMenu(parent);
+    }
+
+    private void ForgetMenu(Node keep)
+    {
         keep.Frontier=null;keep.Legal=null;keep.Families=0;keep.MenuGap=keep.UnknownMenu=false;
         keep.RecipeCursor=0;
         keep.Compacted=true;Branches++;
@@ -115,17 +133,23 @@ internal sealed class TreeReclamation(long target)
     internal void Run(Action beforeFirstCut)
     {
         DiscoverLinks();
-        while(Bytes<target && candidates.TryDequeue(out var node,out _))
+        long slack=Math.Clamp(target/16,512,2_000_000);
+        // A small remainder is not worth evicting higher-ranked branches.
+        while(Bytes<target-target/10 && candidates.TryDequeue(out var node,out _))
         {
-            long largest=Math.Max(target-Bytes,target/2)*2;
-            long size=EstimateCut(node,largest);
-            if(size>largest && node.Children.Count>1)
+            bool leaf=IsLeaf(node);
+            if(leaf && (node.Parent==null || pinned.Contains(node.Parent)))continue;
+            long largest=target-Bytes+slack;
+            long size=EstimateCut(node,largest,leaf);
+            if(size>largest)
             {
                 foreach(var child in node.Children)Offer(child);
                 continue;
             }
+            if(size==0)continue;
             if(Bytes==0)beforeFirstCut();
-            Forget(node);Bytes+=size;
+            if(leaf)ForgetLeaf(node);else Forget(node);
+            Bytes+=size;
         }
         // Terminal links used for route reuse must still point into a retained path.
         foreach(var n in ancestors)

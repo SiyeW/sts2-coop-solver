@@ -10,15 +10,16 @@ using STS2RitsuLib.Networking.Sidecar;
 
 namespace CoopSolver;
 
-internal sealed record HudHello(string Battle,string Token,long Have,bool? View=null,PotionCost? Opening=null,PotionCost? Live=null,int[]? GraphRounds=null,bool History=false);
+internal sealed record HudHello(string Battle,string Token,long Have,PotionCost? Opening=null,PotionCost? Live=null,int[]? GraphRounds=null,bool History=false,bool Structured=false);
 internal sealed record HudPacket(string Battle,string Token,long Sequence,long PlanVersion,HudFrame Frame);
 
 internal sealed class RouteShare
 {
     private const int MaxBytes=262144;
+    private static readonly JsonSerializerOptions compact=new(){DefaultIgnoreCondition=System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull};
     private static byte[] Pack<T>(T value)
     {
-        var raw=JsonSerializer.SerializeToUtf8Bytes(value);
+        var raw=JsonSerializer.SerializeToUtf8Bytes(value,compact);
         if(raw.Length>MaxBytes)throw new InvalidDataException("路线超过共享容量");
         using var output=new MemoryStream();
         using(var stream=new DeflateStream(output,CompressionLevel.Fastest,true))stream.Write(raw);
@@ -50,7 +51,7 @@ internal sealed class RouteShare
     private long serial,version,lastSeen,nextSend,nextHello,have=-1;
     private HudPlan? lastPlan;
     private bool broadcasting=true;
-    private bool? view;
+    private bool? lastLive;
     private PotionCost? openingChoice,liveChoice;
     private readonly Dictionary<ulong,(HudPlan? Plan,long Version)> peerPlans=new();
     private int[] graphRounds=Array.Empty<int>();
@@ -67,7 +68,7 @@ internal sealed class RouteShare
     }
     internal void Choose(bool live,PotionCost? cost)
     {
-        view=live;if(live)liveChoice=cost;else openingChoice=cost;nextHello=0;
+        if(live)liveChoice=cost;else openingChoice=cost;nextHello=0;
     }
     internal HudFrame? Remote {get;private set;}
     internal void Install()
@@ -134,7 +135,7 @@ internal sealed class RouteShare
     internal void Reset(INetGameService? net,string key)
     {
         lock(gate){hostId=(net as NetClientGameService)?.HostNetId;battle=key;token=Guid.NewGuid().ToString("N");lastSeen=0;missingSequence=0;received=null;inbox.Clear();}
-        peerPlans.Clear();view=null;openingChoice=liveChoice=null;viewers.Clear();Remote=null;lastPlan=null;version=serial=0;have=-1;wantsHistory=false;nextHello=nextSend=0;
+        peerPlans.Clear();lastLive=null;openingChoice=liveChoice=null;viewers.Clear();Remote=null;lastPlan=null;version=serial=0;have=-1;wantsHistory=false;nextHello=nextSend=0;
     }
     internal void ConsumePending(ulong expectedHost,long now)
     {
@@ -147,10 +148,10 @@ internal sealed class RouteShare
                 {
                     if(p.Frame.Plan!=null || p.PlanVersion==have || p.PlanVersion==0)
                     {
-                        received=null;lastSeen=p.Sequence;Remote=p.Frame with {Plan=p.PlanVersion==0?null:p.PlanVersion==have && Remote?.Plan!=null?Remote.Plan:p.Frame.Plan};
-                        if(view.HasValue && openingChoice!=null && Remote.Opening?.Options is {} oo)
+                        received=null;lastSeen=p.Sequence;Remote=HudWire.Receive(p.Frame) with {Plan=p.PlanVersion==0?null:p.PlanVersion==have && Remote?.Plan!=null?Remote.Plan:p.Frame.Plan};
+                        if(openingChoice!=null && Remote.Opening?.Options is {} oo)
                             openingChoice=oo.FirstOrDefault(o=>o.Key==Remote.Opening.PotionKey);
-                        if(view.HasValue && liveChoice!=null && Remote.Realtime?.Options is {} lo)
+                        if(liveChoice!=null && Remote.Realtime?.Options is {} lo)
                             liveChoice=lo.FirstOrDefault(o=>o.Key==Remote.Realtime.PotionKey);
                         if(Remote.Plan is {} plan && plan.Outcome is not ("胜" or "败"))Remote=Remote with {Plan=null,Choice="",Pv=null};
                         if(have!=p.PlanVersion)nextHello=0;
@@ -184,7 +185,7 @@ internal sealed class RouteShare
         ConsumePending(net.HostNetId,now);
         if(now<nextHello)return;
         nextHello=now+(Remote==null || have<0?1000:5000);
-        RitsuLibSidecarTypedMessageRegistry.SendToHost(net,hello,new(battle,token,have,view,openingChoice,liveChoice,graphRounds.Length==0?null:graphRounds,wantsHistory));
+        RitsuLibSidecarTypedMessageRegistry.SendToHost(net,hello,new(battle,token,have,openingChoice,liveChoice,graphRounds.Length==0?null:graphRounds,wantsHistory,Structured:true));
     }
     internal void RefreshGraph()=>nextSend=0;
     internal void Host(NetHostGameService net,HudFrame frame,long now,Func<ulong,HudHello,HudFrame>? project=null,bool broadcast=true)
@@ -193,8 +194,11 @@ internal sealed class RouteShare
         {
             broadcasting=broadcast;nextSend=0;peerPlans.Clear();
         }
-        if(broadcast && !ReferenceEquals(frame.Plan,lastPlan))
-        {lastPlan=frame.Plan;version=lastPlan==null?0:++serial;nextSend=0;}
+        if(broadcast && (lastLive!=frame.Live || !ReferenceEquals(frame.Plan,lastPlan)))
+        {
+            lastLive=frame.Live;
+            lastPlan=frame.Plan;version=lastPlan==null?0:++serial;nextSend=0;
+        }
         lock(gate)
         {
             foreach(var (id,h) in inbox)
@@ -211,7 +215,7 @@ internal sealed class RouteShare
             var peer=peerPlans.GetValueOrDefault(id);
             if(!ReferenceEquals(peer.Plan,shown.Plan)){peer=(shown.Plan,shown.Plan==null?0:++serial);peerPlans[id]=peer;}
             long peerVersion=peer.Version;
-            var payload=h.Have==peerVersion?shown with {Plan=null}:shown;
+            var payload=HudWire.Send(h.Have==peerVersion?shown with {Plan=null}:shown,h.Structured);
             try { if(RitsuLibSidecarTypedMessageRegistry.SendToPeer(net,id,data,new(battle,h.Token,++serial,peerVersion,payload)))
                 viewers[id]=h; } // Only a guest heartbeat acknowledges receipt.
             catch(InvalidDataException)

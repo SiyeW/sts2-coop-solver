@@ -103,7 +103,7 @@ internal sealed partial class Advisor
             var (enemy,point)=ordered[i];
             if(enemy.CombatId is not uint id)continue;
             string name=known[id];
-            if(ordered.Length==1 && known.Count==1){names[id]=name;continue;}
+            if(ordered.Length==1){names[id]=name;continue;}
             if(!positioned){names[id]=name+"（站位待确认）";continue;}
             string side=SideLabel(i,ordered.Length);
             var column=ordered.Where(item=>Math.Abs(item.point!.Value.X-point!.Value.X)<20)

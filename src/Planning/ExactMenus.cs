@@ -50,7 +50,7 @@ internal sealed class ExactMenus : IDisposable
     internal static void Install()
     {
         ChoiceLayout.Install();
-        GeneratedPotionChoices.Install();
+        ExactPotionChoices.Install();
         var harmony=new Harmony("sts2.coopsolver.physical-menus");
         void Patch(string original,string prefix) => harmony.Patch(AccessTools.Method(typeof(KernelSession),original),
             prefix:new HarmonyMethod(typeof(ExactMenus),prefix));
@@ -60,7 +60,7 @@ internal sealed class ExactMenus : IDisposable
         Patch("PrepareAfterStartChoices",nameof(UseRecordedMenu));
     }
     internal static bool Observes(KernelSession state)=>current?.session==state;
-    internal static PlanCardChoice? ChooseGenerated(KernelSession state,TurnStartChoiceRequest request,Player owner)=>
+    internal static PlanCardChoice? ChoosePotion(KernelSession state,TurnStartChoiceRequest request,Player owner)=>
         current?.session==state?current.Select(request,owner,false):null;
     private static bool UseRecordedMenu(KernelSession __instance) => current?.session!=__instance;
     private static bool CanComparePartyChoices(KernelSession __instance,Player owner,Player[] players,

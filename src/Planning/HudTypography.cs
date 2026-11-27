@@ -7,9 +7,10 @@ namespace CoopSolver;
 internal static class HudTypography
 {
     internal const int FieldGap=5, Body=21, Detail=19, ControlHeight=25, RowHeight=24, BodyHeight=21, DetailHeight=19;
+    internal const int RowInset=6;
     internal static readonly Color Ink=new("#edf2ef"),Loss=new("#f1a49d"),Damage=new("#efd095"),Heal=new("#a7dfba"),Kill=new("#ffedbf");
     internal static Color LossInk(int? value,Color neutral)=>value switch {>0=>Loss,<0=>Heal,_=>neutral};
-    internal static StyleBoxFlat Row(bool alternate,int verticalPadding=1)=>HudSurface.Box(alternate?"#92a7b420":"#23344148","",6,verticalPadding);
+    internal static StyleBoxFlat Row(bool alternate,int verticalPadding=1)=>HudSurface.Box(alternate?"#92a7b420":"#23344148","",RowInset,verticalPadding);
     internal static float SingleLineHeight(Control context,bool small)
     {
         int size=small?Detail:Body;
@@ -61,7 +62,7 @@ internal static class HudTypography
     {
         var native=FontManager.GetSubstituteFont(Ui.Language,heavy?FontType.Bold:FontType.Regular)
             ??GD.Load<Font>(heavy?"res://themes/kreon_bold_shared.tres":"res://themes/kreon_regular_shared.tres");
-        if(Ui.English)return native;
+        if(!Ui.UsesHanSpacing)return native;
         var face=native is FontVariation variation?(FontVariation)variation.Duplicate():new FontVariation{BaseFont=native};
         ChineseSpacing.Bind(face);
         return face;

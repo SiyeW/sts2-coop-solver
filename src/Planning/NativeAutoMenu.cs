@@ -106,7 +106,7 @@ internal sealed class NativeAutoMenu(Node screen,object identity)
         }).ToArray();
         if(picks.Length<choice.Minimum || picks.Length>choice.Maximum || picks.Distinct().Count()!=picks.Length)throw Changed();
     }
-    private static Exception Changed()=>new InvalidOperationException(Ui.T("选牌与路线不符","Card choices changed"));
+    private static Exception Changed()=>new InvalidOperationException(Ui.Text("ui.087"));
     internal void Advance()
     {
         if(confirmed)return;

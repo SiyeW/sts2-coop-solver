@@ -25,7 +25,7 @@ internal sealed class RoundOverview
         scroll.AddChild(body);body.AddThemeConstantOverride("separation",0);
     }
 
-    private static string[] Titles()=>new[]{Ui.T("剩血","HP"),Ui.T("扣血","HP loss"),Ui.T("打","DMG"),Ui.T("敌人剩血","Enemy HP")};
+    private static string[] Titles()=>new[]{Ui.Text("ui.088"),Ui.Text("ui.089"),Ui.Text("ui.090"),Ui.Text("ui.091")};
     private static int[]? Values(HudRoundHp? hp,int field)=>field switch
         {0=>hp?.EndHp,1=>hp?.Loss,2 when hp?.IncludesBlockDamage==true=>hp.Damage,_=>null};
     private static Color MetricInk(int field,int? value,Color neutral)=>field switch
@@ -47,7 +47,7 @@ internal sealed class RoundOverview
                 .Select(hp=>TextWidth(Number(Values(hp,field)?.ElementAtOrDefault(seat)))).DefaultIfEmpty(0).Max())+10)
             .ToArray()).ToArray();
 
-        internal float TurnWidth=>Math.Max(TextWidth(Ui.T("回合","Turn")),(plan?.Rounds??Array.Empty<HudRoundHp>())
+        internal float TurnWidth=>Math.Max(TextWidth(Ui.Text("ui.092")),(plan?.Rounds??Array.Empty<HudRoundHp>())
             .Select(hp=>TextWidth(Ui.Turn(hp.Round))).DefaultIfEmpty(0).Max())+10;
         internal float Width(int field,string title)=>Math.Max(TextWidth(title)+8,field<3
             ?Cells[field].Sum()+Math.Max(0,Seats-1)*4
@@ -82,7 +82,7 @@ internal sealed class RoundOverview
     {
         var row=Line();
         Color ink=selected?Highlighted:DefaultInk;
-        if(layout.Turns)row.AddChild(Text(heading?Ui.T("回合","Turn"):Ui.Turn(round),ink,layout.TurnWidth));
+        if(layout.Turns)row.AddChild(Text(heading?Ui.Text("ui.093"):Ui.Turn(round),ink,layout.TurnWidth));
         var titles=Titles();
         for(int i=0;i<4;i++)
         {
@@ -97,7 +97,7 @@ internal sealed class RoundOverview
                 var label=Text(heading?titles[i]:Number(hp?.EnemyHp),ink);
                 label.SizeFlagsVertical=Control.SizeFlags.ExpandFill;
                 if(!heading && hp?.EnemyHp==0)
-                    group.AddChild(CombatHud.Outline(label,Ui.T("击杀","Kill")));
+                    group.AddChild(CombatHud.Outline(label,Ui.Text("ui.094")));
                 else group.AddChild(label);
                 continue;
             }
@@ -118,7 +118,7 @@ internal sealed class RoundOverview
                 {
                     if(i==0 && value==0)
                     {
-                        var fallen=CombatHud.Outline(label,Ui.T("倒下","Down"));
+                        var fallen=CombatHud.Outline(label,Ui.Text("ui.095"));
                         fallen.CustomMinimumSize=new(layout.Cells[i][seat],0);
                         label.CustomMinimumSize=new(0,HudTypography.RowHeight);
                         fallen.SizeFlagsHorizontal=Control.SizeFlags.ExpandFill;band.AddChild(fallen);
@@ -135,7 +135,7 @@ internal sealed class RoundOverview
         return row;
     }
 
-    internal static void RenderSummary(VBoxContainer target,int number,HudPlan? plan,int localSeat)
+    internal static void RenderSummary(VBoxContainer target,int number,HudPlan? plan,int localSeat,int leftInset)
     {
         Clear(target);
         if(plan==null || number<0)return;
@@ -149,7 +149,11 @@ internal sealed class RoundOverview
                 if(Values(round,field) is {} values)
                     foreach(int value in values)cellWidth=Math.Max(cellWidth,TextWidth(Number(value)));
 
-        var row=Line();target.AddChild(row);
+        var inset=new MarginContainer{MouseFilter=Control.MouseFilterEnum.Ignore};
+        inset.AddThemeConstantOverride("margin_left",leftInset);
+        inset.AddThemeConstantOverride("margin_right",RouteOutcomeView.TextInset);
+        var row=Line();
+        target.AddChild(inset);inset.AddChild(row);
         for(int field=0;field<4;field++)
         {
             if(field>0)Divider(row,spread:true);
@@ -160,7 +164,7 @@ internal sealed class RoundOverview
             if(field==3)
             {
                 var enemy=Text(Number(hp?.EnemyHp),DefaultInk);
-                Control enemyValue=hp?.EnemyHp==0?CombatHud.Outline(enemy,Ui.T("击杀","Kill")):enemy;
+                Control enemyValue=hp?.EnemyHp==0?CombatHud.Outline(enemy,Ui.Text("ui.096")):enemy;
                 group.AddChild(enemyValue);
                 continue;
             }
@@ -173,7 +177,7 @@ internal sealed class RoundOverview
                 bool lethal=field==0 && value==0;
                 var label=Text(Number(value),ink,cellWidth);
                 PanelContainer badge;
-                if(plan.Party.Length<2 && lethal)badge=CombatHud.Outline(label,Ui.T("倒下","Down"));
+                if(plan.Party.Length<2 && lethal)badge=CombatHud.Outline(label,Ui.Text("ui.097"));
                 else
                 {
                     badge=new PanelContainer{MouseFilter=Control.MouseFilterEnum.Ignore};
@@ -187,7 +191,7 @@ internal sealed class RoundOverview
             }
             if(field==2 && hp is {IncludesBlockDamage:true,UnassignedDamage:{} unassigned} &&
                 unassigned.Values.Sum() is int other && other>0)
-                group.AddChild(CombatHud.Caption(Ui.T($"未归属{other}",$"Unassigned {other}"),HudTypography.Damage,true));
+                group.AddChild(CombatHud.Caption(Ui.Text("ui.098",other),HudTypography.Damage,true));
         }
     }
 

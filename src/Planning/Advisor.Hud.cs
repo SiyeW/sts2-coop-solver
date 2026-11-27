@@ -3,8 +3,11 @@ using System;
 using System.Linq;
 using CoopBots.Kernel;
 using MegaCrit.Sts2.Core.Combat;
+using MegaCrit.Sts2.Core.Entities.Creatures;
 using MegaCrit.Sts2.Core.Multiplayer;
 using MegaCrit.Sts2.Core.Multiplayer.Game;
+using MegaCrit.Sts2.Core.Nodes.Screens;
+using MegaCrit.Sts2.Core.Nodes.Screens.Capstones;
 using MegaCrit.Sts2.Core.Platform;
 using MegaCrit.Sts2.Core.Runs;
 using Godot;
@@ -75,13 +78,20 @@ internal sealed partial class Advisor
     {pinnedChoice=text;nextHud=0;}
     internal static string CharacterInk(MegaCrit.Sts2.Core.Models.CharacterModel character)
     {
-        var source=character.Id.Entry=="NECROBINDER"?new Color("#766b92"):character.NameColor;
+        var source=character.Id.Entry switch
+        {
+            "NECROBINDER"=>new Color("#766b92"),
+            "REGENT"=>new Color("#ef762c"),
+            _=>character.NameColor
+        };
         return source.ToHtml(false);
     }
     private HudPlan MakeHud(InteractiveSearch.Line line,string route,string summary,CoopBots.Kernel.KernelSession? choiceOrigin=null)
     {
         int firstRound=choiceOrigin?.TurnNumber??rootRound;
         var party=choiceOrigin?.Party??participants;
+        var actors=party.Select((player,index)=>(player.NetId,index)).ToDictionary(item=>item.NetId,item=>item.index);
+        var origin=choiceOrigin??root;
         var seats=party.Select((p,i)=>{
             var events=DeathSaves.Events(line.Rounds,p.NetId);
             int restored=events.Sum(e=>e.Hp);
@@ -96,14 +106,38 @@ internal sealed partial class Advisor
                 line.Steps.Count(a=>a.Player.NetId==p.NetId && a.Potion!=null)+events.Count(e=>e.Potion),
                 line.Hp[i],CharacterInk(p.Character),restored,recovered);
         }).ToArray();
+        string? Position(Creature target)=>target.CombatId is uint id?targetNames.GetValueOrDefault(id):null;
         var kills=(line.Kills??Array.Empty<RouteKill>()).Select(k=>new HudKill(k.Step,
-            k.Enemy.CombatId is uint id && targetNames.TryGetValue(id,out var name)?name:k.Enemy.Name.ToString(),
-            ReferenceEquals(k.Enemy,line.Steps[k.Step].Target),k.CreditedSeat,k.Effect,k.Enemy.CombatId)).ToArray();
+            Position(k.Enemy)??k.Enemy.Name.ToString(),ReferenceEquals(k.Enemy,line.Steps[k.Step].Target),
+            k.CreditedSeat,k.Effect,k.Enemy.CombatId,HudTarget.Of(k.Enemy,position:Position(k.Enemy)))).ToArray();
         var targets=line.Steps.Select((action,step)=>(action.Target,step))
             .Where(item=>item.Target is {Monster:not null,CombatId:not null})
             .ToDictionary(item=>item.step,item=>item.Target!.CombatId!.Value);
-        var model=new HudPlan(choiceOrigin?.TurnNumber??rootRound,line.EndTurn,seats,route,summary,string.Join("\n",line.Risks),kills,line.Rounds,line.EnemyHp,seats.Sum(s=>(s.ToEnd??0)+(owner?.PastLoss(s.Id)??0)),Ui.Terms(line),Ui.Language,GoalResult.For(line.Ending),targets);
-        if((choiceOrigin??root) is {} origin)(owner??this).dependencyGraphs.Track(model,origin,line);
+        HudPick[]? Picks(System.Collections.Generic.IEnumerable<CoopBots.Kernel.KernelChoice>? list)=>
+            list?.Select(choice=>new HudPick(actors.GetValueOrDefault(choice.Owner,-1)+1,ChoiceCards(choice))).ToArray();
+        var moves=line.Steps.Select(action=>
+        {
+            var potion=action.Potion;
+            int? slot=null;
+            if(potion!=null && (origin==null?action.Player.Potions.Count(b=>b.Id==potion.Id):
+                origin.CapturedPotions(action.Player).Count(b=>b.Id==potion.Id))>1)
+            {
+                int index=origin==null?action.Player.GetPotionSlotIndex(potion):CapturedBelt.Slot(origin,potion);
+                if(index>=0)slot=index+1;
+            }
+            var target=action.Target;
+            var transition=action.TurnStartChoices;
+            return new HudMove(actors[action.Player.NetId],action.EndTurn?HudMoveKind.EndTurn:action.Card!=null?
+                HudMoveKind.Card:potion!=null?HudMoveKind.Potion:HudMoveKind.Choice,
+                action.Card is {} card?CardPresentation.Capture(card,action.CardStateKey,CardPresentation.FeeFor(action)):null,
+                HudName.From(potion?.Title),slot,target==null?null:HudTarget.Of(target,
+                    target.Player is {} teammate?actors.GetValueOrDefault(teammate.NetId,-1)+1:0,Position(target)),
+                Picks(action.Choices),transition!=null && transition.ToRound!=transition.FromRound?transition.ToRound:null,
+                Picks(transition?.Choices));
+        }).ToArray();
+        var outcome=line.Ending is {Verified:true} record?(record.Victory?HudOutcome.Win:HudOutcome.Loss):HudOutcome.Unknown;
+        var model=new HudPlan(choiceOrigin?.TurnNumber??rootRound,line.EndTurn,seats,route,summary,string.Join("\n",line.Risks),kills,line.Rounds,line.EnemyHp,seats.Sum(s=>(s.ToEnd??0)+(owner?.PastLoss(s.Id)??0)),Ui.Terms(line),Ui.Language,GoalResult.For(line.Ending),targets,moves,outcome);
+        if(origin!=null)(owner??this).dependencyGraphs.Track(model,origin,line);
         return model;
     }
     internal sealed class LossUpdates
@@ -205,7 +239,25 @@ internal sealed partial class Advisor
             best?.Ending is {} end?(end.Victory?"胜":"败"):side.pendingCheckVisible?"核对中":"",
             plan==null?null:System.Text.RegularExpressions.Regex.Match(plan.Result,@"发现时(?:搜索|模拟|计算) ([0-9.]+[kMB]?) 次").Groups[1].Value,
             side.Follow && side.CurrentWorkerError==null && !sharedOpening && searchEnabled && SearchCapacity.OpeningPercent<100 &&
-            (!current || side.engine?.Latest?.Generation!=side.generation),Exhausted:exhausted,MinimumLossProven:sameLoss && snapshot!.MinimumLossProven,ProofPercent:sameLoss?snapshot!.ProofPercent:null,MemoryWaiting:waiting,ProofDone:sameLoss?snapshot!.ProofDone:0,ProofTotal:sameLoss?snapshot!.ProofTotal:0,ProofBlocked:sameLoss && snapshot!.ProofBlocked,ProofCoverage:sameLoss?snapshot!.ProofCoverage:null);
+            (!current || side.engine?.Latest?.Generation!=side.generation),Exhausted:exhausted,
+            MinimumLossProven:sameLoss && snapshot!.MinimumLossProven,ZeroLossProven:HasZeroLossWin(ending,plan),
+            ProofPercent:sameLoss?snapshot!.ProofPercent:null,MemoryWaiting:waiting,ProofDone:sameLoss?snapshot!.ProofDone:0,ProofTotal:sameLoss?snapshot!.ProofTotal:0,ProofBlocked:sameLoss && snapshot!.ProofBlocked,ProofCoverage:sameLoss?snapshot!.ProofCoverage:null);
+    }
+
+    // Display proof for the HP-loss metric. This does not certify the worker's
+    // broader score or stop it from looking for better potion/recovery outcomes.
+    internal static bool HasZeroLossWin(TerminalRecord? ending,HudPlan? plan)
+    {
+        if(ending is not {Verified:true,Victory:true} ||
+            plan is not {Goal:null,Party.Length:>0,Rounds:{Length:>0} rounds})return false;
+        int expected=plan.Start;
+        foreach(var round in rounds)
+        {
+            if(round.Loss.Length==0)continue; // A trailing presentation row may have no settlement.
+            if(round.Round!=expected++ || round.Loss.Length!=plan.Party.Length ||
+                round.Loss.Any(loss=>loss!=0))return false;
+        }
+        return expected>plan.Start && expected>plan.End;
     }
     private string? interfaceLanguage;
     private static HudFrame AddWarnings(HudFrame frame,string[] warnings,string? first=null,string? second=null)
@@ -216,7 +268,7 @@ internal sealed partial class Advisor
         if(second!=null)merged=merged.Append(second);
         return frame with {Warnings=merged.Distinct().ToArray()};
     }
-    private CombatHud CreateHud(Window? nativeWindow)=>new(tree,()=>requested=true,()=>{showLive=!showLive;switchRequested=true;},
+    private CombatHud CreateHud(Window? nativeWindow)=>new(tree,()=>requested=true,()=>{showLive=!showLive;switchRequested=true;nextHud=0;},
         ()=>OpenRoute(),ToggleResults,SetGuestLocal,RestartSearch,SelectPotion,TogglePlayback,nativeWindow,SetBroadcast,round=>SelectGraphRound(round,nativeWindow!=null),RefreshHistory);
     private HudFrame WithReadyEnds(HudFrame frame)
     {
@@ -342,7 +394,7 @@ internal sealed partial class Advisor
                             Rate=pending.MenuMeter.Rate(now,searchEnabled && pending.Probe!=null && !Memory.Waiting()),
                             Party=party,Pv=null,Round=room.RoundNumber,End=display?.End,Outcome=display?.Outcome??"",
                             Discovered=display!=null && pending.Rendered is {} line?Compact(line.FoundAt):null,
-                            MemoryWaiting=searchEnabled && Memory.Waiting(),Checking=false,Exhausted=false,MinimumLossProven=false,
+                            MemoryWaiting=searchEnabled && Memory.Waiting(),Checking=false,Exhausted=false,MinimumLossProven=false,ZeroLossProven=false,
                             ProofPercent=null,ProofDone=0,ProofTotal=0,ProofBlocked=false,ProofCoverage=null};
                         frame=frame with {Realtime=liveRow,Plan=live?display:frame.Plan,State=live?"正在评估当前选牌":frame.State};
                     }
@@ -378,7 +430,7 @@ internal sealed partial class Advisor
                     dependencyGraphs.Request(LiveGraphWorker,showLive?hudFrame.Plan:livePlan,room.RoundNumber,out _,
                         settled:liveGraphSettled);
                 if(net is NetHostGameService server)share?.Host(server,hudFrame,now,(viewer,h)=>
-                    ForViewer(viewer,h.View??showLive,new(){Manual=h.Opening},new(){Manual=h.Live},false,h.GraphRounds,h.History),broadcastRoutes);
+                    ForViewer(viewer,showLive,new(){Manual=h.Opening},new(){Manual=h.Live},false,h.GraphRounds,h.History),broadcastRoutes);
             }
             else
             {
@@ -408,16 +460,22 @@ internal sealed partial class Advisor
         }
         if(NativeUi)
         {
-            hud??=CreateHud(null);
             bool solo=net.Type==NetGameType.Singleplayer;
             bool available=solo && canSolve && PlaybackSelection()!=null;
-            hud.SetPlayback(solo,playback!=null,available);
             if(window is {IsShown:true,Panel:{} detached})
             {
                 detached.SetPlayback(solo,playback!=null,available);
                 detached.Update(hudFrame,net.NetId,localSolver,canSolve || root!=null && SearchCapacity.OpeningPercent>0,room.RoundNumber,guestClient,net.Type==NetGameType.Host?broadcastRoutes:null,targetNames);
             }
-            hud.Update(hudFrame,net.NetId,localSolver,canSolve || root!=null && SearchCapacity.OpeningPercent>0,room.RoundNumber,guestClient,net.Type==NetGameType.Host?broadcastRoutes:null,targetNames);
+            if(NCapstoneContainer.Instance?.CurrentCapstoneScreen is NCapstoneSubmenuStack)
+                hud?.HideOverlay();
+            else
+            {
+                hud??=CreateHud(null);
+                hud.SetPlayback(solo,playback!=null,available);
+                hud.Update(hudFrame,net.NetId,localSolver,canSolve || root!=null && SearchCapacity.OpeningPercent>0,
+                    room.RoundNumber,guestClient,net.Type==NetGameType.Host?broadcastRoutes:null,targetNames);
+            }
         }
         else if(hud?.Visible==true)hud.Hide();
         return !localSolver && !UseWorker;

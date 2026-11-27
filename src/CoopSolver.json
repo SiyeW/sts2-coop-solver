@@ -2,7 +2,7 @@
   "id": "CoopSolver",
   "name": "多人战斗求解器",
   "author": "StS2CoopSolver",
-  "version": "0.10.37",
+  "version": "0.10.43",
   "description": "计算单人或全队战斗路线。联机时可跟随主机，也可在本机独立计算。",
   "has_dll": true,
   "has_pck": false,

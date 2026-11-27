@@ -88,7 +88,9 @@ internal sealed class SearchTreeMemory
             // graph while the other worker is paused. The transfer owns both
             // graphs until it finishes.
             if(Array.Exists(owners,owner=>owner.Recovering)){canRetry=true;return;}
-            var trim=new TreeReclamation(before-limit*85/100);
+            // Recount after each bounded batch. A cap lowered substantially
+            // mid-fight can take multiple passes without deleting the whole tree.
+            var trim=new TreeReclamation(Math.Min(before-limit*85/100,limit/8));
             if(root!=null)trim.PreserveRoot(root);
             exchange?.ProtectRetainedWork(trim);
             foreach(var owner in owners)owner.ProtectRetainedWork(trim);
@@ -297,24 +299,42 @@ internal sealed class SearchTreeMemory
                 if(!todo.TryPop(out var node))return true;
                 if(ReferenceEquals(node.WalkStamp,stamp))continue;
                 node.WalkStamp=stamp;
-                // The empty sentinel is also present before the first expansion.
-                if(node.Parent!=null || node.Children.Count!=0 || node.Frontier!=null || node.Observed!=null)
-                    structuralBytes+=184+32+Buffer(node.Children.Capacity,8);
-                if(node.Legal!=null)structuralBytes+=32+Buffer(node.Legal.Capacity,8);
-                Ending(node.ReachedEnd);
-                if(node.Evidence is {} evidence)
-                {
-                    Evidence(evidence);
-                    foreach(var scope in scopes)
-                        if(scope.Other.TryGetValue(node,out var other))Evidence(other);
-                }
+                MeasureNode(node,scopes);
                 foreach(var child in node.Children)todo.Push(child);
                 if(node.Observed!=null)todo.Push(node.Observed);
                 if(node.RecipeSource!=null)todo.Push(node.RecipeSource);
-                Edge(node.Step);
-                node.Frontier?.Measure(this);
             }while(Stopwatch.GetElapsedTime(start).TotalMilliseconds<milliseconds);
             return todo.Count==0 && pendingSeeds.Count==0 && pendingLines.Count==0;
+        }
+        internal void MeasureNode(AnytimeSearch.Node node,IEnumerable<AnytimeSearch.EvidenceScope> evidenceScopes)
+        {
+            // The empty sentinel is also present before the first expansion.
+            if(node.Parent!=null || node.Children.Count!=0 || node.Frontier!=null || node.Observed!=null)
+                structuralBytes+=184+32;
+            MeasureMenu(node);
+            Ending(node.ReachedEnd);
+            if(node.Evidence is {} evidence)
+            {
+                Evidence(evidence);
+                foreach(var scope in evidenceScopes)
+                    if(!ReferenceEquals(scope,evidence.Scope) && scope.Other.TryGetValue(node,out var other))
+                        Evidence(other);
+            }
+            Edge(node.Step);
+        }
+
+        internal void MeasureMenu(AnytimeSearch.Node node)
+        {
+            structuralBytes+=Buffer(node.Children.Capacity,8);
+            if(node.Legal!=null)structuralBytes+=32+Buffer(node.Legal.Capacity,8);
+            node.Frontier?.Measure(this);
+        }
+
+        internal void ResetNodeEstimate()
+        {
+            structuralBytes=largeBytes=sampleBytes=0;
+            mask=0;
+            payload.Clear();large.Clear();
         }
         // x64 managed layouts, including alignment and allocated collection capacity.
         internal static long Buffer(int capacity,int elementSize)=>capacity==0?0:24+((capacity*(long)elementSize+7)&~7L);

@@ -6,7 +6,7 @@ namespace CoopSolver;
 internal sealed class RouteWindow
 {
     private const string LayoutFile="user://coop-solver-window.cfg";
-    private readonly Window window=new() { Name="CoopSolverRouteWindow", Title=Ui.T("全队战斗路线","Party combat routes"), Visible=false, ForceNative=true,
+    private readonly Window window=new() { Name="CoopSolverRouteWindow", Title=Ui.Text("ui.106"), Visible=false, ForceNative=true,
         Transient=false, Exclusive=false, Borderless=false, Unresizable=false,
         InitialPosition=Window.WindowInitialPosition.Absolute, MinSize=new(500,390) };
     private Rect2I stored;

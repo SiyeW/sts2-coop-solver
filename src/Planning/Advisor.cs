@@ -326,7 +326,7 @@ internal sealed partial class Advisor(SceneTree tree)
                     hp = p.Creature.CurrentHp, cards = p.PlayerCombatState!.Hand.Cards.Select(c => c.Id.Entry).ToArray() }),
                 enemies = board.Enemies.Select(e => new { id = e.Monster?.Id.Entry, hp = e.CurrentHp })
             }));
-        playerNames=RunManager.Instance.NetService.Type==NetGameType.Singleplayer?new[]{Ui.T("我","You")}:participants.Select(p=>MegaCrit.Sts2.Core.Platform.PlatformUtil.GetPlayerName(RunManager.Instance.NetService.Platform,p.NetId)).ToArray();
+        playerNames=RunManager.Instance.NetService.Type==NetGameType.Singleplayer?new[]{Ui.Text("ui.001")}:participants.Select(p=>MegaCrit.Sts2.Core.Platform.PlatformUtil.GetPlayerName(RunManager.Instance.NetService.Platform,p.NetId)).ToArray();
         startHp=participants.Select(p=>root.Hp(p.Creature)).ToArray();
         startBottles=participants.Sum(root.HeldPotionCount);
         CaptureLabels(board);
@@ -334,7 +334,7 @@ internal sealed partial class Advisor(SceneTree tree)
             File.WriteAllText(caseOutput + ".belts.json", JsonSerializer.Serialize(players.Select(p => new {
                 owner = p.Character.Id.Entry, bottles = p.Potions.Select(b => new {
                     slot = p.GetPotionSlotIndex(b), id = b.Id.Entry,
-                    held = root.UsablePotions(p).Contains(b), modeled = KernelSession.CanModelPotion(b),
+                    held = root.UsablePotions(p).Contains(b), modeled = KernelSession.CanModelPotion(b) || ExactPotionChoices.Supports(b),
                     targets = root.PotionTargets(b).Select(t => t?.Player?.Character.Id.Entry ?? t?.Monster?.Id.Entry)
                 })
             })));
@@ -361,12 +361,14 @@ internal sealed partial class Advisor(SceneTree tree)
         return s.Append('\n').Append(FormatSteps(board,r.Script,startRound,frozen)).ToString();
     }
 
-    internal static string ChoiceNames(KernelChoice choice,bool live=false)
+    internal static string ChoiceNames(KernelChoice choice,bool live=false)=>
+        choice.Cards.Count==0?"（跳过）":string.Join("、",ChoiceCards(choice,live).Select(card=>card.Text(legacy:true)));
+
+    private static HudCardLabel[] ChoiceCards(KernelChoice choice,bool live=false)
     {
-        var names=choice.Cards.Select(c=>{
+        return choice.Cards.Select(c=>{
             var model=ModelDb.GetById<CardModel>(new ModelId("CARD",c.Id));
-            string title=model.Title+(c.Upgrade<=0?"":c.Upgrade==1?"+":"+"+c.Upgrade);
-            title+=CardPresentation.Describe(c.StateKey,model,CardPresentation.MenuFee(c,choice.Options));
+            var label=CardPresentation.Capture(model,c.StateKey,CardPresentation.MenuFee(c,choice.Options),c.Upgrade);
             if(choice.Options is {} options)
             {
                 var same=Enumerable.Range(0,options.Count).Where(i=>options[i].Id==c.Id && options[i].Upgrade==c.Upgrade &&
@@ -381,12 +383,11 @@ internal sealed partial class Advisor(SceneTree tree)
                     var visible=live && layout!=null?NativeAutoMenu.VisibleOrder(choice,layout):null;
                     var order=(visible??layout?.DisplayOrder(choice)??Enumerable.Range(0,options.Count).ToArray()).Where(same.Contains).ToArray();
                     int ordinal=Array.IndexOf(order,at)+1;
-                    if(ordinal>0)title+=$"（第{ordinal}张）";
+                    if(ordinal>0)label=label with {Copy=ordinal};
                 }
             }
-            return title;
-        });
-        return choice.Cards.Count==0?"（跳过）":string.Join("、",names);
+            return label;
+        }).ToArray();
     }
 
     private static string FormatSteps(CombatState board,System.Collections.Generic.IReadOnlyList<KernelTeamSearch.Action> route,int? startRound=null,KernelSession? frozen=null,System.Collections.Generic.IReadOnlyDictionary<uint,string>? positions=null)

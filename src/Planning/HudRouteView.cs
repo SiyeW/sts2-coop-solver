@@ -6,11 +6,10 @@ using Godot;
 
 namespace CoopSolver;
 
-// The persisted and shared route uses the same text as the second-screen view.
-// Keep unknown lines verbatim, including menus attached to a round boundary.
 internal sealed class HudRouteView
 {
-    private sealed record Page(int Number,List<(string Text,int Step)> Lines)
+    private sealed record Line(int Step,int Seat=-1,bool End=false,string LegacyBody="",HudMove? Move=null,HudPick[]? Picks=null);
+    private sealed record Page(int Number,List<Line> Lines)
     {
         internal Dictionary<int,int>? EndLossByStep;
         internal Dictionary<int,int>? DamageByStep;
@@ -45,7 +44,14 @@ internal sealed class HudRouteView
     private bool ListMode=>seats.Length<=1 || OwnOnly;
     internal void CloseOverview(){Overview.Panel.Hide();Round.Icon=HudIcons.Down;Round.SetPressedNoSignal(false);Scroll.Visible=ListMode && pages.Count>0;}
     private const int ActionGap=HudTypography.FieldGap;
-    private readonly List<(PanelContainer Badge,Control Description,Label Card,string Name,HBoxContainer Target,Label? TargetLabel,string TargetName,float TargetWidth,Label Damage,Label Energy,Control Divider)> visibleActions=new();
+    private const int SeatBadgeInset=6;
+    private sealed record Detail(Control Control,Label? Label=null,string Text="",float Outline=0);
+    private sealed record ActionColumns(PanelContainer Badge,VBoxContainer Description,Label Card,string Name,
+        HBoxContainer Target,Label? TargetLabel,HudTargetLabel? TargetModel,string TargetName,float TargetWidth,Label Damage,Label Energy,Control Divider)
+    {
+        internal readonly List<Detail> Details=new();
+    }
+    private readonly List<ActionColumns> visibleActions=new();
     private int selected=-1;
     private int localSeat;
     internal bool OwnOnly {get;private set;}
@@ -104,40 +110,66 @@ internal sealed class HudRouteView
     internal void Set(HudPlan? plan,int current,ulong me=0)
     {
         int seat=Array.FindIndex(plan?.Party??Array.Empty<HudSeat>(),s=>s.Id==me)+1;
-        if(ReferenceEquals(plan,lastPlan) && seat==localSeat)return;
-        if(lastPlan?.Steps!=plan?.Steps){waits.Clear();waitRound=-1;}
+        if(ReferenceEquals(plan,lastPlan) && seat==localSeat)
+        {
+            // Playback can cross a round boundary before a new PV is published.
+            if(!manual && current!=selected)
+            {
+                int follow=pages.FindIndex(page=>page.Number==current);
+                if(follow>=0)Show(follow);
+            }
+            return;
+        }
+        if(lastPlan?.Steps!=plan?.Steps || !ReferenceEquals(lastPlan?.Moves,plan?.Moves)){waits.Clear();waitRound=-1;}
         lastPlan=plan;
         seats=plan?.Party??Array.Empty<HudSeat>();
         localSeat=seat;
-        string text=plan?.Steps??"";
-        int step=-1;
         pages.Clear();
-        foreach(var line in text.Split('\n'))
+        if(plan?.Moves is {} recorded)
         {
-            if(TryRound(line,out int n,out var choices))
+            pages.Add(new(plan.Start,new()));
+            for(int step=0;step<recorded.Length;step++)
             {
-                pages.Add(new(n,new()));
-                string extra=choices.Trim();
-                if(extra.Length>0)pages[^1].Lines.Add((extra,-1));
+                var action=recorded[step];
+                pages[^1].Lines.Add(new(step,action.Seat,action.EndTurn,Move:action));
+                if(action.NextRound is not int round)continue;
+                pages.Add(new(round,new()));
+                if(action.NextPicks is {Length:>0} choices)pages[^1].Lines.Add(new(-1,Picks:choices));
             }
-            else if(pages.Count!=0 && !string.IsNullOrWhiteSpace(line))pages[^1].Lines.Add((line,PlayerMove.IsMatch(line)?++step:-1));
         }
+        else ReadLegacyPages(plan?.Steps??"");
         foreach(var page in pages)
         {
-            var report=plan?.Rounds?.FirstOrDefault(r=>r.Round==page.Number);
-            var moves=new List<(int Step,int Seat,bool End)>();
-            foreach(var (line,ordinal) in page.Lines)
-                if(ordinal>=0 && TryPlayerMove(line,out int actor,out string caption))
-                    moves.Add((ordinal,actor,caption.Split('〔')[0]=="结束回合"));
-            var positions=moves.ToArray();
+            var report=plan?.Rounds?.FirstOrDefault(row=>row.Round==page.Number);
+            var positions=page.Lines.Where(line=>line.Step>=0).Select(line=>(line.Step,line.Seat,line.End)).ToArray();
             page.DamageByStep=report?.DamageByAction(positions);
-            if(plan?.Kills is {} kills && moves.Count>0)
-                page.Kills=HudRoundHp.PlaceEndKills(kills.Where(k=>k.Step>=moves[0].Step && k.Step<=moves[^1].Step).ToArray(),seats,positions);
+            if(plan?.Kills is {} kills && positions.Length>0)
+                page.Kills=HudRoundHp.PlaceEndKills(kills.Where(k=>k.Step>=positions[0].Step && k.Step<=positions[^1].Step).ToArray(),seats,positions);
             page.EndLossByStep=report?.LossByAction(positions);
         }
         int index=pages.FindIndex(p=>p.Number==(manual?selected:current));
         if(index<0){manual=false;index=Math.Max(0,pages.FindIndex(p=>p.Number==current));}
         Show(index);
+    }
+
+    private void ReadLegacyPages(string steps)
+    {
+        int step=-1;
+        foreach(string row in steps.Split('\n'))
+        {
+            if(TryRound(row,out int number,out var choices))
+            {
+                pages.Add(new(number,new()));
+                if(choices.Trim() is {Length:>0} extra)pages[^1].Lines.Add(new(-1,LegacyBody:extra));
+            }
+            else if(pages.Count!=0 && !string.IsNullOrWhiteSpace(row))
+            {
+                var line=TryPlayerMove(row,out int seat,out string caption)?
+                    new Line(++step,seat,caption.Split('〔')[0]=="结束回合",caption):
+                    new Line(-1,LegacyBody:row);
+                pages[^1].Lines.Add(line);
+            }
+        }
     }
     internal void MoveRound(int delta)
     {
@@ -155,11 +187,6 @@ internal sealed class HudRouteView
         int i=pages.FindIndex(p=>p.Number==number);
         if(i>=0 && number!=selected){manual=true;Show(i);}
     }
-    private bool Other(string text)
-    {
-        var m=PlayerMove.Match(text);
-        return seats.Length>1 && m.Success && int.Parse(m.Groups[1].Value)!=localSeat;
-    }
     internal void SetWaits(HudGraph? graph)
     {
         var updated=new Dictionary<int,string[]>();
@@ -170,7 +197,7 @@ internal sealed class HudRouteView
             {
                 if(!steps.TryGetValue(group.Key,out var target) || target.Seat+1!=localSeat)continue;
                 var sources=group.Select(e=>steps.GetValueOrDefault(e.Before)).OfType<HudGraphAction>()
-                    .Where(a=>a.Seat!=target.Seat && executed?.Includes(graph.Round,a.Step)!=true && (graph.Round!=readyRound || a.Name!="结束回合" ||
+                    .Where(a=>a.Seat!=target.Seat && executed?.Includes(graph.Round,a.Step)!=true && (graph.Round!=readyRound || !a.EndTurn ||
                         (uint)a.Seat>=(uint)graph.Party.Length || !ready.Contains(graph.Party[a.Seat].Id)))
                     .ToArray();
                 if(sources.Length>0)updated[group.Key]=WaitFields(sources,lastPlan);
@@ -184,15 +211,8 @@ internal sealed class HudRouteView
 
     internal static string[] WaitFields(HudGraphAction[] waits,HudPlan? plan)
     {
-        var fields=new List<string>{Ui.T("等","Wait")};
-        for(int i=0;i<waits.Length;i++)
-        {
-            var action=waits[i];
-            fields.Add($"P{action.Seat+1}");
-            string name=Ui.Route(action.Name.StartsWith("用药 ",StringComparison.Ordinal)?action.Name[3..]:action.Name,plan);
-            fields.Add(i+1<waits.Length?name+Ui.T("、",","):name);
-        }
-        return fields.ToArray();
+        string sources=string.Join(Ui.Text("ui.044"),waits.Select(action=>$"P{action.Seat+1} {action.Caption(plan)}"));
+        return new[]{Ui.Text("route.wait_for",sources)};
     }
 
     private static HBoxContainer TextFields(Color ink,bool small,params string[] fields)
@@ -211,7 +231,8 @@ internal sealed class HudRouteView
         if(RoundIndex>=0)Show(RoundIndex);
     }
 
-    private void PlayerTotals()=>RoundOverview.RenderSummary(Roster,selected,lastPlan,localSeat);
+    private void PlayerTotals()=>RoundOverview.RenderSummary(Roster,selected,lastPlan,localSeat,
+        ListMode?HudTypography.RowInset+SeatBadgeInset:HudDependencyView.PlayerTitleInset);
     private void Show(int index)
     {
         visibleActions.Clear();
@@ -228,12 +249,12 @@ internal sealed class HudRouteView
         PlayerTotals();
         if(Overview.Panel.Visible)Overview.Render(pages.Select(p=>p.Number).ToArray(),lastPlan,selected,localSeat);
         if(!ListMode){IdealWidth=0;return;}
-        int firstStep=page.Lines.FirstOrDefault(line=>line.Step>=0).Step;
+        int firstStep=page.Lines.FirstOrDefault(line=>line.Step>=0)?.Step??0;
         foreach(var line in page.Lines)
         {
-            if(Other(line.Text) || line.Step>=0 && executed?.Includes(page.Number,line.Step-firstStep)==true)continue;
-            if(page.Number==readyRound && TryPlayerMove(line.Text,out int seat,out var caption) &&
-                caption.StartsWith("结束回合",StringComparison.Ordinal) && (uint)seat<(uint)seats.Length && ready.Contains(seats[seat].Id))
+            if(seats.Length>1 && line.Seat>=0 && line.Seat+1!=localSeat ||
+                line.Step>=0 && executed?.Includes(page.Number,line.Step-firstStep)==true)continue;
+            if(page.Number==readyRound && line.End && (uint)line.Seat<(uint)seats.Length && ready.Contains(seats[line.Seat].Id))
                 continue;
             if(OwnOnly && waitRound==page.Number && line.Step>=0 && waits.TryGetValue(line.Step-firstStep,out var wait))
             {
@@ -241,13 +262,13 @@ internal sealed class HudRouteView
                 row.Name="HudWait"+line.Step;row.CustomMinimumSize=new(0,HudTypography.RowHeight);
                 rows.AddChild(row);
             }
-            AddRow(line.Text,line.Step);
+            AddRow(line);
         }
         var report=lastPlan?.Rounds?.FirstOrDefault(r=>r.Round==selected);
         if(!OwnOnly && report is {IncludesBlockDamage:true,StepDamage:null,Damage:not null})
         {
             int unlisted=report.Damage.Sum()-(report.CardDamage?.Values.Sum()??0);
-            if(unlisted>0)rows.AddChild(TextFields(HudTypography.Damage,false,Ui.T("其他结算","Other effects"),Ui.T($"打{unlisted}",$"{unlisted} dmg")));
+            if(unlisted>0)rows.AddChild(TextFields(HudTypography.Damage,false,Ui.Text("ui.076"),Ui.Text("ui.077",unlisted)));
         }
         FitActionColumns();
         Scroll.ScrollVertical=same?oldScroll:0;
@@ -289,6 +310,12 @@ internal sealed class HudRouteView
             float cardWidth=Math.Min(card,room);
             if(c.TargetLabel!=null && full>room)
                 cardWidth=Math.Min(card,Math.Max(room*.42f,room-ActionGap-c.TargetWidth));
+            if(c.TargetLabel is {} targetLabel && c.TargetModel is {HasParenthesizedName:true} target && full>room)
+            {
+                float minimum=c.TargetWidth-TextWidth(targetLabel,c.TargetName)+
+                    TextWidth(targetLabel,outlined?target.Minimum:"→ "+target.Minimum)+Padding(target.Minimum);
+                cardWidth=Math.Min(cardWidth,Math.Max(1,room-ActionGap-minimum));
+            }
             float CardFit(string text)=>TextWidth(c.Card,text)+(c.TargetLabel==null?Gap(text):0);
             c.Card.Text=RouteTextWrap.Fit(c.Name,c.TargetLabel==null?room:cardWidth,CardFit);
             var titleLines=c.Card.Text.Split('\n');
@@ -299,7 +326,13 @@ internal sealed class HudRouteView
                 float trim=c.TargetWidth-TextWidth(label,c.TargetName);
                 float fit=Math.Max(1,room-used-ActionGap-trim);
                 float TargetFit(string value)=>TextWidth(label,value)+Padding(value);
-                label.Text=RouteTextWrap.Fit(c.TargetName,fit,TargetFit);
+                if(c.TargetModel is {HasParenthesizedName:true} model)
+                {
+                    string arrow=outlined?"":"→ ";
+                    label.Text=arrow+model.Fit(value=>TextWidth(label,value),
+                        Math.Max(1,fit-TextWidth(label,arrow)-Padding(model.Minimum)));
+                }
+                else label.Text=RouteTextWrap.Fit(c.TargetName,fit,TargetFit);
                 var targetLines=label.Text.Split('\n');
                 float text=targetLines.Max(t=>TextWidth(label,t));
                 label.CustomMinimumSize=new(text,0);
@@ -307,6 +340,20 @@ internal sealed class HudRouteView
                 used+=ActionGap+targetLines.Max(TargetFit)+trim;
             }
             else used=titleLines.Max(CardFit);
+            foreach(var detail in c.Details)
+            {
+                if(detail.Label is not {} detailLabel)
+                {
+                    float width=detail.Control.GetCombinedMinimumSize().X;
+                    natural=Math.Max(natural,width+Gap(""));
+                    used=Math.Max(used,width+Gap(""));
+                    continue;
+                }
+                float DetailFit(string text)=>TextWidth(detailLabel,text)+detail.Outline+Gap(detail.Outline>0?"":text);
+                natural=Math.Max(natural,DetailFit(detail.Text));
+                detailLabel.Text=RouteTextWrap.Fit(detail.Text,room,DetailFit);
+                used=Math.Max(used,detailLabel.Text.Split('\n').Max(DetailFit));
+            }
             rendered=Math.Max(rendered,used);
         }
         IdealWidth=reserved+natural;
@@ -320,18 +367,33 @@ internal sealed class HudRouteView
             c.Target.Visible=c.TargetLabel!=null;c.Damage.Visible=damage>0;c.Energy.Visible=energy>0;
         }
     }
-    private static string LossText(int loss)=>loss<0?Ui.T($"回{-loss}血",$"+{-loss} HP"):Ui.T($"扣{loss}血",$"Loss {loss}");
-    private void AddRow(string text,int step)
+    private static string LossText(int loss)=>loss<0?Ui.Text("ui.078",-loss):Ui.Text("ui.079",loss);
+    private void AddRow(Line row)
     {
-        var match=PlayerMove.Match(text);
-        int seat=match.Success?int.Parse(match.Groups[1].Value):0;
-        string body=match.Success?match.Groups[2].Value:text;
-        int at=body.IndexOf('〔');
-        string detail=at>=0?body[at..]:"";
-        if(at>=0)body=body[..at];
-        string[] move=body.Split(" → ",2);
-        if(move.Length==2 && lastPlan?.EnemyTargets?.TryGetValue(step,out uint id)==true)
-            move[1]=Ui.EnemyTarget(move[1],id,targetNames);
+        int seat=row.Seat+1,step=row.Step;
+        var typed=row.Move;
+        string detail="",name="";
+        string? legacyTarget=null;
+        bool potion=typed?.IsPotion??false;
+        if(typed!=null)name=typed.Text();
+        else
+        {
+            string body=row.LegacyBody;
+            int at=body.IndexOf('〔');
+            detail=at>=0?body[at..]:"";
+            if(at>=0)body=body[..at];
+            string[] move=body.Split(" → ",2);
+            string original=move[0];
+            potion=original.StartsWith("用药 ",StringComparison.Ordinal) ||
+                lastPlan?.Terms?.Any(term=>term.Table=="potions" && (original==term.Source || original.StartsWith(term.Source+"（药水槽 ")))==true;
+            name=Ui.Route(original.StartsWith("用药 ",StringComparison.Ordinal)?original[3..]:original,lastPlan);
+            if(move.Length>1)legacyTarget=move[1];
+        }
+        string? liveTarget=lastPlan?.EnemyTargets?.TryGetValue(step,out uint id)==true && targetNames?.TryGetValue(id,out var label)==true?
+            label:null;
+        var targetModel=HudTargetLabel.For(typed?.Target,legacyTarget,lastPlan,liveTarget);
+        if(potion && seats.Length==1 && targetModel?.Seat==seat)targetModel=null;
+        string? targetText=targetModel?.Text();
         var bg=new PanelContainer{CustomMinimumSize=new(0,HudTypography.ActionRowHeight()),MouseFilter=Control.MouseFilterEnum.Pass};
         bg.AddThemeStyleboxOverride("panel",HudTypography.Row(rows.GetChildCount()%2==0));
         rows.AddChild(bg);
@@ -339,33 +401,27 @@ internal sealed class HudRouteView
         line.AddThemeConstantOverride("separation",5);bg.AddChild(line);
         var who=CombatHud.Caption(seat>0?"P"+seat:"",HudTypography.Ink);
         var badge=new PanelContainer{SizeFlagsVertical=Control.SizeFlags.ShrinkCenter};
-        badge.AddThemeStyleboxOverride("panel",seats.Length>1?SeatBox(seats.ElementAtOrDefault(seat-1),6,0):
-            HudSurface.Box("#00000000","",6,0));
+        badge.AddThemeStyleboxOverride("panel",seats.Length>1?SeatBox(seats.ElementAtOrDefault(seat-1),SeatBadgeInset,0):
+            HudSurface.Box("#00000000","",SeatBadgeInset,0));
         badge.AddChild(who);line.AddChild(badge);
         var content=new VBoxContainer{SizeFlagsHorizontal=Control.SizeFlags.ExpandFill,MouseFilter=Control.MouseFilterEnum.Pass};
         content.AddThemeConstantOverride("separation",1);line.AddChild(content);
-        VBoxContainer? descriptionBlock=null;
-        if(move[0].Length!=0)
+        ActionColumns? columns=null;
+        if(name.Length!=0)
         {
             var action=new HBoxContainer{MouseFilter=Control.MouseFilterEnum.Pass};
             action.AddThemeConstantOverride("separation",ActionGap);content.AddChild(action);
-            descriptionBlock=new VBoxContainer{MouseFilter=Control.MouseFilterEnum.Pass};
+            var descriptionBlock=new VBoxContainer{MouseFilter=Control.MouseFilterEnum.Pass};
             descriptionBlock.AddThemeConstantOverride("separation",1);action.AddChild(descriptionBlock);
             var description=new HBoxContainer{MouseFilter=Control.MouseFilterEnum.Pass};
             description.AddThemeConstantOverride("separation",ActionGap);descriptionBlock.AddChild(description);
             var snapshot=lastPlan?.Rounds?.FirstOrDefault(r=>r.Round==selected);
-            string name=move[0];
-            if(!name.StartsWith("用药 ") && lastPlan?.Terms?.Any(t=>t.Table=="potions" && (name==t.Source || name.StartsWith(t.Source+"（药水槽 ")))==true)
-                name="用药 "+name;
-            bool potion=name.StartsWith("用药 ",StringComparison.Ordinal);
-            string caption=Ui.Route(potion?name[3..]:name,lastPlan);
-            var title=CombatHud.Caption(caption,potion?HudTypography.Damage:
-                name=="结束回合"?new("#bdcbd1"):new("#fffcf4"));
+            var title=CombatHud.Caption(name,potion?HudTypography.Damage:row.End?new("#bdcbd1"):new("#fffcf4"));
             title.SizeFlagsHorizontal=Control.SizeFlags.Fill;
             description.AddChild(title);
             int dealt=pages[RoundIndex].DamageByStep?.GetValueOrDefault(step)??0;
-            var damage=CombatHud.Caption(dealt>0?Ui.T($"打{dealt}",$"{dealt} dmg"):"",HudTypography.Damage,small:true);
-            var energy=CombatHud.Caption(snapshot?.EnergyAfter?.TryGetValue(step,out int left)==true?Ui.T($"余{left}费",$"{left} EN"):"",new("#bacbd0"),small:true);
+            var damage=CombatHud.Caption(dealt>0?Ui.Text("ui.080",dealt):"",HudTypography.Damage,small:true);
+            var energy=CombatHud.Caption(snapshot?.EnergyAfter?.TryGetValue(step,out int left)==true?Ui.Text("ui.081",left):"",new("#bacbd0"),small:true);
             if(pages[RoundIndex].EndLossByStep?.TryGetValue(step,out var loss)==true)
             {
                 energy.Text=loss==0?"":LossText(loss);
@@ -375,23 +431,24 @@ internal sealed class HudRouteView
             damage.HorizontalAlignment=energy.HorizontalAlignment=HorizontalAlignment.Left;
             damage.VerticalAlignment=energy.VerticalAlignment=VerticalAlignment.Top;
 
-            var divider=HudTypography.ActionMetricRule();
+            var divider=HudTypography.ActionMetricRule(continuous:true);
             divider.Name="HudListMetricRule";
             action.AddChild(divider);action.AddChild(damage);action.AddChild(energy);
             float targetWidth=0;Label? targetLabel=null;
             var destination=new HBoxContainer{SizeFlagsHorizontal=Control.SizeFlags.Fill,Alignment=BoxContainer.AlignmentMode.Begin};
             description.AddChild(destination);
-            if(move.Length==2)
+            if(targetText!=null)
             {
-                var target=CombatHud.Caption("→ "+Ui.Route(move[1],lastPlan),new("#c5d6dc"));
+                var target=CombatHud.Caption("→ "+targetText,new("#c5d6dc"));
+                target.Name="HudListTarget";
                 targetLabel=target;target.HorizontalAlignment=HorizontalAlignment.Left;
                 bool lethalTarget=pages[RoundIndex].Kills.Any(k=>k.Step==step && k.IsTarget);
                 if(lethalTarget)
                 {
                     destination.AddChild(CombatHud.Caption("→",new("#c5d6dc")));
-                    target.Text=Ui.Route(move[1],lastPlan);
+                    target.Text=targetText;
                     target.AddThemeColorOverride("font_color",HudTypography.Kill);
-                    destination.AddChild(CombatHud.Outline(target,Ui.T("击杀","Kill")));
+                    destination.AddChild(CombatHud.Outline(target,Ui.Text("ui.082")));
                 }
                 else {target.SizeFlagsHorizontal=Control.SizeFlags.ExpandFill;destination.AddChild(target);}
                 float nameWidth=TextWidth(target,target.Text)+2;
@@ -399,21 +456,29 @@ internal sealed class HudRouteView
                     destination.GetThemeConstant("separation")+((PanelContainer)target.GetParent()).GetThemeStylebox("panel").GetMinimumSize().X:0);
                 if(lethalTarget)target.CustomMinimumSize=new(Math.Min(nameWidth,145),0);
             }
-            visibleActions.Add((badge,descriptionBlock,title,title.Text,destination,targetLabel,targetLabel?.Text??"",targetWidth,damage,energy,divider));
+            columns=new(badge,descriptionBlock,title,title.Text,destination,targetLabel,targetModel,targetLabel?.Text??"",targetWidth,damage,energy,divider);
+            visibleActions.Add(columns);
+        }
+        void AddDetail(Control control,Label? caption=null,float outline=0)
+        {
+            (columns?.Description??content).AddChild(control);
+            columns?.Details.Add(new(control,caption,caption?.Text??"",outline));
         }
         var restores=lastPlan?.Rounds?.FirstOrDefault(r=>r.Round==selected)?.Revives?.GetValueOrDefault(step);
         if(restores!=null)foreach(var e in restores)
         {
             var revivedSeat=Array.FindIndex(lastPlan!.Party,s=>s.Id==e.Seat)+1;
-            content.AddChild(TextFields(new("#cfba90"),false,$"P{revivedSeat}",
-                Ui.T($"{DeathSaves.Name(e)}复活",$"{DeathSaves.Name(e)} revive"),Ui.T($"回{e.Hp}血",$"+{e.Hp} HP")));
+            AddDetail(TextFields(new("#cfba90"),false,$"P{revivedSeat}",
+                Ui.Text("ui.083",DeathSaves.Name(e)),Ui.Text("ui.084",e.Hp)));
         }
-        foreach(var kill in pages[RoundIndex].Kills.Where(k=>k.Step==step && (!k.IsTarget || move.Length==1)))
+        foreach(var kill in pages[RoundIndex].Kills.Where(k=>k.Step==step && (!k.IsTarget || targetText==null)))
         {
-            var victim=CombatHud.Outline(CombatHud.Caption(Ui.Route(Ui.EnemyTarget(kill.Name,kill.EnemyId,targetNames),lastPlan),new("#ffedbf")),Ui.T("击杀","Kill"));
-            victim.SizeFlagsHorizontal=Control.SizeFlags.ShrinkBegin;content.AddChild(victim);
+            var caption=CombatHud.Caption(kill.Caption(lastPlan,targetNames),new("#ffedbf"));
+            var victim=CombatHud.Outline(caption,Ui.Text("ui.085"));
+            victim.SizeFlagsHorizontal=Control.SizeFlags.ShrinkBegin;
+            AddDetail(victim,caption,victim.GetThemeStylebox("panel").GetMinimumSize().X);
         }
-        if(detail.Length==0)return;
+        if(detail.Length==0 && typed==null && row.Picks==null)return;
         var picks=new List<string>();
         foreach(Match m in Regex.Matches(detail,@"〔([^〕]+)〕"))
         {
@@ -422,14 +487,13 @@ internal sealed class HudRouteView
             if(pickText.StartsWith(prefix,StringComparison.Ordinal))pickText=pickText[prefix.Length..];
             picks.Add(pickText);
         }
-        var pick=CombatHud.Caption(Ui.Route(string.Join(Ui.T("、",", "),picks),lastPlan),new("#f3d19a"));
-        pick.AutowrapMode=TextServer.AutowrapMode.WordSmart;
-        if(descriptionBlock==null)content.AddChild(pick);
-        else
-        {
-            var padding=new MarginContainer();
-            padding.AddThemeConstantOverride("margin_right",(int)HudTypography.ExtraGapBeforeMetrics(""));
-            padding.AddChild(pick);descriptionBlock.AddChild(padding);
-        }
+        var recordedPicks=typed?.InlinePicks()??row.Picks;
+        string pickTextDisplay=recordedPicks!=null?string.Join(Ui.Text("ui.086"),recordedPicks.Select(pick=>pick.Text(seat))):
+            Ui.Route(string.Join(Ui.Text("ui.086"),picks),lastPlan);
+        if(pickTextDisplay.Length==0)return;
+        var pick=CombatHud.Caption(pickTextDisplay,new("#f3d19a"));
+        pick.Name="HudListChoice";
+        if(columns==null)pick.AutowrapMode=TextServer.AutowrapMode.WordSmart;
+        AddDetail(pick,pick);
     }
 }

@@ -21,6 +21,11 @@ function Build-Library($Name,$SourceDir,$References,$AdditionalSources=@()) {
     $refs = @('System.Private.CoreLib','System.Runtime','System.Linq','System.Collections','System.Collections.Concurrent','System.Console','System.Text.Json','System.Security.Cryptography','System.IO.Compression','System.IO.FileSystem.DriveInfo','System.Text.RegularExpressions','System.Reflection.Primitives','System.Reflection.Emit.ILGeneration','System.Runtime.Loader','System.Threading','System.Runtime.InteropServices','System.ObjectModel','System.Diagnostics.Process','System.ComponentModel.Primitives','System.Memory','netstandard','GodotSharp','sts2','0Harmony')
     foreach($r in $refs) { $flags += "/reference:$data/$r.dll" }
     foreach($r in $References) { $flags += "/reference:$r" }
+    if($Name -eq 'CoopSolver.Planning') {
+        foreach($locale in Get-ChildItem -LiteralPath "$SourceDir/locales" -Filter '*.json' -File) {
+            $flags += "/resource:$($locale.FullName),CoopSolver.Locales.$($locale.Name)"
+        }
+    }
     $sources = @(Get-ChildItem -LiteralPath $SourceDir -Filter '*.cs' | ForEach-Object FullName) + $AdditionalSources
     & $csc.FullName @flags @sources
     if($LASTEXITCODE -ne 0){throw "Build failed for $Name"}

@@ -54,7 +54,7 @@ internal static class ChineseSpacing
     }
     internal static float EdgeBlank(string text,int fontSize,bool leading)
     {
-        if(Ui.English || text.Length==0)return 0;
+        if(!Ui.UsesHanSpacing || text.Length==0)return 0;
         char edge=leading?text[0]:text[^1];
         if(leading?!Opening.Contains(edge):!Close(edge))return 0;
         var face=HudTypography.Face();
@@ -87,7 +87,7 @@ internal static class ChineseSpacing
 
     internal static string Format(string text)
     {
-        if(Ui.English)return text;
+        if(!Ui.UsesHanSpacing)return text;
         StringBuilder? result=null;int last=0;
         for(int i=0;i<text.Length-1;i++)
         {

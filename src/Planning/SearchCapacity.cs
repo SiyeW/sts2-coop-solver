@@ -50,7 +50,7 @@ internal static class SearchCapacity
     }
     internal static void BindMemory(InlineMenus menus,Godot.Button memory)
     {
-        var items=memoryLimits.Select(mb=>new InlineMenus.Item(mb,mb==0?Ui.T("无限制","Unlimited"):
+        var items=memoryLimits.Select(mb=>new InlineMenus.Item(mb,mb==0?Ui.Text("ui.107"):
             mb<1000?$"{mb} MB":(mb/1000d).ToString("0.0",System.Globalization.CultureInfo.InvariantCulture)+" GB")).ToArray();
         menus.Bind(memory,memory.Name+"Menu",items,()=>MemoryLimitMb,SetMemoryLimit);
     }

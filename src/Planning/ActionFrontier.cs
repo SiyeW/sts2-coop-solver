@@ -127,7 +127,8 @@ internal sealed class ActionFrontier
             }
             foreach(var bottle in state.UsablePotions(p))
             {
-                if(!KernelSession.CanModelPotion(bottle)) { unsupported(bottle.Id.Entry); continue; }
+                if(!KernelSession.CanModelPotion(bottle) && !ExactPotionChoices.Supports(bottle))
+                { unsupported(bottle.Id.Entry); continue; }
                 int slot=CapturedBelt.Slot(state,bottle);
                 if(slot<0){unsupported(bottle.Id.Entry+"：缺少实体药水槽");continue;}
                 foreach(var target in state.PotionTargets(bottle))
@@ -347,7 +348,7 @@ internal sealed class ActionFrontier
             if(!state.ForecastCausal(action,int.MaxValue,out reason,out var resolved)) return false;
             if(!menus.Consumed){reason="选牌步骤消失";return false;}
             if(proof!=null)proof.ChoiceShare=menus.ChoiceShare;
-            if(resolved.Potion is {} potion && GeneratedPotionChoices.Supports(potion))
+            if(resolved.Potion is {} potion && ExactPotionChoices.Supports(potion))
                 resolved=resolved with {Choices=menus.Observed.ToArray(),ChoiceOrdinals=digits};
             shown=resolved;
             if(menus.Observed.Count!=0 || resolved.TurnStartChoices?.Choices.Count>0 || move.PotionChoice>=0)

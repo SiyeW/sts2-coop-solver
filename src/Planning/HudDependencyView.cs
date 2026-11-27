@@ -7,7 +7,8 @@ namespace CoopSolver;
 
 internal sealed class HudDependencyView
 {
-    private const int Gap=12,StandardColumns=4,CellPadding=12;
+    internal const int PlayerTitleInset=5;
+    private const int Gap=12,StandardColumns=4,CellPadding=2*HudTypography.RowInset,WaitLineSpace=34;
     private const float ArrowDepth=9,ArrowHalfWidth=5.5f;
     private static float Line=>HudTypography.ActionRowHeight();
     private float SmallLine=>HudTypography.SingleLineHeight(container,true);
@@ -32,7 +33,7 @@ internal sealed class HudDependencyView
     private ColumnLayout[] layouts=Array.Empty<ColumnLayout>();
     private PanelContainer? expansion;
     private Tile? expanded;
-    private sealed record Field(string Text,Color Ink,bool Lethal=false);
+    private sealed record Field(string Text,Color Ink,bool Lethal=false,HudTargetLabel? Target=null);
     private sealed record ActionText(Field[] Fields,Field? Damage,Field? Change,string? Choice=null);
     private readonly record struct ColumnLayout(float Description,float Damage,float Change,float Wait,float Lead)
     {
@@ -40,7 +41,7 @@ internal sealed class HudDependencyView
             ?1+Lead+HudTypography.FieldGap+(Damage>0?Damage+HudTypography.FieldGap:0)+(Change>0?Change+HudTypography.FieldGap:0)
             :0;
         internal float PreferredWidth=>Math.Max(MinimumWidth,Math.Max(Description+MetricsWidth,Wait)+CellPadding);
-        internal float MinimumWidth=>Width(Ui.T("结束回合","End turn"))+1+HudTypography.ExtraGapBeforeMetrics("")+MetricsWidth+CellPadding;
+        internal float MinimumWidth=>Width(Ui.Text("ui.066"))+1+HudTypography.ExtraGapBeforeMetrics("")+MetricsWidth+CellPadding;
     }
     internal bool HasActions=>tiles.Count>0;
     private sealed record Tile(PanelContainer Box,ActionText Text,ColumnLayout Layout,float Width,bool Even,bool Header=false);
@@ -162,7 +163,7 @@ internal sealed class HudDependencyView
             if(shown!=null && !shown.Party.Select(seat=>seat.Id).SequenceEqual(graph.Party.Select(seat=>seat.Id)))
                 firstSeat=0;
             rerender|=shown==null || shown.Round!=graph.Round || !shown.Party.SequenceEqual(graph.Party) ||
-                shown.Conservative!=graph.Conservative || !shown.Actions.SequenceEqual(graph.Actions) ||
+                shown.Conservative!=graph.Conservative || !SameActions(shown.Actions,graph.Actions,shownPlan,plan) ||
                 !shown.Dependencies.SequenceEqual(graph.Dependencies);
             shown=graph;shownPlan=plan;
         }
@@ -176,10 +177,10 @@ internal sealed class HudDependencyView
         ResetGrid();
         int count=graph.Party.Length;
         if(count==0)return;
-        float damage=Width(Ui.T("打0","0 dmg"),HudTypography.Detail);
-        float change=Width(Ui.T("余0费","0 EN"),HudTypography.Detail);
+        float damage=Width(Ui.Text("ui.067"),HudTypography.Detail);
+        float change=Width(Ui.Text("ui.068"),HudTypography.Detail);
         layouts=Enumerable.Repeat(new ColumnLayout(0,damage,change,0,0),count).ToArray();
-        bool AlreadyEnded(HudGraphAction action)=>graph.Round==readyRound && action.Name=="结束回合" &&
+        bool AlreadyEnded(HudGraphAction action)=>graph.Round==readyRound && action.EndTurn &&
             ready.Contains(graph.Party[action.Seat].Id);
         var moves=graph.Actions.Where(a=>(uint)a.Seat<(uint)count && executed?.Includes(graph.Round,a.Step)!=true).DistinctBy(a=>a.Step).ToArray();
         var actions=moves.Where(a=>!AlreadyEnded(a)).ToDictionary(a=>a.Step);
@@ -212,7 +213,7 @@ internal sealed class HudDependencyView
                 var words=HudRouteView.WaitFields(wait,shownPlan);
                 var layout=layouts[action.Seat];
                 layouts[action.Seat]=layout with {
-                    Wait=Math.Max(layout.Wait,FieldsWidth(words,HudTypography.Detail)+34)
+                    Wait=Math.Max(layout.Wait,FieldsWidth(words,HudTypography.Detail)+WaitLineSpace)
                 };
                 cells[(row++,action.Seat)]=(action,words,wait[0].Seat>action.Seat);
             }
@@ -228,7 +229,7 @@ internal sealed class HudDependencyView
         foreach(int i in visibleSeats)
         {
             var title=Cell(Line);
-            title.AddThemeStyleboxOverride("panel",HudRouteView.SeatBox(graph.Party[i],5,0));
+            title.AddThemeStyleboxOverride("panel",HudRouteView.SeatBox(graph.Party[i],PlayerTitleInset,0));
             string[] titleFields={$"P{i+1}",graph.Party[i].Name};
             title.AddChild(TextFields(titleFields,HudTypography.Ink));
             CombatHud.SeatUnderline(title,graph.Party[i].Id==me,HudTypography.Ink);
@@ -267,7 +268,8 @@ internal sealed class HudDependencyView
     private void AddWait(int step,string[] words,bool right)
     {
         var box=Cell(Line);
-        box.AddThemeStyleboxOverride("panel",new StyleBoxEmpty());
+        box.AddThemeStyleboxOverride("panel",new StyleBoxEmpty{
+            ContentMarginLeft=HudTypography.RowInset,ContentMarginRight=HudTypography.RowInset});
         var layout=new Control{MouseFilter=Control.MouseFilterEnum.Ignore};
         box.AddChild(layout);
         var label=TextFields(words,DependencyColor,small:true,right:right);
@@ -275,7 +277,7 @@ internal sealed class HudDependencyView
         float textWidth=FieldsWidth(words,HudTypography.Detail);
         void Align()
         {
-            float width=Math.Min(textWidth,Math.Max(0,layout.Size.X-34));
+            float width=Math.Min(textWidth,Math.Max(0,layout.Size.X-WaitLineSpace));
             label.Size=new(width,Line);
             label.Position=new(right?layout.Size.X-width:0,(layout.Size.Y-Line)/2);
         }
@@ -334,32 +336,50 @@ internal sealed class HudDependencyView
 
     private ActionText Describe(HudGraphAction action)
     {
-        bool potion=action.Name.StartsWith("用药 ",StringComparison.Ordinal);
-        string name=Ui.Route(potion?action.Name[3..]:action.Name,shownPlan);
+        bool potion=action.IsPotion;
+        string name=action.Caption(shownPlan);
         var fields=new List<Field>{new(name,potion?HudTypography.Damage:HudTypography.Ink)};
-        if(action.Target is {Length:>0} target)
+        if(Target(action,shownPlan) is {} target)
         {
             fields.Add(new("→",Dim));
-            fields.Add(new(Ui.Route(Ui.EnemyTarget(target,action.EnemyTargetId,targetNames),shownPlan),
-                action.TargetKilled?HudTypography.Kill:Dim,action.TargetKilled));
+            fields.Add(new(target.Text(),action.TargetKilled?HudTypography.Kill:Dim,action.TargetKilled,target));
         }
-        if(action.OtherKills is {Length:>0} others)
-            fields.Add(new(Ui.Route(others,shownPlan),HudTypography.Kill,true));
-        string? damageValue=action.DamageAlternatives??(action.Damage>0?$"{action.Damage}":null);
+        if(OtherKillsCaption(action,shownPlan) is {Length:>0} others)
+            fields.Add(new(others,HudTypography.Kill,true));
+        string? damageValue=Amounts(action.DamageValues)??action.DamageAlternatives??(action.Damage>0?action.Damage.ToString(Ui.Culture):null);
         Field? damage=damageValue!=null
-            ?new(Ui.T($"打{damageValue}",$"{damageValue} dmg"),HudTypography.Damage):null;
+            ?new(Ui.Text("ui.069",damageValue),HudTypography.Damage):null;
         Field? change=null;
         if(action.EndLoss is int lost && lost!=0)
-            change=lost<0?new(Ui.T($"回{-lost}血",$"+{-lost} HP"),HudTypography.Heal):
-                new(Ui.T($"扣{lost}血",$"Loss {lost}"),HudTypography.Loss);
+            change=lost<0?new(Ui.Text("ui.070",-lost),HudTypography.Heal):
+                new(Ui.Text("ui.071",lost),HudTypography.Loss);
         else if(action.Energy is int left)
         {
-            string amount=action.EnergyAlternatives??$"{left}";
-            change=new(Ui.T($"余{amount}费",$"{amount} EN"),Dim);
+            string amount=Amounts(action.EnergyValues)??action.EnergyAlternatives??left.ToString(Ui.Culture);
+            change=new(Ui.Text("ui.072",amount),Dim);
         }
-        return new(fields.ToArray(),damage,change,
-            action.Choices is {Length:>0} choices?Ui.Route(choices,shownPlan):null);
+        return new(fields.ToArray(),damage,change,ChoicesCaption(action,shownPlan));
     }
+
+    private HudTargetLabel? Target(HudGraphAction action,HudPlan? plan)=>
+        HudTargetLabel.For(action.Move?.Target,action.Target,plan,
+            action.EnemyTargetId is uint id && targetNames?.TryGetValue(id,out var live)==true?live:null,
+            plan?.Party??shown?.Party);
+    private static string? ChoicesCaption(HudGraphAction action,HudPlan? plan)=>
+        action.Move?.Choices()??(action.Choices is {} old?Ui.Route(old,plan):null);
+    private static string? OtherKillsCaption(HudGraphAction action,HudPlan? plan)=>
+        action.Defeated is {} names?string.Join(Ui.Text("ui.044"),names.Select(target=>HudTargetLabel.For(target,null,plan)?.Text())):
+        action.OtherKills is {} old?Ui.Route(old,plan):null;
+    private static string? Amounts(int[]? values)=>values==null?null:string.Join("|",values.Select(value=>value.ToString(Ui.Culture)));
+
+    private bool SameActions(HudGraphAction[] a,HudGraphAction[] b,HudPlan? first,HudPlan? second)=>
+        a.Length==b.Length && a.Zip(b,(left,right)=>
+            (left with {Move=null,Defeated=null,EnergyValues=null,DamageValues=null})==
+                (right with {Move=null,Defeated=null,EnergyValues=null,DamageValues=null}) &&
+            left.EndTurn==right.EndTurn && left.IsPotion==right.IsPotion &&
+            left.Caption(first)==right.Caption(second) && Target(left,first)==Target(right,second) &&
+            ChoicesCaption(left,first)==ChoicesCaption(right,second) && OtherKillsCaption(left,first)==OtherKillsCaption(right,second) &&
+            Amounts(left.EnergyValues)==Amounts(right.EnergyValues) && Amounts(left.DamageValues)==Amounts(right.DamageValues)).All(same=>same);
 
     private static float FieldWidth(Field field)=>Width(field.Text)+(field.Lethal?9:1);
     private static float FirstLineWidth(Field[] fields)=>
@@ -380,27 +400,36 @@ internal sealed class HudDependencyView
         var main=new Control{CustomMinimumSize=new(0,Line),ClipContents=true,MouseFilter=Control.MouseFilterEnum.Ignore};
         description.AddChild(main);
         float natural=FirstLineWidth(text.Fields);
+        var targetField=text.Fields.FirstOrDefault(field=>field.Target is {HasParenthesizedName:true});
+        float targetReserve=targetField?.Target is {} target?
+            Width(target.Minimum)+Width("→")+2*HudTypography.FieldGap+(targetField.Lethal?9:1):0;
+        float firstWidth=text.Fields.Length==0?0:FieldWidth(text.Fields[0]);
         float offset=0;
         foreach(var field in text.Fields)
         {
             var label=Text(field.Text,field.Ink);
+            if(field.Target!=null)label.Name="HudGraphTarget";
             Control control=label;
             if(field.Lethal)
             {
                 label.CustomMinimumSize=Vector2.Zero;
-                control=CombatHud.Outline(label,Ui.T("击杀","Kill"));
+                control=CombatHud.Outline(label,Ui.Text("ui.073"));
             }
             main.AddChild(control);
             control.AnchorBottom=1;
             control.OffsetTop=field.Lethal?1:0;
             control.OffsetBottom=field.Lethal?-1:0;
             float left=offset,end=offset+FieldWidth(field);
-            control.OffsetLeft=left;
             void Fit()
             {
                 float limit=main.Size.X>=natural?main.Size.X:main.Size.X-HudTypography.ExtraGapBeforeMetrics("");
-                control.OffsetRight=Math.Max(left,Math.Min(limit,end));
-                control.Visible=limit>left+(field.Lethal?9:0);
+                float shift=targetReserve>0?Math.Clamp(firstWidth+targetReserve-limit,0,firstWidth-1):0;
+                float start=left==0?left:left-shift;
+                float stop=Math.Max(start,Math.Min(limit,end-shift));
+                control.OffsetLeft=start;control.OffsetRight=stop;
+                control.Visible=stop>start+(field.Lethal?9:0);
+                if(field.Target is {HasParenthesizedName:true} positioned)
+                    label.Text=positioned.Fit(static value=>Width(value),stop-start-(field.Lethal?9:1));
             }
             main.Resized+=Fit;
             Fit();

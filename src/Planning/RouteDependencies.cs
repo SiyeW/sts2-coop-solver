@@ -16,7 +16,7 @@ internal static class RouteDependencies
 {
     internal readonly record struct Edge(int Before,int After);
     internal readonly record struct ActionReading(ulong Before,int Energy,int Damage);
-    internal readonly record struct ActionDisplay(int? Energy,int? Damage,string? EnergyAlternatives=null,string? DamageAlternatives=null);
+    internal readonly record struct ActionDisplay(int? Energy,int? Damage,int[]? EnergyValues=null,int[]? DamageValues=null);
     internal sealed record ActionReadings(ulong[] Radix,int[] LaneLengths,int[] Consumed,ActionReading[][] Actions)
     {
         internal ActionReadings Retain(IEnumerable<int> steps,int[] consumed)
@@ -35,7 +35,7 @@ internal static class RouteDependencies
                 {energy.Add(reading.Energy);damage.Add(reading.Damage);}
             if(energy.Count==0)return default;
             return new(energy.Min,damage.Min,
-                energy.Count>1?string.Join("|",energy):null,damage.Count>1?string.Join("|",damage):null);
+                energy.Count>1?energy.ToArray():null,damage.Count>1?damage.ToArray():null);
         }
 
         private bool ExtendsConsumed(ulong progress)

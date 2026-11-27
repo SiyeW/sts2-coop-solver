@@ -205,8 +205,9 @@ internal sealed class RouteGraphBook
         {
             int step=round.Start+hit.Step;
             if(source.Line.Steps[step].EndTurn)continue;
-            kills.Add(new(step,enemyNames.GetValueOrDefault(hit.Enemy)??hit.Enemy.Name.ToString(),
-                ReferenceEquals(hit.Enemy,source.Line.Steps[step].Target)));
+            string? position=enemyNames.GetValueOrDefault(hit.Enemy);
+            kills.Add(new(step,position??hit.Enemy.Name.ToString(),ReferenceEquals(hit.Enemy,source.Line.Steps[step].Target),
+                EnemyId:hit.Enemy.CombatId,Target:HudTarget.Of(hit.Enemy,position:position)));
         }
         foreach(var kill in plan.Kills??Array.Empty<HudKill>())
             if((kill.CreditedSeat.HasValue || kill.Effect!=TurnKillEffect.None) && kill.Step>=round.Start &&
@@ -226,6 +227,7 @@ internal sealed class RouteGraphBook
         var endLoss=snapshot?.LossByAction(positions);
         HudGraphAction Describe(int i,int seat,string caption,uint? enemyId)
         {
+            var move=plan.Moves?.ElementAtOrDefault(i);
             int pick=caption.IndexOf('〔');
             string? choices=pick<0?null:caption[pick..].Replace("〕〔","、").Trim('〔','〕');
             string[] action=(pick<0?caption:caption[..pick]).Split(" → ",2,StringSplitOptions.None);
@@ -234,10 +236,15 @@ internal sealed class RouteGraphBook
             int? energy=amounts?.Energy??(snapshot?.EnergyAfter?.TryGetValue(i,out int left)==true?left:null);
             int? lost=endLoss?.TryGetValue(i,out int health)==true && health!=0?health:null;
             var killed=deaths.Where(k=>k.Step==i).ToArray();
-            bool targetKilled=action.Length>1 && killed.Any(k=>k.IsTarget);
-            string others=string.Join("、",killed.Where(k=>!targetKilled || !k.IsTarget).Select(k=>k.Name));
+            bool targetKilled=(move!=null?move.Target!=null:action.Length>1) && killed.Any(k=>k.IsTarget);
+            var otherKills=killed.Where(k=>!targetKilled || !k.IsTarget).ToArray();
+            string others=string.Join("、",otherKills.Select(k=>k.Name));
+            var energies=amounts?.EnergyValues;
+            var damages=amounts?.DamageValues;
             return new(i>=0?i-start:i,seat,action[0],action.ElementAtOrDefault(1),choices,damage,energy,lost,
-                targetKilled,others.Length>0?others:null,enemyId,amounts?.EnergyAlternatives,amounts?.DamageAlternatives);
+                targetKilled,others.Length>0?others:null,enemyId,energies==null?null:string.Join("|",energies),
+                damages==null?null:string.Join("|",damages),move,
+                otherKills.All(k=>k.Target!=null)?otherKills.Select(k=>k.Target!).ToArray():null,energies,damages);
         }
         var actions=moves.Select(m=>Describe(m.Step,m.Seat,m.Caption,m.EnemyId)).ToArray();
         return new(round,plan.Party,actions,edges,VerificationVersion:VerificationVersion);

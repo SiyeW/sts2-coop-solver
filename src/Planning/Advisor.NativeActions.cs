@@ -193,7 +193,7 @@ internal sealed partial class Advisor
                 same=slot>=0 && planned!=null && played?.Matches(planned,source)==true &&
                     planned.CardStateKey==move!.Key;
             }
-            else if(seat>=0 && action is UsePotionAction use && CapturedBelt.At(source,source.Party[seat],checked((int)use.PotionIndex)) is {} potion && (KernelSession.CanModelPotion(potion) || GeneratedPotionChoices.Supports(potion)))
+            else if(seat>=0 && action is UsePotionAction use && CapturedBelt.At(source,source.Party[seat],checked((int)use.PotionIndex)) is {} potion && (KernelSession.CanModelPotion(potion) || ExactPotionChoices.Supports(potion)))
             {
                 var target=NativePotionTarget(use,potion);
                 move=new(seat,MoveKind.Potion,(int)use.PotionIndex,potion.Id.Entry,target);
