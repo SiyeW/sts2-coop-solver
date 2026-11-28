@@ -21,8 +21,7 @@ internal sealed partial class Advisor(SceneTree tree)
     {
         SearchCapacity.Load();
         SimulationMeter.Install();
-        ChaosPotionChoices.Install();
-        ExactMenus.Install();
+        ChoiceLayout.Install();
         ContinuationHistory.Install();
         DamageAttribution.Install();
         DeathSaves.Install();
@@ -178,7 +177,7 @@ internal sealed partial class Advisor(SceneTree tree)
                 InteractiveSearch.Dispatcher.Split(wantOpening && root!=null && engine?.IsExhausted!=true && !Memory.Waiting() &&
                      (wantLive && playing && liveAdvisor?.engine?.IsExhausted!=true || SelectingHand && SearchCapacity.OpeningPercent<100));
                 openingWanted=wantOpening;
-                if(searchEnabled)exchange?.PumpPromotions(meter);
+                exchange?.PumpPromotions(searchEnabled?meter:null);
                 if(root!=null && exchange?.TakeLine() is {} promoted)RenderLine(promoted with {FoundAt=meter.Actions+exchange.ConnectedWork});
                 if(root!=null && ReferenceEquals(board,live))UpdateTree(live,playing,wantOpening!=running);
                 wantLive &= searchEnabled;
@@ -334,7 +333,7 @@ internal sealed partial class Advisor(SceneTree tree)
             File.WriteAllText(caseOutput + ".belts.json", JsonSerializer.Serialize(players.Select(p => new {
                 owner = p.Character.Id.Entry, bottles = p.Potions.Select(b => new {
                     slot = p.GetPotionSlotIndex(b), id = b.Id.Entry,
-                    held = root.UsablePotions(p).Contains(b), modeled = KernelSession.CanModelPotion(b) || ExactPotionChoices.Supports(b),
+                    held = root.UsablePotions(p).Contains(b), modeled = KernelSession.CanModelPotion(b) || KernelSession.SupportsPotionSelection(b),
                     targets = root.PotionTargets(b).Select(t => t?.Player?.Character.Id.Entry ?? t?.Monster?.Id.Entry)
                 })
             })));
@@ -406,11 +405,8 @@ internal sealed partial class Advisor(SceneTree tree)
             if(action.Card is {} card)
                 move=CardPresentation.PlayTitle(card,action.CardStateKey,CardPresentation.FeeFor(action));
             s.Append("\n").Append(who).Append("：").Append(move);
-            if(action.Potion is {} potion && (frozen==null ? action.Player.Potions.Count(b=>b.Id==potion.Id) : frozen.CapturedPotions(action.Player).Count(b=>b.Id==potion.Id))>1)
-            {
-                int slot=frozen==null ? action.Player.GetPotionSlotIndex(potion) : CapturedBelt.Slot(frozen,potion);
-                if(slot>=0)s.Append("（药水槽 ").Append(slot+1).Append("）");
-            }
+            if(action.Potion is {} potion && CapturedBelt.DisplaySlot(frozen,potion) is int slot)
+                s.Append("（药水槽 ").Append(slot).Append("）");
             if(action.Target?.Player is {} teammate)
                 s.Append(" → P").Append(board.Players.ToList().FindIndex(p=>p.NetId==teammate.NetId)+1)
                     .Append(' ').Append(teammate.Character.Title.GetFormattedText());

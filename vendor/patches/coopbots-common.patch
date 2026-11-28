@@ -1,0 +1,2352 @@
+diff --git a/src/CoopBots.Kernel/KernelChoiceContinuation.cs b/src/CoopBots.Kernel/KernelChoiceContinuation.cs
+index 3c694da60734d456be557ece3466c393290e3d13..31cf1fbd7686cec292b2ea0562ba36e9ef1460a0 100644
+--- a/src/CoopBots.Kernel/KernelChoiceContinuation.cs
++++ b/src/CoopBots.Kernel/KernelChoiceContinuation.cs
+@@ -231,7 +231,7 @@ public sealed partial class KernelSession
+     // ordinary fork guards still reject active card/draw/power transactions.
+     private Queue<PlanCardChoice>? PrepareAfterStartChoices(Player owner, bool isExtraTurn, bool sideStarted)
+     {
+-        if (KernelSearchBudgetScope.IsStopped || KernelChoiceContinuation.Active || !AutoResolveTurnStartChoices
++        if (MenuSelector is not null || KernelSearchBudgetScope.IsStopped || KernelChoiceContinuation.Active || !AutoResolveTurnStartChoices
+             || !Combat.IterateHookListeners().OfType<MegaCrit.Sts2.Core.Models.RelicModel>()
+                 .Any(r => r.Owner == owner && r.Id.Entry == "TOASTY_MITTENS" && !r.IsMelted)
+                 && Combat.GetAmount<ToolsOfTheTradePower>(owner.Creature) <= 0) return null;
+diff --git a/src/CoopBots.Kernel/KernelChoices.cs b/src/CoopBots.Kernel/KernelChoices.cs
+index abb05d49ace26d6cb3eec7e7683b0927b193fd1c..239859d643ca15edaf36c3b53e318cf2c9130a85 100644
+--- a/src/CoopBots.Kernel/KernelChoices.cs
++++ b/src/CoopBots.Kernel/KernelChoices.cs
+@@ -1,10 +1,15 @@
+ using System.Runtime.CompilerServices;
+ using CoopBots.Kernel.Vendor;
+ using MegaCrit.Sts2.Core.Entities.Cards;
++using MegaCrit.Sts2.Core.Entities.Players;
+ using MegaCrit.Sts2.Core.Models;
++using MegaCrit.Sts2.Core.Models.Potions;
+ 
+ namespace CoopBots.Kernel;
+ 
++internal enum KernelMenuKind { Action, TurnStart, Potion }
++internal delegate PlanCardChoice? KernelMenuSelector(TurnStartChoiceRequest request, Player? owner, KernelMenuKind kind);
++
+ public sealed record KernelChoiceCard(string Id, int Upgrade, string StateKey, int Occurrence);
+ public sealed record KernelChoice(ulong Owner, string Source, string Effect, PileType Pile,
+     string Context, int Minimum, int Maximum, IReadOnlyList<KernelChoiceCard> Cards)
+@@ -95,6 +100,11 @@ public sealed partial class KernelSession
+     private readonly List<int> choiceCounts = new();
+     private readonly List<KernelChoice> resolvedChoices = new();
+ 
++    // An optional host policy belongs to one action on one branch. Forks
++    // carry simulation state only, so optional probes use kernel defaults.
++    internal KernelMenuSelector? MenuSelector { get; set; }
++    internal void RecordActionChoice(KernelChoice choice) => resolvedChoices.Add(choice);
++
+     // Replays from a settled parent for each bounded choice vector. Pending
+     // transactions are never forked. Nested choices are enumerated as well.
+     public IEnumerable<CardBranch> CardBranches(CardModel card, MegaCrit.Sts2.Core.Entities.Creatures.Creature? target,
+@@ -224,12 +234,22 @@ public sealed partial class KernelSession
+         // step failed with `pending-choice`. One SURVIVOR in the path was therefore
+         // enough to empty ActionStates for a whole 104-action route.
+         choiceOrdinals = action.ChoiceOrdinals is { } ordinals ? ordinals.ToArray() : null;
++        if (action.Potion is DistilledChaos) choiceOrdinals ??= [];
+         choicePosition = 0;
+         if (action.EndTurn) return exactTurnStartContract
+             ? ReplayEndTurn(action, maxRounds, out boundary, out resolvedAction)
+             : EndTurn(action.Player, maxRounds, out boundary, out resolvedAction);
+         if (action.Potion is { } potion)
+         {
++            int chaosChoiceStart = potion is DistilledChaos ? resolvedChoices.Count : -1;
++            int generatedSlot=GeneratedPotionSlot(potion);
++            if(generatedSlot>=0 && FindCapturedPotion(potion)==null)
++            {
++                if(PotionAtSlot(action.Player,generatedSlot) is not {} replacement ||
++                    replacement.Id!=potion.Id || GeneratedPotionSlot(replacement)!=generatedSlot)
++                {boundary="generated-potion-slot-changed";return false;}
++                potion=replacement;
++            }
+             if (exactTurnStartContract && !BeginImplicitTurnStartReplay(action, out boundary)) return false;
+             try
+             {
+@@ -237,7 +257,22 @@ public sealed partial class KernelSession
+                 if (used) used = exactTurnStartContract
+                     ? FinishImplicitTurnStartReplay(action, maxRounds, out boundary)
+                     : FinishImplicitForecast(maxRounds, out boundary);
+-                if (used) resolvedAction = action with { TurnStartChoices = LastTurnStartChoices };
++                if (used)
++                {
++                    var choices = action.Choices;
++                    if (chaosChoiceStart >= 0)
++                    {
++                        var actual = resolvedChoices.Skip(chaosChoiceStart).ToArray();
++                        if (choices is not null && (choices.Count != actual.Length ||
++                            !choices.Zip(actual, MatchesChaosChoice).All(matches => matches)))
++                        {
++                            boundary = "distilled-chaos-choice-changed";
++                            return false;
++                        }
++                        choices = actual;
++                    }
++                    resolvedAction = action with { Potion = potion, Choices = choices, TurnStartChoices = LastTurnStartChoices };
++                }
+                 return used;
+             }
+             finally { pendingImplicitTurnStartReplay = null; plannedImplicitAction = false; }
+@@ -280,14 +315,21 @@ public sealed partial class KernelSession
+             var choiceStart = resolvedChoices.Count;
+             if (exactTurnStartContract && !BeginImplicitTurnStartReplay(action, out boundary)) return false;
+             bool played;
++            int previousForcedTurnLimit = forcedTurnLimit;
+             try
+             {
++                forcedTurnLimit = maxRounds;
+                 played = Play(resolved.Original, target, out boundary);
+                 if (played) played = exactTurnStartContract
+                     ? FinishImplicitTurnStartReplay(action, maxRounds, out boundary)
+                     : FinishImplicitForecast(maxRounds, out boundary);
+             }
+-            finally { pendingImplicitTurnStartReplay = null; plannedImplicitAction = false; }
++            finally
++            {
++                forcedTurnLimit = previousForcedTurnLimit;
++                pendingImplicitTurnStartReplay = null;
++                plannedImplicitAction = false;
++            }
+             if (played)
+             {
+                 // Tokens are created by this play's actual choice cursor, after
+@@ -338,6 +380,8 @@ public sealed partial class KernelSession
+     private TurnStartChoiceCursor ChoiceCursor(MegaCrit.Sts2.Core.Entities.Players.Player owner)
+         => TurnStartChoiceCursor.ForAutomaticPolicy(request =>
+         {
++            if (MenuSelector is { } select)
++                return select(request, owner, KernelMenuKind.Action);
+             if (choiceOrdinals is null) return null;
+             var spec = TurnStartChoiceSupport.BuildSpec(simulator, owner, request);
+             // Every physical occurrence in a native ten-card SINGLE cleanup
+diff --git a/src/CoopBots.Kernel/KernelPartySetup.cs b/src/CoopBots.Kernel/KernelPartySetup.cs
+index 428211a61c3855cde3598d5fb0e9e03301c231c6..1d0d246cc5c2ccf7fb4553c0f806a4430b7db491 100644
+--- a/src/CoopBots.Kernel/KernelPartySetup.cs
++++ b/src/CoopBots.Kernel/KernelPartySetup.cs
+@@ -111,9 +111,15 @@ public sealed partial class KernelSession
+         IReadOnlyDictionary<Player, CombatPredictionSimulator.PartySetupPause> pauses, KernelSession reference,
+         bool beforeSide = false, bool isExtraTurn = false)
+     {
+-        if (KernelChoiceContinuation.Active || !AutoResolveTurnStartChoices) return null;
++        if (MenuSelector is not null || KernelChoiceContinuation.Active || !AutoResolveTurnStartChoices) return null;
+         if (KernelSearchBudgetScope.IsStopped) return null;
+         var first = pauses[owner];
++        // Another seat can append history after this menu suspends. Only the
++        // optional lookahead needs a fork, so skip it when that span is stale.
++        var pausedSteps = players.Where(pauses.ContainsKey).SelectMany(player => pauses[player].Continuation.Steps).ToArray();
++        if (!simulator.History.SupportsExecutionContinuation(first.Continuation.HistoryStart,
++            pausedSteps.SelectMany(step => step.Frame.DeferredEntries),
++            pausedSteps.SelectMany(step => step.Frame.ActiveCardPlays))) return null;
+         var steps = players.SelectMany(p => beforeSide
+             ? pauses.TryGetValue(p, out var pending) ? pending.Continuation.Steps : []
+             : (pauses.TryGetValue(p, out var after) ? after.Continuation.Steps : [])
+diff --git a/src/CoopBots.Kernel/KernelPlanningState.Facts.cs b/src/CoopBots.Kernel/KernelPlanningState.Facts.cs
+index 08e6a8be68c739f646397590992a7210d0f36b7e..151566f411c1f2c889c09d13d910c27ec508ed78 100644
+--- a/src/CoopBots.Kernel/KernelPlanningState.Facts.cs
++++ b/src/CoopBots.Kernel/KernelPlanningState.Facts.cs
+@@ -1,3 +1,4 @@
++using System.Collections.Concurrent;
+ using System.Collections;
+ using System.Globalization;
+ using System.Reflection;
+@@ -23,9 +24,9 @@ public sealed partial class KernelSession
+     // in that text. Multiplayer cache reuse records those captured facts too.
+     // Owner's 2026-10-09 architecture plan: unavailable facts prevent reuse only;
+     // they never refuse a native action or substitute a numeric hash for evidence.
+-    internal bool AppendPlanningMechanismFacts(StringBuilder text)
++    internal bool AppendPlanningMechanismFacts(StringBuilder text, bool includeVictoryPlayPile = false)
+     {
+-        try { return new PlanningMechanismWriter(this, text).Append(); }
++        try { return new PlanningMechanismWriter(this, text, includeVictoryPlayPile).Append(); }
+         catch (Exception error) when (error is InvalidOperationException or MissingMemberException
+             or ArgumentException or TargetInvocationException or InvalidCastException)
+         {
+@@ -60,16 +61,18 @@ public sealed partial class KernelSession
+             BindingFlags.Instance | BindingFlags.NonPublic) ?? throw new MissingMethodException(name))
+             .Invoke(Combat, [simulator, player]);
+ 
+-    private sealed class PlanningMechanismWriter(KernelSession session, StringBuilder text)
++    private sealed class PlanningMechanismWriter(KernelSession session, StringBuilder text, bool includeVictoryPlayPile = false)
+     {
+         private const BindingFlags Fields = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
++        private static readonly ConcurrentDictionary<Type, FieldInfo[]> OrderedFields = new();
++        private static readonly ConcurrentDictionary<(Type Type, string Name), FieldInfo> CapturedFields = new();
++        private static readonly ConcurrentDictionary<(Type Type, string Name), PropertyInfo> CapturedProperties = new();
+         private static readonly Dictionary<Type, Type> RequiredPowerStates = new()
+         {
+             [typeof(AfterimagePower)] = typeof(CardPlayPairPredictionState),
+             [typeof(DarkEmbracePower)] = typeof(DarkEmbracePredictionState),
+             [typeof(SkittishPower)] = typeof(SkittishPredictionState),
+             [typeof(PanachePower)] = typeof(PanachePredictionState),
+-            [typeof(SoulboundPower)] = typeof(SoulboundPredictionState),
+             [typeof(HellraiserPower)] = typeof(HellraiserPredictionState),
+             [typeof(CacophonyPower)] = typeof(CacophonyPredictionState),
+             [typeof(AutomationPower)] = typeof(AutomationPredictionState),
+@@ -79,7 +82,6 @@ public sealed partial class KernelSession
+             [typeof(VoidFormPower)] = typeof(VoidFormPredictionState),
+             [typeof(HardenedShellPower)] = typeof(HardenedShellPredictionState),
+             [typeof(FeralPower)] = typeof(FeralPredictionState),
+-            [typeof(ImitationLearningPower)] = typeof(ImitationLearningPredictionState),
+         };
+         private readonly List<(PredictedCard Card, string Address)> cards = [];
+         private readonly Dictionary<AbstractModel, string> models = new(ReferenceEqualityComparer.Instance);
+@@ -93,9 +95,10 @@ public sealed partial class KernelSession
+                 var state = session.simulator.State.GetPlayerCombatState(player);
+                 AddPile(state.Hand.Cards, player, "H"); AddPile(state.DrawPile.Cards, player, "D");
+                 AddPile(state.DiscardPile.Cards, player, "C"); AddPile(state.ExhaustPile.Cards, player, "X");
+-                // An occupied PlayPile is a transaction rather than a settled
+-                // planning boundary, even if a permissive fork happens to exist.
+-                if (state.PlayPile.Cards.Count > 0) Unavailable("occupied-play-pile");
++                // A verified victory can stop the simulator before moving the
++                // winning card. Record its actual pile for terminal comparison.
++                if (includeVictoryPlayPile) AddPile(state.PlayPile.Cards, player, "P");
++                else if (state.PlayPile.Cards.Count > 0) Unavailable("occupied-play-pile");
+             }
+             foreach (var (player, current, previous) in session.PlanningHistoryCourseAttacks())
+             {
+@@ -146,7 +149,22 @@ public sealed partial class KernelSession
+             {
+                 if (power.GetType().Assembly != typeof(PowerModel).Assembly || PowerHiddenStateMirrors.Slots(power).Length > 0)
+                 { Unavailable("unqualified-power-adapter:" + power.GetType().FullName); continue; }
+-                if (RequiredPowerStates.TryGetValue(power.GetType(), out var required))
++                if (power is SoulboundPower soulbound)
++                {
++                    // Lazily allocated by the generation hook. With no active generation,
++                    // the guard is false whether or not a branch previously allocated it.
++                    if (session.simulator.StateStore.Peek(soulbound,
++                        () => new SoulboundPredictionState(soulbound)).IsAddingSoul)
++                        Unavailable("pending-soulbound-generation");
++                }
++                else if (power is ImitationLearningPower imitation)
++                {
++                    if (imitation._playerTarget is not { } target)
++                        Unavailable("missing-imitation-target");
++                    else
++                        text.Append(";imitation-target=").Append(target.NetId);
++                }
++                else if (RequiredPowerStates.TryGetValue(power.GetType(), out var required))
+                 {
+                     // CaptureRootState materializes the audited native payload.
+                     // Never create one from clone.GetInternalData: DeepCloneFields
+@@ -154,6 +172,11 @@ public sealed partial class KernelSession
+                     if (!stored.Any(entry => ReferenceEquals(entry.Model, power) && entry.StateType == required))
+                         Unavailable("missing-captured-power-state:" + power.GetType().Name);
+                 }
++                else if (power is GigantificationPower or SubroutinePower or StranglePower)
++                {
++                    // These mirrors keep only an in-flight attack/card-play receipt.
++                    // Their settled effect amount is already captured above.
++                }
+                 else if (power is OrbitPower orbit)
+                     text.Append(";orbit=").Append(session.Combat.GetOrbitEnergyRemainder(orbit));
+                 else if (power is PaleBlueDotPower pale)
+@@ -182,6 +205,23 @@ public sealed partial class KernelSession
+                 // Amount is already the canonical effective amount in P=.
+                 // Lazy creation of its redundant wrapper is not semantic state.
+                 if (entry.StateType.Name == "PowerAmountPredictionState") continue;
++                if (entry.Value is SoulboundPredictionState soulbound)
++                {
++                    if (soulbound.IsAddingSoul) Unavailable("pending-soulbound-generation");
++                    continue;
++                }
++                if (entry.Value is ImitationLearningPredictionState imitation)
++                {
++                    if (imitation.CardAndClones.Count != 0) Unavailable("pending-imitation-card");
++                    continue;
++                }
++                if (entry.Model is GigantificationPower && GigantificationPowerMirrors.IsSettledState(entry.Value)) continue;
++                if (entry.Model is SubroutinePower or StranglePower
++                    && entry.Value is CardPlayPairPredictionState pair)
++                {
++                    if (pair.Amounts.Count != 0) Unavailable("pending-card-play-pair:" + entry.Model.GetType().Name);
++                    continue;
++                }
+                 // Upstream lazily mirrors Withering's integer CardsLeft in a
+                 // CounterPredictionState; native roots retain only DynamicVars.
+                 // Our full canonical facts keep P=/PT= and skip only an exact
+@@ -220,7 +260,7 @@ public sealed partial class KernelSession
+                     && RequiredPowerStates.TryGetValue(retired.GetType(), out var retiredState)
+                     && entry.StateType == retiredState) continue;
+                 var address = ModelAddress(entry.Model);
+-                if (address is null) { Unavailable("detached-captured-state"); continue; }
++                if (address is null) { Unavailable("detached-captured-state:" + entry.Model.GetType().Name); continue; }
+                 text.Append(";captured-state=").Append(address).Append('/').Append(entry.StateType.FullName).Append('{');
+                 if (entry.StateType.Assembly != typeof(KernelSession).Assembly
+                     || !typeof(IPredictionStateForkable).IsAssignableFrom(entry.StateType))
+@@ -342,7 +382,15 @@ public sealed partial class KernelSession
+         }
+         internal void AppendSearchMetadata()
+         {
+-            foreach (var name in new[] { "_cumulativeHpLost", "_recoveredHp", "_potionUses",
++            // Costs and counts depend on which bottles were consumed. Journal order
++            // is retained for reporting but does not belong to state equality.
++            text.Append(";_potionUses=");
++            var uses = session.Combat.PotionUses;
++            AppendValue(uses.Count <= 1 ? uses : uses.OrderBy(use => use.PotionId, StringComparer.Ordinal)
++                .ThenBy(use => use.Slot)
++                .ThenBy(use => use.StrategicHpCost)
++                .ThenBy(use => use.Automatic).ToArray(), 0);
++            foreach (var name in new[] { "_cumulativeHpLost", "_recoveredHp",
+                 "_longTermResourceValue", "_angerCopiesGenerated", "_growthRewards",
+                 "_deathSaveRelicHpRestored", "_deathSavePotionHpRestored", "_deathSaveUseCount" })
+             {
+@@ -367,7 +415,7 @@ public sealed partial class KernelSession
+                 "_swordSageReplayBonuses",
+                 "_dampenCasters", "_dampenOriginalUpgrades", "_deathPhases",
+                 "_stolenStrength", "_stolenDexterity", "_statefulRelicStates",
+-                "_simulatedOsties", "_simulatedOstyMaxHp", "_monsterIntStates",
++                "_monsterIntStates",
+                 "_knowledgeDemonCurseCounters", "_enemiesIntendingAttack",
+                 "_hasPredictedEnemyIntents", "_nextCreatureId", "_currentSide",
+                 "_escapedCreatures", "_knownEnemies", "_allies", "_enemies",
+@@ -399,6 +447,12 @@ public sealed partial class KernelSession
+                 }
+                 else AppendValue(ReadField(session.Combat, name), 0);
+             }
++            // Native captures and simulated summons store this information
++            // differently. Compare each owner's effective pet and max HP.
++            foreach (var player in session.Combat.Players)
++                text.Append(";osty=").Append(player.NetId).Append('/')
++                    .Append(CreatureAddress(session.Combat.GetOsty(player))).Append('/')
++                    .Append(session.Combat.GetOstyMaxHp(session.simulator, player));
+             foreach (var (player, current, previous) in session.PlanningHistoryCourseAttacks())
+             {
+                 // null and an empty backing dictionary have the same effective
+@@ -545,8 +599,13 @@ public sealed partial class KernelSession
+         private void AppendObjectFields(object value, Type type, int depth)
+         {
+             if (depth > 32) { Unavailable("cyclic-captured-state"); return; }
+-            foreach (var field in type.GetFields(Fields | BindingFlags.DeclaredOnly).Where(f => !f.IsStatic)
+-                .OrderBy(f => f.Name, StringComparer.Ordinal))
++            foreach (var field in OrderedFields.GetOrAdd(type, static valueType =>
++                valueType.GetFields(Fields | BindingFlags.DeclaredOnly)
++                    .Where(field => !field.IsStatic &&
++                        // Native AfterCloned clears this flag. Its only reader
++                        // selects the forge animation when the blade changes piles.
++                        (valueType != typeof(SovereignBlade) || field.Name != "_createdThroughForge"))
++                    .OrderBy(field => field.Name, StringComparer.Ordinal).ToArray()))
+             {
+                 text.Append('/').Append(type.Name).Append('.').Append(field.Name).Append('=');
+                 AppendValue(field.GetValue(value), depth + 1);
+@@ -609,15 +668,17 @@ public sealed partial class KernelSession
+             { AppendObjectFields(value, type, depth + 1); return; }
+             Unavailable("unqualified-field:" + type.FullName);
+         }
+-        private static object? ReadField(object value, string name)
+-        {
+-            for (var type = value.GetType(); type is not null; type = type.BaseType)
+-                if (type.GetField(name, Fields | BindingFlags.DeclaredOnly) is { } field) return field.GetValue(value);
+-            throw new MissingFieldException(value.GetType().FullName, name);
+-        }
+-        private static object? CapturedProperty(object value, string name)
+-            => (value.GetType().GetProperty(name, Fields)
+-                ?? throw new MissingMemberException(value.GetType().FullName, name)).GetValue(value);
++        private static object? ReadField(object value, string name) =>
++            CapturedFields.GetOrAdd((value.GetType(), name), static key =>
++            {
++                for (var type = key.Type; type is not null; type = type.BaseType)
++                    if (type.GetField(key.Name, Fields | BindingFlags.DeclaredOnly) is { } field) return field;
++                throw new MissingFieldException(key.Type.FullName, key.Name);
++            }).GetValue(value);
++
++        private static object? CapturedProperty(object value, string name) =>
++            CapturedProperties.GetOrAdd((value.GetType(), name), static key => key.Type.GetProperty(key.Name, Fields)
++                ?? throw new MissingMemberException(key.Type.FullName, key.Name)).GetValue(value);
+         private static bool IsStatefulRelic(RelicModel relic)
+             => (bool)(typeof(SimulatedCombatState).GetMethod("IsStatefulRelic", BindingFlags.Static | BindingFlags.NonPublic)
+                 ?? throw new MissingMethodException(typeof(SimulatedCombatState).FullName, "IsStatefulRelic"))
+diff --git a/src/CoopBots.Kernel/KernelPlanningState.cs b/src/CoopBots.Kernel/KernelPlanningState.cs
+index 304a73f8dfc05343cf273a274240ee45552b5e4d..75cbfc399bde1d676a4a37ea01e056b7f0cde7b2 100644
+--- a/src/CoopBots.Kernel/KernelPlanningState.cs
++++ b/src/CoopBots.Kernel/KernelPlanningState.cs
+@@ -29,13 +29,45 @@ public sealed class KernelPlanningState
+     /// </summary>
+     public string SearchMetadata { get; internal init; } = "";
+     public bool Reusable { get; }
+-    public bool Matches(KernelPlanningState other)
++    public bool Matches(KernelPlanningState other) => Matches(other, null);
++
++    internal HashSet<CardModel> CardIdentities() => new(physicalCards, ReferenceEqualityComparer.Instance);
++
++    // Independent replays allocate their own copies of newly generated cards.
++    // For route verification, preserve every pre-existing card's identity.
++    internal bool Matches(KernelPlanningState other, IReadOnlySet<CardModel>? priorCards)
+     {
+         if (!Reusable || !other.Reusable || !ReferenceEquals(battle, other.battle)
+             || !string.Equals(Semantics, other.Semantics, StringComparison.Ordinal)
+             || physicalCards.Length != other.physicalCards.Length) return false;
+         for (var i = 0; i < physicalCards.Length; i++)
+-            if (!ReferenceEquals(physicalCards[i], other.physicalCards[i])) return false;
++            if (!ReferenceEquals(physicalCards[i], other.physicalCards[i]))
++                return priorCards is not null && MatchesGeneratedCards(other, priorCards);
++        return true;
++    }
++
++    private bool MatchesGeneratedCards(KernelPlanningState other, IReadOnlySet<CardModel> priorCards)
++    {
++        // New cards may be renamed, but one card cannot become two or vice versa.
++        var mapping = new Dictionary<CardModel, CardModel>(ReferenceEqualityComparer.Instance);
++        var used = new HashSet<CardModel>(ReferenceEqualityComparer.Instance);
++        for (var i = 0; i < physicalCards.Length; i++)
++        {
++            var card = physicalCards[i];
++            var counterpart = other.physicalCards[i];
++            if (priorCards.Contains(card) || priorCards.Contains(counterpart))
++            {
++                if (!ReferenceEquals(card, counterpart)) return false;
++                continue;
++            }
++            if (mapping.TryGetValue(card, out var prior))
++            {
++                if (!ReferenceEquals(prior, counterpart)) return false;
++                continue;
++            }
++            if (!used.Add(counterpart)) return false;
++            mapping.Add(card, counterpart);
++        }
+         return true;
+     }
+ 
+@@ -141,10 +173,15 @@ public sealed partial class KernelSession
+     // Multiplayer also binds seat control and original physical cards. Owner
+     // 2026-10-09: exact supported-state equality permits bounded continuation
+     // reuse after human input; equal hand/HP alone must never authorize reuse.
+-    public KernelPlanningState PlanningState(IEnumerable<ulong> controlledPlayers)
++    public KernelPlanningState PlanningState(IEnumerable<ulong> controlledPlayers) =>
++        PlanningState(controlledPlayers, includeVictoryPlayPile: false);
++
++    internal KernelPlanningState PlanningState(IEnumerable<ulong> controlledPlayers, bool includeVictoryPlayPile)
+     {
++        includeVictoryPlayPile &= HasTerminal && HasWon;
+         if (liveRoot is null) throw new InvalidOperationException("Planning evidence needs a battle identity.");
+-        var text = new StringBuilder(PartyStateText());
++        var text = new StringBuilder();
++        AppendPredictedPartyText(text);
+         text.Append("\nplanning-round=").Append(Combat.RoundNumber)
+             .Append(";enemy-phase=").Append(EnemyPhaseCompleted)
+             .Append(";horizon-closed=").Append(HorizonClosed)
+@@ -160,8 +197,10 @@ public sealed partial class KernelSession
+                 .Append('/').Append(Combat.GetPlayerTurnNumber(player))
+                 .Append('/').Append(CardsPlayedThisTurn(player))
+                 .Append('/').Append(Combat.GetEnergySpentThisTurn(player));
+-            cards.AddRange(Hand(player)); cards.AddRange(DrawPile(player));
+-            cards.AddRange(Discard(player)); cards.AddRange(Exhaust(player));
++            var state = simulator.State.GetPlayerCombatState(player);
++            AddOriginalCards(state.Hand.Cards); AddOriginalCards(state.DrawPile.Cards);
++            AddOriginalCards(state.DiscardPile.Cards); AddOriginalCards(state.ExhaustPile.Cards);
++            if (includeVictoryPlayPile) AddOriginalCards(state.PlayPile.Cards);
+         }
+         foreach (var creature in Combat.Creatures)
+             text.Append(";attacks=").Append(creature.CombatId).Append('/')
+@@ -173,7 +212,7 @@ public sealed partial class KernelSession
+         }
+         foreach (var (_, pending) in PlanningHistoryCoursePendingAttacks())
+             if (pending is not null) cards.Add(pending.Original);
+-        var mechanismsAvailable = AppendPlanningMechanismFacts(text);
++        var mechanismsAvailable = AppendPlanningMechanismFacts(text, includeVictoryPlayPile);
+         // A pending native selector or prepared answer is part of an action,
+         // not a settled root. This qualifies reuse evidence only; it does not
+         // refuse a legal game action or change native choice resolution.
+@@ -189,6 +228,11 @@ public sealed partial class KernelSession
+             && Qualify(preparedAfterStartChoices is not { Count: > 0 }, "prepared-after-start-answers", ref reuseFailure),
+             reuseFailure) { SearchMetadata = PlanningSearchMetadata() };
+ 
++        void AddOriginalCards(IReadOnlyList<Vendor.Engine.Common.PredictedCard> pile)
++        {
++            foreach (var card in pile) cards.Add(card.Original);
++        }
++
+         static bool Qualify(bool condition, string reason, ref string? failure)
+         {
+             if (!condition) failure = reason;
+diff --git a/src/CoopBots.Kernel/KernelPotionChoices.cs b/src/CoopBots.Kernel/KernelPotionChoices.cs
+index 7b6de8b75054c500e9970696f7eb1f4a90c0dd9d..33eff735b97f20e996ba56aa36ec24acc8df84ff 100644
+--- a/src/CoopBots.Kernel/KernelPotionChoices.cs
++++ b/src/CoopBots.Kernel/KernelPotionChoices.cs
+@@ -11,17 +11,13 @@ namespace CoopBots.Kernel;
+ 
+ public sealed partial class KernelSession
+ {
+-    // Owner-requested Touch-only choice contract, 2026-10-11. The paid native
+-    // F28 witness selected DASH+ (filtered menu ordinal 4), retained ThisCombat
+-    // free cost and consumed its bottle. Its later terminal is not verified.
+-    // Other eight chooser bottles remain boundaries. All effect/lifecycle
+-    // stages below reuse native mirrors; this adapter owns recipient and tokens.
++    // Touch commits a bounded target-hand selection before it can execute.
+     public static bool RequiresPotionChoiceContract(PotionModel potion) => potion is TouchOfInsanity;
+ 
+     public IReadOnlyList<KernelTeamSearch.Action> PotionActions(PotionModel potion, Creature? target,
+         int maximumChoices = 10, IReadOnlyList<Player>? controlledActors = null)
+     {
+-        if (!RequiresPotionChoiceContract(potion))
++        if (!RequiresPotionChoiceContract(potion) && potion is not DistilledChaos)
+             return [new(potion.Owner, null, target, potion)];
+         return PotionBranches(potion, target, maximumChoices, controlledActors)
+             .Where(branch => branch.Boundary.Length == 0)
+@@ -32,6 +28,12 @@ public sealed partial class KernelSession
+     public IEnumerable<CardBranch> PotionBranches(PotionModel potion, Creature? target,
+         int maximumBranches = 10, IReadOnlyList<Player>? controlledActors = null)
+     {
++        if (potion is DistilledChaos)
++        {
++            foreach (var branch in ChaosPotionBranches(potion, target, maximumBranches))
++                yield return branch;
++            yield break;
++        }
+         if (maximumBranches <= 0 || KernelSearchBudgetScope.IsStopped) yield break;
+         if (potion is not TouchOfInsanity)
+         {
+@@ -79,6 +81,33 @@ public sealed partial class KernelSession
+         }
+     }
+ 
++    private IEnumerable<CardBranch> ChaosPotionBranches(PotionModel potion, Creature? target, int limit)
++    {
++        var pending = new Queue<int[]>();
++        pending.Enqueue([]);
++        var seen = new HashSet<string> { "" };
++        for (int i = 0; i < limit && pending.TryDequeue(out var vector); i++)
++        {
++            var branch = Fork();
++            branch.choiceOrdinals = vector;
++            branch.choicePosition = 0;
++            bool success = branch.UsePotion(potion, target, null, out var boundary);
++            var counts = branch.choiceCounts;
++            var used = Enumerable.Range(0, counts.Count).Select(j => j < vector.Length ? vector[j] : 0).ToArray();
++            KernelChoiceContinuation.EnqueueAlternatives(pending, seen, used, counts);
++            yield return new(branch, branch.resolvedChoices.ToArray(), success ? "" : boundary, used);
++        }
++    }
++
++    private static bool MatchesChaosChoice(KernelChoice a, KernelChoice b)
++        => a.Owner == b.Owner && a.Source == b.Source && a.Context == b.Context &&
++            a.Effect == b.Effect && a.Pile == b.Pile && a.Timing == b.Timing &&
++            a.NativeRound == b.NativeRound && a.PlayerTurnNumber == b.PlayerTurnNumber &&
++            a.Minimum == b.Minimum && a.Maximum == b.Maximum &&
++            a.RequestedMinimum == b.RequestedMinimum && a.RequestedMaximum == b.RequestedMaximum &&
++            a.MenuSource == b.MenuSource && a.Options is not null && b.Options is not null &&
++            a.Options.SequenceEqual(b.Options) && a.Cards.SequenceEqual(b.Cards);
++
+     private IReadOnlyList<PredictedCard> TouchOptions(Creature? target)
+         => simulator.State.GetPlayerCombatState(target!.Player!).Hand.Cards.Where(card =>
+             card.Preview.CostsEnergyOrStars(includeGlobalModifiers: false)
+@@ -113,8 +142,7 @@ public sealed partial class KernelSession
+         if (!CanAct(potion.Owner)) { boundary = "owner-ended"; return false; }
+         if (target?.Player is null || !Combat.Creatures.Contains(target) || Hp(target) <= 0
+             || !potion.IsValidTarget(target)) { boundary = "potion-target-invalid"; return false; }
+-        simulated = FindCapturedPotion(potion);
+-        var slot = simulated is null ? -1 : SimulatedPotionSlot(simulated);
++        simulated = FindCapturedPotion(potion, out int slot);
+         if (slot < 0) { boundary = "potion-not-captured"; return false; }
+         historyStart = simulator.History.Entries.Count;
+         failedBoundary = "incomplete-action";
+@@ -173,6 +201,6 @@ public sealed partial class KernelSession
+         }
+         catch (Exception error)
+         { boundary = failedBoundary = "potion-exception:" + error.GetType().Name; return false; }
+-        return FinishPotionEvidence(source, out boundary);
++        return FinishActionEvidence("OnUse", source.Id.Entry, out boundary);
+     }
+ }
+diff --git a/src/CoopBots.Kernel/KernelSession.Evaluation.cs b/src/CoopBots.Kernel/KernelSession.Evaluation.cs
+index c0258ca208d5ff27fa6572f1dc5116b91c47a2d4..e202fef807474be5e2d20ee144e0eddcca5f1325 100644
+--- a/src/CoopBots.Kernel/KernelSession.Evaluation.cs
++++ b/src/CoopBots.Kernel/KernelSession.Evaluation.cs
+@@ -199,23 +199,8 @@ public sealed partial class KernelSession
+     public string StateText(Player player)
+     {
+         if (player.PlayerCombatState is null) throw new InvalidOperationException("Player has no combat state.");
+-        IntentForecast forecast;
+-        try { forecast = IntentForecaster.Build(liveRoot ?? throw new InvalidOperationException(), 1); }
+-        catch
+-        {
+-            forecast = new IntentForecast
+-            {
+-                Rounds = [], HasUnsupportedIntent = true, IsExactForModeledDamage = false,
+-                UnsupportedDetails = [], ApproximationDetails = [], MonsterAiCountersByRound = [],
+-            };
+-        }
+-        // The branch's OWN turn number, never the live PlayerCombatState's. This render
+-        // happens right after the search finishes, while the live board is still on the
+-        // old turn, and deployment compares it after the boundary has been crossed — so
+-        // reading the live value here guaranteed `field=turn` drift on the first step past
+-        // every crossing. See KernelSession.TurnNumber.
+         return ContinuationStamp.CapturePredicted(
+-            player, simulator, Combat.GetPlayerTurnNumber(player), forecast, Combat.GetRootPlayerTurnNumber(player)).StateText;
++            player, simulator, Combat.GetPlayerTurnNumber(player)).StateText;
+     }
+     public bool SandpitDeath(Creature target) => Combat.EffectivePowers().OfType<SandpitPower>()
+         .Any(p => p.Target == target && p.Amount <= 1 && Hp(p.Owner) > 0);
+diff --git a/src/CoopBots.Kernel/KernelSession.Potions.cs b/src/CoopBots.Kernel/KernelSession.Potions.cs
+new file mode 100644
+index 0000000000000000000000000000000000000000..d7474841571f9c3201bbcc4a5d85a09918429b4c
+--- /dev/null
++++ b/src/CoopBots.Kernel/KernelSession.Potions.cs
+@@ -0,0 +1,315 @@
++using MegaCrit.Sts2.Core.Combat;
++using MegaCrit.Sts2.Core.Entities.Cards;
++using MegaCrit.Sts2.Core.Entities.Creatures;
++using MegaCrit.Sts2.Core.Entities.Players;
++using MegaCrit.Sts2.Core.Entities.Potions;
++using MegaCrit.Sts2.Core.Models;
++using MegaCrit.Sts2.Core.Models.Potions;
++using CoopBots.Kernel.Vendor;
++using CoopBots.Kernel.Vendor.Engine.Common;
++using CoopBots.Kernel.Vendor.Engine.InCombat.Simulation;
++using CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Potions.OnUse;
++
++namespace CoopBots.Kernel;
++
++public sealed partial class KernelSession
++{
++    private sealed record PotionInventory(int Capacity, bool CanUse, PotionModel[] Originals,
++        HashSet<PotionModel> Usable);
++
++    // Frozen at live capture time and shared by every fork. Simulated slot contents
++    // still belong to the fork and are checked by physical bottle identity.
++    private sealed record PotionSnapshot(
++        IReadOnlyDictionary<PotionModel, (int Slot, PotionModel Captured)> Slots,
++        IReadOnlyDictionary<Player, PotionInventory> Inventories,
++        IReadOnlyDictionary<PotionModel, IReadOnlyDictionary<string, decimal>> Values,
++        IReadOnlyDictionary<PotionModel, IReadOnlyDictionary<Creature, bool>> TargetRules)
++    {
++        internal static readonly PotionSnapshot Empty = new(
++            new Dictionary<PotionModel, (int, PotionModel)>(),
++            new Dictionary<Player, PotionInventory>(),
++            new Dictionary<PotionModel, IReadOnlyDictionary<string, decimal>>(),
++            new Dictionary<PotionModel, IReadOnlyDictionary<Creature, bool>>());
++    }
++
++    private PotionSnapshot potionSnapshot = PotionSnapshot.Empty;
++
++    private static PotionSnapshot CapturePotions(CombatState live, SimulatedCombatState combat)
++    {
++        var slots = live.Players.SelectMany(player => Enumerable.Range(0, player.PotionSlots.Count)
++            .Where(slot => player.GetPotionAtSlotIndex(slot) is not null)
++            .Select(slot => (Original: player.GetPotionAtSlotIndex(slot)!, Slot: slot,
++                Captured: combat.GetPotionAtSlot(player, slot)!)))
++            .ToDictionary(row => row.Original, row => (row.Slot, row.Captured));
++
++        var inventories = live.Players.ToDictionary(player => player, player =>
++        {
++            var originals = player.Potions.ToArray();
++            return new PotionInventory(player.MaxPotionCount, player.CanUseOrRemovePotions, originals,
++                originals.Where(p => !p.IsQueued && !p.HasBeenRemovedFromState && p.PassesCustomUsabilityCheck
++                    && p.Usage is PotionUsage.CombatOnly or PotionUsage.AnyTime).ToHashSet());
++        });
++
++        var values = slots.Keys.ToDictionary(p => p,
++            p => (IReadOnlyDictionary<string, decimal>)p.DynamicVars.Values.ToDictionary(v => v.Name, v => v.BaseValue));
++        var targets = slots.Keys.ToDictionary(p => p,
++            p => (IReadOnlyDictionary<Creature, bool>)live.Creatures.ToDictionary(c => c, p.IsValidTarget));
++        return new(slots, inventories, values, targets);
++    }
++
++    private PotionModel? FindCapturedPotion(PotionModel original) => FindCapturedPotion(original, out _);
++
++    private PotionModel? FindCapturedPotion(PotionModel original, out int slot)
++    {
++        var captured = original;
++        if (potionSnapshot.Slots.TryGetValue(original, out var entry))
++            (slot, captured) = entry;
++        else
++            slot = GeneratedPotionSlot(original);
++
++        if (captured is not null && slot >= 0 && ReferenceEquals(Combat.GetPotionAtSlot(original.Owner, slot), captured))
++            return captured;
++        slot = -1;
++        return null;
++    }
++
++    internal int RecordedPotionSlot(PotionModel potion)
++        => potionSnapshot.Slots.TryGetValue(potion, out var entry) ? entry.Slot : GeneratedPotionSlot(potion);
++
++    internal static int GeneratedPotionSlot(PotionModel potion) => SimulatedCombatState.GeneratedPotionSlot(potion);
++
++    internal PotionModel? PotionAtSlot(Player player, int slot)
++    {
++        var potion = Combat.GetPotionAtSlot(player, slot);
++        if (potion is null || !potionSnapshot.Inventories.TryGetValue(player, out var inventory)) return null;
++        foreach (var original in inventory.Originals)
++            if (potionSnapshot.Slots.TryGetValue(original, out var entry) &&
++                entry.Slot == slot && ReferenceEquals(entry.Captured, potion))
++                return original;
++        return GeneratedPotionSlot(potion) == slot ? potion : null;
++    }
++
++    public int PotionCapacity(Player player) => potionSnapshot.Inventories.TryGetValue(player, out var inventory) ? inventory.Capacity : 0;
++    public bool CanUsePotions(Player player) => potionSnapshot.Inventories.TryGetValue(player, out var inventory) && inventory.CanUse;
++    internal IReadOnlyList<PotionModel> CapturedPotions(Player player)
++        => potionSnapshot.Inventories.TryGetValue(player, out var inventory) ? inventory.Originals : [];
++    internal decimal PotionValue(PotionModel potion, string variable)
++        => potionSnapshot.Values.TryGetValue(potion, out var values) && values.TryGetValue(variable, out var value)?value:
++            GeneratedPotionSlot(potion)>=0 && potion.DynamicVars.TryGetValue(variable,out var generated)
++                ?generated.BaseValue:0;
++    public int HeldPotionCount(Player player) => Enumerable.Range(0, PotionCapacity(player))
++        .Count(slot => Combat.GetPotionAtSlot(player, slot) is not null);
++    public bool HoldsPotion(PotionModel potion) => FindCapturedPotion(potion) is not null;
++    public IReadOnlyList<PotionModel> UsablePotions(Player player)
++    {
++        if(!potionSnapshot.Inventories.TryGetValue(player,out var inventory))return [];
++        var potions=new List<PotionModel>(inventory.Originals.Length);
++        for(int slot=0;slot<inventory.Capacity;slot++)
++        {
++            if(PotionAtSlot(player,slot) is not {} potion)continue;
++            if(inventory.Usable.Contains(potion) || inventory.CanUse && GeneratedPotionSlot(potion)>=0 &&
++                potion.GetType().Assembly==typeof(PotionModel).Assembly &&
++                potion.Usage is PotionUsage.CombatOnly or PotionUsage.AnyTime)
++                potions.Add(potion);
++        }
++        return potions;
++    }
++    /// <summary>
++    /// Whether the built-in kernel can replay this bottle, including its selection contract.
++    /// </summary>
++    public static bool CanModelPotion(PotionModel potion)
++        => RequiresPotionChoiceContract(potion)
++            || PotionOnUseMirrors.CanMirror(potion) && !PotionChoiceSupport.RequiresChoice(potion);
++
++    public IReadOnlyList<Creature?> PotionTargets(PotionModel potion)
++    {
++        bool generated=GeneratedPotionSlot(potion)>=0;
++        bool Allowed(Creature target)
++        {
++            if(generated)return Hp(target)>0;
++            // Native target rules may read IsAlive. Freeze their answers for
++            // native identities on Capture's thread; later summons are private
++            // simulated creatures and can still use the native rule directly.
++            if (potionSnapshot.TargetRules.TryGetValue(potion, out var targets) && targets.TryGetValue(target, out var allowed))
++                return allowed;
++            return potion.IsValidTarget(target);
++        }
++        switch (generated && potion is FoulPotion?TargetType.AllEnemies:potion.TargetType)
++        {
++            case TargetType.AllEnemies:
++                return [null];
++            case TargetType.AnyEnemy:
++                return Enemies.Where(Allowed).Cast<Creature?>().ToArray();
++            case TargetType.AnyPlayer:
++                return Combat.Players.Where(p => Hp(p.Creature) > 0 && Allowed(p.Creature))
++                    .Select(p => (Creature?)p.Creature).ToArray();
++            case TargetType.Self:
++                return Hp(potion.Owner.Creature) > 0 ? [potion.Owner.Creature] : [];
++            default:
++                return [];
++        }
++    }
++
++    /// <summary>
++    /// Uses a potion inside this branch. Potions are free actions, so a potion
++    /// that turns a non-lethal turn into a confirmed kill can be evaluated and
++    /// confirmed by the same engine that plans the cards.
++    /// </summary>
++    public bool UsePotion(PotionModel potion, Creature? target, out string boundary)
++    {
++        if (potion is DistilledChaos)
++        {
++            choiceOrdinals = [];
++            choicePosition = 0;
++        }
++        return UsePotion(potion, target, null, out boundary);
++    }
++
++    private bool UsePotion(PotionModel potion, Creature? target, IReadOnlyList<KernelChoice>? choices, out string boundary)
++    {
++        LastTurnStartChoices = null;
++        if (RequiresPotionChoiceContract(potion)) return UseTouch(potion, target, choices, out boundary);
++        if (SupportsPotionSelection(potion) && (choices is { Count: > 0 } || MenuSelector is not null))
++            return UseSelectedPotion(potion, target, choices, out boundary);
++        using var isolation = SimulationNotificationIsolation.Enter();
++        if (failedBoundary is not null) { boundary = failedBoundary; return false; }
++        if (!CanAct(potion.Owner)) { boundary = "owner-ended"; return false; }
++        // A host can supply choice support before entering the built-in potion lifecycle.
++        if (PotionChoiceSupport.RequiresChoice(potion))
++        { boundary = "potion-choice-unmodeled"; return false; }
++        failedBoundary = "incomplete-action";
++        try
++        {
++            var simulated = FindCapturedPotion(potion, out int slot);
++            if (simulated is null)
++            { boundary = failedBoundary = "potion-not-captured"; return false; }
++
++            var potionHistoryStart = simulator.History.Entries.Count;
++            Combat.BeginActionChoices(ChoiceCursor(potion.Owner));
++            try
++            {
++                if (!PotionExecutionSupport.Prepare(simulator, Combat, simulated, slot, target)
++                    || !PotionExecutionSupport.Complete(simulator, Combat, simulated, target, null,
++                        potionHistoryStart, processedDeaths))
++                { boundary = failedBoundary = "pending-choice"; return false; }
++                if (!CombatBeamSolver.SettleReplayActionBoundary(simulator, Combat))
++                { boundary = failedBoundary = "pending-boundary"; return false; }
++            }
++            finally { Combat.EndActionChoices(); }
++            simulator.CheckWinCondition(Combat.GetPlayerTurnNumber(potion.Owner));
++        }
++        catch (Exception error)
++        {
++            boundary = failedBoundary = "potion-exception:" + error.GetType().Name;
++            return false;
++        }
++        return FinishActionEvidence("OnUse", potion.Id.Entry, out boundary);
++    }
++
++    /// <summary>Whether a recorded player selection can complete this potion.</summary>
++    public static bool SupportsPotionSelection(PotionModel potion)
++        => potion is GamblersBrew or Ashwater or DropletOfPrecognition or LiquidMemories
++            || PotionChoiceSupport.GeneratesCardChoice(potion);
++
++    private bool UseSelectedPotion(PotionModel potion, Creature? target,
++        IReadOnlyList<KernelChoice>? choices, out string reason)
++    {
++        var owner = potion.Owner;
++        var recipient = target?.Player;
++        if (!CanFork || !CanAct(owner) || recipient is null ||
++            !Party.Contains(recipient) || !potion.IsValidTarget(target) ||
++            Hp(recipient.Creature) <= 0 || FindCapturedPotion(potion, out int slot) is not { } native)
++        {
++            reason = "药水或目标已变化";
++            return false;
++        }
++        using var isolation = SimulationNotificationIsolation.Enter();
++        int history = simulator.History.Entries.Count;
++        failedBoundary = "incomplete-action";
++        try
++        {
++            Combat.BeginActionChoices(ChoiceCursor(owner));
++            try
++            {
++                if(!PotionExecutionSupport.Prepare(simulator, Combat, native, slot, target))
++                {reason=failedBoundary="药水选牌前未结算";return false;}
++                var spec = BuildPotionMenu(simulator, native, recipient);
++                var request=new TurnStartChoiceRequest(potion.Id.Entry,spec.Effect,spec.SourcePile,spec.MaxCount,spec,MenuSource:potion.Id.Entry);
++                var selected = MenuSelector?.Invoke(request, recipient, KernelMenuKind.Potion);
++                var cards=selected!=null?
++                    TurnStartChoiceSupport.ResolveTokens(selected,spec.Options,
++                        Math.Min(spec.MinCount,spec.Options.Count),Math.Min(spec.MaxCount,spec.Options.Count)):
++                    ResolveRecorded(choices,spec,recipient,potion.Id.Entry);
++                if(cards==null){reason=failedBoundary="药水选牌与记录不一致";return false;}
++                if(!ApplyPotionSelection(simulator, Combat, owner, spec.Effect, cards) ||
++                    !PotionExecutionSupport.Complete(simulator, Combat, native, target, null, history, processedDeaths) ||
++                    !CombatBeamSolver.SettleReplayActionBoundary(simulator, Combat))
++                {reason=failedBoundary="药水选牌或结算与记录不一致";return false;}
++            }
++            finally{Combat.EndActionChoices();}
++            simulator.CheckWinCondition(Combat.GetPlayerTurnNumber(owner));
++            return FinishActionEvidence("OnUse", potion.Id.Entry, out reason);
++        }
++        catch(Exception error) when(error is InvalidOperationException or ArgumentException or NotSupportedException)
++        {reason=failedBoundary="药水选牌："+error.GetBaseException().Message;return false;}
++    }
++
++    private static CardChoiceSpec BuildPotionMenu(CombatPredictionSimulator simulator,PotionModel potion,Player recipient)
++    {
++        if(PotionChoiceSupport.GeneratesCardChoice(potion))return PotionChoiceSupport.GetSpec(simulator,potion);
++        var (effect,pile,arbitrary)=potion switch
++        {
++            GamblersBrew=>(PlanChoiceEffect.DiscardAndDraw,PileType.Hand,true),
++            Ashwater=>(PlanChoiceEffect.Exhaust,PileType.Hand,true),
++            DropletOfPrecognition=>(PlanChoiceEffect.MoveToHand,PileType.Draw,false),
++            LiquidMemories=>(PlanChoiceEffect.MoveToHandFreeThisTurn,PileType.Discard,false),
++            _=>throw new InvalidOperationException(potion.Id.Entry)
++        };
++        var cards=simulator.State.GetPlayerCombatState(recipient).GetCardPile(pile)!.Cards;
++        return new(effect,pile,arbitrary?0:1,arbitrary?cards.Count:1,cards,cards,0);
++    }
++
++    private static IReadOnlyList<PredictedCard>? ResolveRecorded(IReadOnlyList<KernelChoice>? choices,CardChoiceSpec spec,
++        Player recipient,string source)
++    {
++        var receipt=choices?.FirstOrDefault(choice=>choice.Owner==recipient.NetId && choice.Source==source &&
++            choice.Pile==spec.SourcePile && choice.Effect==spec.Effect.ToString());
++        var selected=receipt?.ResolveMenu(recipient.NetId,spec.Options.Select(c=>c.Preview).ToArray(),
++            spec.MinCount,spec.MaxCount,source);
++        return selected?.Select(card=>spec.Options.Single(option=>ReferenceEquals(option.Preview,card))).ToArray();
++    }
++
++    private static bool ApplyPotionSelection(CombatPredictionSimulator simulator,SimulatedCombatState combat,Player creator,
++        PlanChoiceEffect effect,IReadOnlyList<PredictedCard> cards)
++    {
++        if(cards.Count==0)return true;
++        switch(effect)
++        {
++            case PlanChoiceEffect.DiscardAndDraw:
++                simulator.DiscardAndDraw(cards,cards.Count);
++                break;
++            case PlanChoiceEffect.Exhaust:
++                foreach(var card in cards)
++                {
++                    simulator.Exhaust(card);
++                    if(!CombatBeamSolver.SettleReplayActionBoundary(simulator,combat))return false;
++                }
++                break;
++            case PlanChoiceEffect.MoveToHandFreeThisTurn:
++                foreach(var card in cards)card.SetToFreeThisTurn();
++                simulator.AddToPile(cards,PileType.Hand);
++                break;
++            case PlanChoiceEffect.MoveToHand:
++                simulator.AddToPile(cards,PileType.Hand);
++                break;
++            case PlanChoiceEffect.GenerateToHand:
++                var generated=cards.Select(card=>card.Clone()).ToArray();
++                foreach(var card in generated)card.SetToFreeThisTurn();
++                simulator.AddGeneratedCardsToCombat(generated,PileType.Hand,creator,CardPilePosition.Bottom,CardGenerationResultKind.Random);
++                break;
++            default:
++                throw new InvalidOperationException(effect.ToString());
++        }
++        return CombatBeamSolver.SettleReplayActionBoundary(simulator,combat);
++    }
++}
+diff --git a/src/CoopBots.Kernel/KernelSession.cs b/src/CoopBots.Kernel/KernelSession.cs
+index 81a1492bd9beff31e72d83e50bcad7a91eaa2aa6..03048731e290d3c3ad31bfa577e5469ba369a1d8 100644
+--- a/src/CoopBots.Kernel/KernelSession.cs
++++ b/src/CoopBots.Kernel/KernelSession.cs
+@@ -3,13 +3,11 @@ using MegaCrit.Sts2.Core.Combat;
+ using MegaCrit.Sts2.Core.Entities.Cards;
+ using MegaCrit.Sts2.Core.Entities.Creatures;
+ using MegaCrit.Sts2.Core.Entities.Players;
+-using MegaCrit.Sts2.Core.Entities.Potions;
+ using MegaCrit.Sts2.Core.Models;
+ using MegaCrit.Sts2.Core.Models.Cards;
+ using MegaCrit.Sts2.Core.Models.Powers;
+ using CoopBots.Kernel.Vendor;
+ using CoopBots.Kernel.Vendor.Engine.Common;
+-using CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Potions.OnUse;
+ using CoopBots.Kernel.Vendor.Engine.InCombat.Simulation;
+ 
+ namespace CoopBots.Kernel;
+@@ -18,25 +16,6 @@ public sealed partial class KernelSession
+ {
+     public static long LiveRevision => KernelIsolation.LiveRevision;
+ 
+-    /// <summary>
+-    /// The simulated slot holding this branch's clone of a potion, or -1.
+-    /// </summary>
+-    /// <remarks>
+-    /// PotionExecutionSupport.Prepare takes a SLOT (it consumes the bottle by index), and
+-    /// our branch API carries the PotionModel instead. Scanning the slots keeps the
+-    /// upstream path intact rather than re-deriving the consume from the model.
+-    /// </remarks>
+-    private int SimulatedPotionSlot(PotionModel simulated)
+-    {
+-        var owner = simulated.Owner;
+-        // Native Player.GetPotionSlotIndex scans the slot list, including holes.
+-        // Counting bottles instead hid slot 2 after slot 0 was spent: V10 live
+-        // predicted a death but could never model the remaining CureAll there.
+-        for (var slot = 0; slot < owner.PotionSlots.Count; slot++)
+-            if (ReferenceEquals(Combat.GetPotionAtSlot(owner, slot), simulated)) return slot;
+-        return -1;
+-    }
+-
+     /// <summary>
+     /// Per-turn attack count for one creature in THIS branch.
+     /// </summary>
+@@ -86,11 +65,25 @@ public sealed partial class KernelSession
+     /// </summary>
+     public string PartyStateText()
+     {
+-        // The live root supplies the party ORDER on both sides. Without it a branch would
+-        // have to invent an order, and an order difference would read as a state
+-        // difference — the same class of bug this method exists to remove.
++        var text = new StringBuilder();
++        AppendPredictedPartyText(text);
++        return text.ToString();
++    }
++
++    private void AppendPredictedPartyText(StringBuilder text)
++    {
+         if (liveRoot is null) throw new InvalidOperationException("Branch has no live root to order the party by.");
+-        return PartyText(liveRoot.Players, StateText);
++        var players = liveRoot.Players;
++        var shared = players.Count > 1
++            ? ContinuationStamp.CapturePredictedPartyFields(simulator)
++            : ((string Enemies, string Mechanics)?)null;
++        foreach (var player in players)
++        {
++            if (player.PlayerCombatState is null) throw new InvalidOperationException("Player has no combat state.");
++            text.Append('p').Append(player.NetId).Append('{');
++            ContinuationStamp.AppendPredictedPlayer(text, player, simulator, Combat.GetPlayerTurnNumber(player), shared);
++            text.Append("}\n");
++        }
+     }
+ 
+     /// <summary>
+@@ -296,26 +289,6 @@ public sealed partial class KernelSession
+     /// their evaluator prices it. See CombatSolverRoute.
+     /// </summary>
+     internal CombatPredictionSimulator Simulator => simulator;
+-    // Physical potion identity is captured once. Vendor FindPotion matches only
+-    // owner+model ID, which aliases duplicate bottles. Forkable potion slots
+-    // preserve their captured model references; a replacement at the same slot
+-    // must not resurrect an already consumed original. Live removal is harmless
+-    // to an older frozen root because neither lookup reads the live belt again.
+-    private IReadOnlyDictionary<PotionModel, (int Slot, PotionModel Captured)> capturedPotions
+-        = new Dictionary<PotionModel, (int, PotionModel)>();
+-    private sealed record PotionInventory(int Capacity, bool CanUse, PotionModel[] Originals,
+-        HashSet<PotionModel> Usable);
+-    // Native usability can invoke run hooks. Evaluate it on Capture's game
+-    // thread, once; a frozen worker must never enumerate a changing live belt.
+-    private IReadOnlyDictionary<Player, PotionInventory> potionInventories = new Dictionary<Player, PotionInventory>();
+-    private IReadOnlyDictionary<PotionModel, IReadOnlyDictionary<string, decimal>> potionValues
+-        = new Dictionary<PotionModel, IReadOnlyDictionary<string, decimal>>();
+-    private IReadOnlyDictionary<PotionModel, IReadOnlyDictionary<Creature, bool>> potionTargetRules
+-        = new Dictionary<PotionModel, IReadOnlyDictionary<Creature, bool>>();
+-    private PotionModel? FindCapturedPotion(PotionModel original)
+-        => capturedPotions.TryGetValue(original, out var entry)
+-            && ReferenceEquals(Combat.GetPotionAtSlot(original.Owner, entry.Slot), entry.Captured)
+-                ? entry.Captured : null;
+     private KernelSession(CombatPredictionSimulator simulator, HashSet<uint> deaths,
+         CombatState? liveRoot = null, int rootTurnNumber = 0)
+     { this.simulator = simulator; processedDeaths = deaths; this.liveRoot = liveRoot; this.rootTurnNumber = rootTurnNumber; }
+@@ -346,21 +319,7 @@ public sealed partial class KernelSession
+             ready = live.Players.Where(CombatManager.Instance.IsPlayerReadyToEndTurn).Select(p => p.NetId).ToHashSet(),
+             extraTurnParticipants = CombatManager.Instance.PlayersTakingExtraTurn.Select(p => p.NetId).ToHashSet()
+         };
+-        session.capturedPotions = live.Players.SelectMany(player => Enumerable.Range(0, player.PotionSlots.Count)
+-            .Where(slot => player.GetPotionAtSlotIndex(slot) is not null)
+-            .Select(slot => (Original: player.GetPotionAtSlotIndex(slot)!, Slot: slot,
+-                Captured: session.Combat.GetPotionAtSlot(player, slot)!)))
+-            .ToDictionary(row => row.Original, row => (row.Slot, row.Captured));
+-        session.potionInventories = live.Players.ToDictionary(player => player, player => {
+-            var originals = player.Potions.ToArray();
+-            return new PotionInventory(player.MaxPotionCount, player.CanUseOrRemovePotions, originals,
+-                originals.Where(p => !p.IsQueued && !p.HasBeenRemovedFromState && p.PassesCustomUsabilityCheck
+-                    && p.Usage is PotionUsage.CombatOnly or PotionUsage.AnyTime).ToHashSet());
+-        });
+-        session.potionValues = session.capturedPotions.Keys.ToDictionary(p => p,
+-            p => (IReadOnlyDictionary<string, decimal>)p.DynamicVars.Values.ToDictionary(v => v.Name, v => v.BaseValue));
+-        session.potionTargetRules = session.capturedPotions.Keys.ToDictionary(p => p,
+-            p => (IReadOnlyDictionary<Creature, bool>)live.Creatures.ToDictionary(c => c, p.IsValidTarget));
++        session.potionSnapshot = CapturePotions(live, session.Combat);
+         session.VerifyProjection(live);
+         return session;
+     }
+@@ -415,13 +374,11 @@ public sealed partial class KernelSession
+         if (failedBoundary is not null) throw new InvalidOperationException("Cannot fork incomplete action: " + failedBoundary);
+         using var isolation = SimulationNotificationIsolation.Enter();
+         return new(simulator.Fork(), new(processedDeaths), liveRoot, rootTurnNumber) { ready = new(ready), extraTurnParticipants = new(extraTurnParticipants),
+-            capturedPotions = capturedPotions,
+-            potionInventories = potionInventories,
+-            potionValues = potionValues,
+-            potionTargetRules = potionTargetRules,
++            potionSnapshot = potionSnapshot,
+             synchronousChoicePlayers = new(synchronousChoicePlayers),
+             EnemyPhaseCompleted = EnemyPhaseCompleted, HorizonClosed = HorizonClosed,
+             LastActionHadEnvironmentalRisk = LastActionHadEnvironmentalRisk,
++            LastActionRiskDetail = LastActionRiskDetail,
+             ProjectionDifferences = ProjectionDifferences.ToArray(),
+             AutoResolveEnemyChoices = AutoResolveEnemyChoices,
+             AutoResolveTurnStartChoices = AutoResolveTurnStartChoices,
+@@ -576,50 +533,6 @@ public sealed partial class KernelSession
+     public IReadOnlyList<CardModel> DrawPile(Player player) => simulator.State.GetPlayerCombatState(player).DrawPile.Cards.Select(c => c.Original).ToArray();
+     public int OrbCount(Player player) => simulator.State.GetPlayerCombatState(player).OrbQueue.Orbs.Count;
+     public bool HasOsty(Player player) => Combat.GetOsty(player) is not null;
+-    public int PotionCapacity(Player player) => potionInventories.TryGetValue(player, out var inventory) ? inventory.Capacity : 0;
+-    public bool CanUsePotions(Player player) => potionInventories.TryGetValue(player, out var inventory) && inventory.CanUse;
+-    internal IReadOnlyList<PotionModel> CapturedPotions(Player player)
+-        => potionInventories.TryGetValue(player, out var inventory) ? inventory.Originals : [];
+-    internal decimal PotionValue(PotionModel potion, string variable)
+-        => potionValues.TryGetValue(potion, out var values) && values.TryGetValue(variable, out var value) ? value : 0;
+-    public int HeldPotionCount(Player player) => Enumerable.Range(0, PotionCapacity(player))
+-        .Count(slot => Combat.GetPotionAtSlot(player, slot) is not null);
+-    public bool HoldsPotion(PotionModel potion) => FindCapturedPotion(potion) is not null;
+-    public IReadOnlyList<PotionModel> UsablePotions(Player player)
+-        => potionInventories.TryGetValue(player, out var inventory)
+-            ? inventory.Originals.Where(p => inventory.Usable.Contains(p) && FindCapturedPotion(p) is not null).ToArray() : [];
+-    /// <summary>
+-    /// Whether the kernel can simulate this potion COMPLETELY. A potion with no mirrored
+-    /// OnUse is rejected by every branch, so the search can never pick it; the planner
+-    /// reports these by name instead of leaving a full slot unexplained in the log.
+-    /// </summary>
+-    /// <remarks>
+-    /// "Mirrored" is not "modelled", and conflating the two cost a whole class of live
+-    /// desyncs. The four CHOOSER potions (Attack/Skill/Power/Colorless) DO have a mirror, but
+-    /// it is explicitly half a model: <c>CardGenerationPotionMirrors</c> returns
+-    /// <c>AddsToHand: false</c> and its own docstring says the generated cards are produced
+-    /// "without … applying combat piles and hooks". So the search rolls the three cards and
+-    /// then plans the rest of the fight as if the bottle added NOTHING, while the live game
+-    /// adds whichever card the chooser picked.
+-    ///
+-    /// <para>
+-    /// Measured live 2026-09-20 (`SLIMES_WEAK`): live hand +1 (`BLOODLETTING`), the plan's step
+-    /// 4 (play the free card) never replayed, eleven `plan step drift` lines that were all that
+-    /// one displacement, and `plan step refused: card-left-hand` at step 12 — the
+-    /// `card-left-hand` family's root cause. Reporting these as modelable while they are only
+-    /// half-modelled is exactly the lying metric R5b exists against.
+-    /// </para>
+-    /// <para>
+-    /// Until the choice is captured, propagated and answered (a four-part feature), R4's
+-    /// standing policy applies: an unmodelled effect is a BOUNDARY, not something to plan
+-    /// across. So these report as unmodelable and the search refuses them; the standalone
+-    /// potion planner can still choose them outside a script.
+-    /// </para>
+-    /// </remarks>
+-    public static bool CanModelPotion(PotionModel potion)
+-        => RequiresPotionChoiceContract(potion)
+-            || PotionOnUseMirrors.CanMirror(potion) && !PotionChoiceSupport.RequiresChoice(potion);
+-
+     /// <summary>
+     /// The status card the player's next play would hand them, or null when no
+     /// enemy counts their plays or the counter is not yet at its last step. Only
+@@ -646,32 +559,6 @@ public sealed partial class KernelSession
+         }
+         return null;
+     }
+-    public IReadOnlyList<Creature?> PotionTargets(PotionModel potion)
+-    {
+-        bool Allowed(Creature target)
+-        {
+-            // Native target rules may read IsAlive. Freeze their answers for
+-            // native identities on Capture's thread; later summons are private
+-            // simulated creatures and can still use the native rule directly.
+-            if (potionTargetRules.TryGetValue(potion, out var targets) && targets.TryGetValue(target, out var allowed))
+-                return allowed;
+-            return potion.IsValidTarget(target);
+-        }
+-        switch (potion.TargetType)
+-        {
+-            case TargetType.AllEnemies:
+-                return [null];
+-            case TargetType.AnyEnemy:
+-                return Enemies.Where(Allowed).Cast<Creature?>().ToArray();
+-            case TargetType.AnyPlayer:
+-                return Combat.Players.Where(p => Hp(p.Creature) > 0 && Allowed(p.Creature))
+-                    .Select(p => (Creature?)p.Creature).ToArray();
+-            case TargetType.Self:
+-                return Hp(potion.Owner.Creature) > 0 ? [potion.Owner.Creature] : [];
+-            default:
+-                return [];
+-        }
+-    }
+     public bool CanPlay(CardModel source)
+     {
+         using var isolation = SimulationNotificationIsolation.Enter();
+@@ -750,126 +637,18 @@ public sealed partial class KernelSession
+         finally { Combat.EndActionChoices(); }
+         var requestedEnd = Combat.ConsumePlayerTurnEndRequest();
+         simulator.CheckWinCondition(Combat.GetPlayerTurnNumber(actingOwner));
+-        // Only the played card's own semantics must be fully modeled to trust the
+-        // action. An unknown enemy power/relic hook is an approximation, not a
+-        // reason to remove the card from the plan: rejecting those made the bots
+-        // refuse to attack enemies whose passive hooks the snapshot lacks.
+-        var gaps = PredictionCoverage.Collect(simulator).Where(gap => !gap.Compensated).ToArray();
+-        // `structural` used to empty this, which is what let an unmodelled card into a plan:
+-        // StructuralCardMirror prices "one declared power, granted to self or one ally" from
+-        // the card's own DynamicVars and then declares the action an estimate. That estimate
+-        // is not always good enough — measured live 2026-09-20, CONCOCT went through this path
+-        // into a 90-action route whose hand then diverged from reality (live hand 6 cards
+-        // against the plan's 5, the extra a generated AFTERIMAGE) and which was refused at
+-        // its turn boundary eighteen times in a row.
+-        //
+-        // Policy now: an unmodelled OnPlay is a BOUNDARY, exactly as upstream treats it. The
+-        // card is not played at all rather than played on a guess. The cost is real and
+-        // deliberate — the multiplayer support family (Blaze, Coordinate, Fade, …) stops
+-        // being used until each is actually modelled — and it is the conservative half of
+-        // "search once, then follow the script": a plan must not contain steps whose effect
+-        // the simulator only approximated.
+-        var blocking = gaps
+-            .Where(gap => gap.Method == "OnPlay" && gap.SourceId == source.Id.Entry)
+-            .ToArray();
+-        LastActionHadEnvironmentalRisk = gaps.Length > blocking.Length;
+-        LastActionRiskDetail = DescribeUncompensated(gaps, blocking);
+-        boundary = blocking.Length > 0 ? "prediction-risk:" + string.Join(";", blocking.Select(gap => gap.ToString())) : "";
+-        failedBoundary = boundary.Length > 0 ? boundary : null;
+-        if (boundary.Length == 0 && requestedEnd && !HasWon) return EndTurn(actingOwner, 1, out boundary);
+-        return boundary.Length == 0;
+-    }
+-
+-    /// <summary>
+-    /// Uses a potion inside this branch. Potions are free actions, so a potion
+-    /// that turns a non-lethal turn into a confirmed kill can be evaluated and
+-    /// confirmed by the same engine that plans the cards.
+-    /// </summary>
+-    public bool UsePotion(PotionModel potion, Creature? target, out string boundary)
+-        => UsePotion(potion, target, null, out boundary);
+-
+-    private bool UsePotion(PotionModel potion, Creature? target, IReadOnlyList<KernelChoice>? choices, out string boundary)
+-    {
+-        LastTurnStartChoices = null;
+-        if (RequiresPotionChoiceContract(potion)) return UseTouch(potion, target, choices, out boundary);
+-        using var isolation = SimulationNotificationIsolation.Enter();
+-        if (failedBoundary is not null) { boundary = failedBoundary; return false; }
+-        if (!CanAct(potion.Owner)) { boundary = "owner-ended"; return false; }
+-        // R4: a half-modelled effect is a BOUNDARY, not something to plan across. The four
+-        // CHOOSER potions generate their offer but never apply the pick (see CanModelPotion),
+-        // so a branch that used one would continue on a board that is wrong by exactly one
+-        // card — which is how `SLIMES_WEAK` desynchronised and finally refused at step 12.
+-        // SOFT refusal on purpose (`boundary =`, not `boundary = failedBoundary =`): nothing
+-        // about this session is broken, the action is simply not available to the search, and
+-        // marking the session failed would poison every other expansion off the same fork.
+-        // ANY potion that needs a CHOICE is not replayable here, and the engine already has the
+-        // predicate for that: `PotionChoiceSupport.RequiresChoice`. It covers the four card
+-        // generation potions AND the five pile/pick potions (Ashwater, DropletOfPrecognition,
+-        // GamblersBrew, LiquidMemories, TouchOfInsanity) — NINE, where this guard used to cover
+-        // only the first four.
+-        //
+-        // Why it matters: the search builds a potion action with NO choices
+-        // (`KernelTeamSearch`: `new Action(actor, null, target, potion)`) and UsePotion passes
+-        // `choice: null` to PotionExecutionSupport.Complete, so the plan can never say WHICH card
+-        // the potion should take. The live screen is answered by the generic `BotCardSelector`
+-        // instead, and when it picks differently the script's hand model diverges. Measured live
+-        // 2026-09-20 (A10 4-bot, SLIMES_NORMAL): DROPLET_OF_PRECOGNITION was used at step 16/52
+-        // ("pick 1 card from the draw pile into your hand" — `CardSelectCmd.FromCombatPile`), the
+-        // drift then read `D[2]`/`H[2] expected={POMMEL_STRIKE}`, and at step 36/52 the script
+-        // refused `card-left-hand` on POMMEL_STRIKE — the very card the potion should have moved.
+-        //
+-        // R4: an effect that cannot be replayed is a BOUNDARY, not something to plan across. The
+-        // standalone potion planner can still drink it outside a script.
+-        if (PotionChoiceSupport.RequiresChoice(potion))
+-        { boundary = "potion-choice-unmodeled"; return false; }
+-        failedBoundary = "incomplete-action";
+-        try
+-        {
+-            // The simulation owns cloned potions; map the live one to its clone.
+-            var simulated = FindCapturedPotion(potion);
+-            if (simulated is null)
+-            { boundary = failedBoundary = "potion-not-captured"; return false; }
+-            var slot = SimulatedPotionSlot(simulated);
+-            if (slot < 0)
+-            { boundary = failedBoundary = "potion-not-captured"; return false; }
+-            // The FULL potion lifecycle, not just its effect. Upstream drives a potion as
+-            // PotionExecutionSupport.Prepare + Complete (Expansion.cs:2638-2648); we called
+-            // `ManualUse` alone, which is OnUseWrapper and nothing else. That skipped
+-            // ConsumePotion (so the bottle stayed in the simulated inventory),
+-            // BeforePotionUsed and AfterPotionUsed (so "when a potion is used" relic and
+-            // power hooks never fired), SynchronizePowerAmountPredictionStates,
+-            // ResolvePowerAmountChanges and CompensateHistorySince — i.e. almost the whole
+-            // lifecycle, silently, on every potion the search ever considered.
+-            var potionHistoryStart = simulator.History.Entries.Count;
+-            Combat.BeginActionChoices(ChoiceCursor(potion.Owner));
+-            try
+-            {
+-                if (!PotionExecutionSupport.Prepare(simulator, Combat, simulated, slot, target)
+-                    || !PotionExecutionSupport.Complete(simulator, Combat, simulated, target, null,
+-                        potionHistoryStart, processedDeaths))
+-                { boundary = failedBoundary = "pending-choice"; return false; }
+-                if (!CombatBeamSolver.SettleReplayActionBoundary(simulator, Combat))
+-                { boundary = failedBoundary = "pending-boundary"; return false; }
+-            }
+-            finally { Combat.EndActionChoices(); }
+-            simulator.CheckWinCondition(Combat.GetPlayerTurnNumber(potion.Owner));
+-        }
+-        catch (Exception error)
+-        {
+-            boundary = failedBoundary = "potion-exception:" + error.GetType().Name;
+-            return false;
+-        }
+-        return FinishPotionEvidence(potion, out boundary);
++        bool settled = FinishActionEvidence("OnPlay", source.Id.Entry, out boundary);
++        if (settled && requestedEnd && !HasWon) return EndTurn(actingOwner, forcedTurnLimit, out boundary);
++        return settled;
+     }
+ 
+-    // Ordinary and selected Touch lifecycles share the exact original evidence gate.
+-    private bool FinishPotionEvidence(PotionModel potion, out string boundary)
++    private bool FinishActionEvidence(string method, string id, out string boundary)
+     {
+-        // Same rule as Play: only the potion's own OnUse must be modeled; other
+-        // unknowns are estimates and are surfaced through the risk flag.
++        // Missing action semantics block replay. Other unsupported mechanics are
++        // reported as environmental risk for this action.
+         var gaps = PredictionCoverage.Collect(simulator).Where(gap => !gap.Compensated).ToArray();
+         var blocking = gaps
+-            .Where(gap => gap.Method == "OnUse" && gap.SourceId == potion.Id.Entry)
++            .Where(gap => gap.Method == method && gap.SourceId == id)
+             .ToArray();
+         LastActionHadEnvironmentalRisk = gaps.Length > blocking.Length;
+         LastActionRiskDetail = DescribeUncompensated(gaps, blocking);
+diff --git a/src/CoopBots.Kernel/KernelTurns.cs b/src/CoopBots.Kernel/KernelTurns.cs
+index 4f89f9f1494bf72d0b9483102ed4897bff91c67b..3722836588dce6d2f97994cf31716222a18e46d7 100644
+--- a/src/CoopBots.Kernel/KernelTurns.cs
++++ b/src/CoopBots.Kernel/KernelTurns.cs
+@@ -44,9 +44,10 @@ public sealed partial class KernelSession
+     /// </summary>
+     private string? boundarySite;
+     public bool EnemyPhaseCompleted { get; private set; }
++    private int forcedTurnLimit = 1;
+     public string? LastRoundFailure { get; private set; }
+     private string? lastLoggedRoundFailure;
+-    public bool IsReady(Player player) => ready.Contains(player.NetId);
++    public bool IsReady(Player player) => ready.Contains(player.NetId) && !Combat.WasPlayerTurnReopened(player);
+     public bool CanAct(Player player) => !EnemyPhaseCompleted && !HasWon && !IsReady(player) && Hp(player.Creature) > 0;
+ 
+     // Readiness is per player; lifecycle hooks belong to the shared side boundary.
+@@ -64,6 +65,7 @@ public sealed partial class KernelSession
+         roundBoundary = null;
+         if (failedBoundary is not null) { boundary = failedBoundary; return false; }
+         if (!Combat.Players.Contains(player) || !CanAct(player)) { boundary = "already-ended"; return false; }
++        Combat.ClearReopenedPlayerTurn(player);
+         ready.Add(player.NetId);
+         boundary = "";
+         if (Combat.Players.Any(p => Hp(p.Creature) > 0 && !IsReady(p))) return true;
+@@ -200,6 +202,7 @@ public sealed partial class KernelSession
+             EnemyPhaseCompleted = false;
+             HorizonClosed = false;
+             ready.Clear();
++            Combat.ClearReopenedPlayerTurns();
+             // Native StartTurn readies dead seats and extra-turn nonparticipants
+             // after setup. Use settled branch HP: death prevention may have healed
+             // a seat, and its captured live object must not decide future readiness.
+@@ -379,6 +382,8 @@ public sealed partial class KernelSession
+     /// </summary>
+     private PlanCardChoice? AutomaticTurnStartChoice(TurnStartChoiceRequest request)
+     {
++        if (MenuSelector is { } select)
++            return select(request, request.Spec?.Options.FirstOrDefault()?.Preview.Owner, KernelMenuKind.TurnStart);
+         if (request.Spec is not { } spec) return null;
+         if (preparedPartyMenus is { Count: > 0 } party)
+         {
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/Common/MirroredHookListenerFilter.cs b/src/CoopBots.Kernel/Vendor/Engine/Common/MirroredHookListenerFilter.cs
+index f1614865d363fc5f0f3381b80c17831b28acb9f4..aa6eb26560d4887a212ffc611c0b2e94c6ed3d21 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/Common/MirroredHookListenerFilter.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/Common/MirroredHookListenerFilter.cs
+@@ -199,7 +199,7 @@ internal sealed class MirroredHookListenerFilter(bool enabled)
+         return Filter(source, ref layout);
+     }
+ 
+-    private static MirroredHookMask MaskFor(Type type)
++    internal static MirroredHookMask MaskFor(Type type)
+         => TypeParticipation.GetValue(type, static value => new Participation(Participates(value))).Mask;
+ 
+     private static MirroredHookMask Participates(Type type)
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/Common/Mirrors/MethodMirrorRegistry.cs b/src/CoopBots.Kernel/Vendor/Engine/Common/Mirrors/MethodMirrorRegistry.cs
+index 0fd7ed0f86f1d2b95faa19a31971059027854470..7dc07ac44674c5dd9cd583789309579d68b8f2c0 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/Common/Mirrors/MethodMirrorRegistry.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/Common/Mirrors/MethodMirrorRegistry.cs
+@@ -97,7 +97,7 @@ internal sealed class MethodMirrorRegistry<TBase, TContext>(MirrorMethodSpec met
+         // Exact type matching is intentional: derived models must be reviewed independently.
+         _registrations.Add(type, new LookupResult(
+             MirrorDispatchKind.Handled,
+-            (receiver, context) => handler((TModel)receiver, context)));
++            (receiver, context) => handler((TModel)receiver, context), handler.Method));
+     }
+ 
+     public void RegisterIgnored<TModel>()
+@@ -195,7 +195,7 @@ internal sealed class MethodMirrorRegistry<TBase, TContext>(MirrorMethodSpec met
+ 
+     public MirrorDispatchResult Invoke(TBase receiver, TContext context)
+     {
+-        var (kind, handler) = Lookup(receiver.GetType());
++        var (kind, handler, _) = Lookup(receiver.GetType());
+         if (kind is MirrorDispatchKind.NotOverridden or MirrorDispatchKind.Ignored)
+         {
+             return new MirrorDispatchResult(kind);
+@@ -320,7 +320,7 @@ internal sealed class MethodMirrorRegistry<TBase, TContext>(MirrorMethodSpec met
+ 
+     private readonly record struct LookupResult(
+         MirrorDispatchKind Kind,
+-        Action<TBase, TContext>? Handler);
++        Action<TBase, TContext>? Handler, MethodInfo? Implementation = null);
+ }
+ 
+ /// <summary>
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/CardIsPlayableMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/CardIsPlayableMirrors.cs
+index 8a1396bb6f4349135484b1241f0e160628aa3f12..46e644099b42bd544d07e5d4db9d239888b15c29 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/CardIsPlayableMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/CardIsPlayableMirrors.cs
+@@ -7,6 +7,7 @@ using MegaCrit.Sts2.Core.Models.Cards;
+ using CoopBots.Kernel.Vendor.Engine.Common;
+ using CoopBots.Kernel.Vendor.Engine.Common.Mirrors;
+ using CoopBots.Kernel.Vendor.Engine.InCombat.Simulation;
++using STS2RitsuLib.Models.Capabilities;
+ 
+ namespace CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Cards;
+ 
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/CardOnPlayMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/CardOnPlayMirrors.cs
+index 042e3b051c819e18b9891211af190b619035ad05..fd9b40f8d7a5151c59041281b9b01a6d2b4a39c2 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/CardOnPlayMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/CardOnPlayMirrors.cs
+@@ -3,6 +3,7 @@ using MegaCrit.Sts2.Core.Entities.Cards;
+ using MegaCrit.Sts2.Core.GameActions.Multiplayer;
+ using MegaCrit.Sts2.Core.Models;
+ using MegaCrit.Sts2.Core.Models.Cards;
++using MegaCrit.Sts2.Core.Models.Powers;
+ using CoopBots.Kernel.Vendor.Engine.Common;
+ using CoopBots.Kernel.Vendor.Engine.Common.Mirrors;
+ using CoopBots.Kernel.Vendor.Engine.InCombat.Simulation;
+@@ -73,6 +74,18 @@ internal static partial class CardOnPlayMirrors
+         var registry = new Registry(OnPlay);
+ 
+         registry.Register<HowlFromBeyond>(GeneralCardMirrors.GeneralAttackOnPlay);
++        registry.Register<OneForAll>((card, context) =>
++        {
++            var combat = (SimulatedCombatState)context.CombatState;
++            foreach (var player in combat.Players)
++                combat.Apply<OneForAllPower>(player.Creature, (int)card.DynamicVars["OneForAllPower"].BaseValue, card.Owner.Creature);
++        });
++        registry.Register<ImitationLearning>((card, context) =>
++            ((SimulatedCombatState)context.CombatState).ApplyImitationLearning(
++                card, context.TargetPlayer));
++        registry.Register<Tutor>((_, context) =>
++            ((SimulatedCombatState)context.CombatState).ResolveTutor(
++                context.Simulator, context.Card, context.TargetPlayer));
+         registry.Register<Mangle>(GeneralCardMirrors.GeneralAttackOnPlay);
+         registry.Register<IAmInvincible>(GeneralCardMirrors.GeneralBlockOnPlay);
+         registry.Register<AstralPulse>(BespokeCardMirrors.AstralPulseOnPlay);
+@@ -134,6 +147,9 @@ internal static partial class CardOnPlayMirrors
+         registry.Register<Dualcast>(OrbCardMirrors.DualcastOnPlay);
+         registry.Register<Fusion>(OrbCardMirrors.FusionOnPlay);
+         registry.Register<Glacier>(OrbCardMirrors.GlacierOnPlay);
++        registry.Register<Hibernate>(OrbCardMirrors.HibernateOnPlay);
++        registry.Register<Mimic>((card, context) => context.GainBlock(card.Owner.Creature,
++            context.Calculate(card.DynamicVars.CalculatedBlock), card.DynamicVars.CalculatedBlock.Props));
+         registry.Register<Glasswork>(OrbCardMirrors.GlassworkOnPlay);
+         registry.Register<IceLance>(OrbCardMirrors.IceLanceOnPlay);
+         registry.Register<Ignition>(OrbCardMirrors.IgnitionOnPlay);
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/OrbCardMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/OrbCardMirrors.cs
+index 0b34ba53f2194ab6a88fb37f71d455519e8a78de..a84bcccb4dc24a1d84b3cb0ecfbf762d2f3acb48 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/OrbCardMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Cards/OnPlay/OrbCardMirrors.cs
+@@ -110,6 +110,15 @@ internal static class OrbCardMirrors
+         context.Simulator.OrbChannel<GlassOrb>(card.Owner);
+     }
+ 
++    public static void HibernateOnPlay(Hibernate card, CardOnPlayMirrorContext context)
++    {
++        ((SimulatedCombatState)context.CombatState).ApplyPowerFromSource(typeof(HibernatePower),
++            card.Owner.Creature, 1, card.Owner.Creature, card);
++        if (context.Simulator.HasPendingChoice)
++            return;
++        context.Simulator.OrbChannel<FrostOrb>(card.Owner, card.DynamicVars.Repeat.IntValue);
++    }
++
+     public static void IceLanceOnPlay(IceLance card, CardOnPlayMirrorContext context)
+     {
+         context.AttackSingle();
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Attack/GigantificationPowerMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Attack/GigantificationPowerMirrors.cs
+index cd4452584f5337fb1eaf20a603f08bda83addba2..660987899435c875db20fb7f5b83f652df721e83 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Attack/GigantificationPowerMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Attack/GigantificationPowerMirrors.cs
+@@ -51,6 +51,10 @@ internal static class GigantificationPowerMirrors
+         return commandToModify is null || context.CardSource.References(commandToModify.ModelSource) ? 3 : 1;
+     }
+ 
++    // The attack command is the only field in this state, including after
++    // the final charge is consumed and the power leaves the effective list.
++    internal static bool IsSettledState(object value) => value is State { CommandToModify: null };
++
+     private static State GetState(GigantificationPower power, CombatMirrorContext context)
+     {
+         return context.StateStore.Get<State>(power);
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Block/ModifyBlockMultiplicativeMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Block/ModifyBlockMultiplicativeMirrors.cs
+index 9ca4134e2e22649203a085177d5ddd829d57f1af..c11d5f5d84d5829c803a2930804ab5e0901afa27 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Block/ModifyBlockMultiplicativeMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Block/ModifyBlockMultiplicativeMirrors.cs
+@@ -71,6 +71,9 @@ internal static class ModifyBlockMultiplicativeMirrors
+         return earlierEvents < power.Amount ? 2m : 1m;
+     }
+ 
++    private static bool IsUnscaledTarget(Creature target) =>
++        target != null && !target.IsPrimaryEnemy && !target.IsSecondaryEnemy;
++
+     private static decimal HandleMultiplayerScaling(
+         MultiplayerScalingModel _,
+         ModifyBlockMultiplicativeMirrorContext context)
+@@ -80,7 +83,7 @@ internal static class ModifyBlockMultiplicativeMirrors
+         // kernel to skip all defense. Mirror the native scaling instead: player
+         // block is unscaled, enemy block scales with the party size.
+         var target = context.Target;
+-        if (target != null && !target.IsPrimaryEnemy && !target.IsSecondaryEnemy) return 1m;
++        if (IsUnscaledTarget(target)) return 1m;
+         if (!context.Props.IsPoweredCardOrMonsterMoveBlock()) return 1m;
+         int playerCount = context.State.CombatState.Players.Count;
+         if (playerCount <= 2) return playerCount;
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/AfterCardGeneratedForCombatMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/AfterCardGeneratedForCombatMirrors.cs
+index c449110bd9b04dfa8d27c977a5155abcb78a4478..1581b6175cc21908d59ed9621afdde680153fcb9 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/AfterCardGeneratedForCombatMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/AfterCardGeneratedForCombatMirrors.cs
+@@ -85,7 +85,7 @@ internal static class AfterCardGeneratedForCombatMirrors
+ 
+     private static void HandleSoulboundPower(SoulboundPower power, AfterCardGeneratedForCombatMirrorContext context)
+     {
+-        if (context.Creator?.Creature != power.Applier ||
++        if (context.Creator is not { } creator || creator.Creature != power.Applier ||
+             context.PreviewCard is not Soul ||
+             power.Owner.Player is not { } player)
+         {
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/AfterCardPlayedMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/AfterCardPlayedMirrors.cs
+index f8ebc4ad366c54ed12c9ab8c86535bbcd44ed54f..544a336cfc48830b1aa85ea6f9b621bf53a25057 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/AfterCardPlayedMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/AfterCardPlayedMirrors.cs
+@@ -580,13 +580,16 @@ internal static class AfterCardPlayedMirrors
+         }
+     }
+ 
++    internal static int? GetEnrageIncrement(EnragePower power, CardModel card) =>
++        card.Type == CardType.Skill ? power.Amount : null;
++
+     private static void HandleEnragePower(EnragePower power, AfterCardPlayedMirrorContext context)
+     {
+-        if (context.PreviewCard.Type != CardType.Skill)
++        if (GetEnrageIncrement(power, context.PreviewCard) is not int amount)
+             return;
+         if (context.CombatState is not ICombatPredictionEffectSink effects)
+             throw new InvalidOperationException("激怒效果缺少可写的预测状态。");
+-        effects.ApplyPower(typeof(StrengthPower), power.Owner, power.Amount, power.Owner);
++        effects.ApplyPower(typeof(StrengthPower), power.Owner, amount, power.Owner);
+     }
+ 
+     private static void HandleGalvanicPower(GalvanicPower power, AfterCardPlayedMirrorContext context)
+@@ -633,12 +636,12 @@ internal static class AfterCardPlayedMirrors
+         ImitationLearningPower power,
+         AfterCardPlayedMirrorContext context)
+     {
+-        var state = context.StateStore.Get(power, () => new ImitationLearningPredictionState(power));
+-        if (state.Amount <= 0)
++        if (power.Amount <= 0)
+         {
+             return;
+         }
+ 
++        var state = context.StateStore.Get(power, static _ => new ImitationLearningPredictionState());
+         var index = state.CardAndClones.FindIndex(pair => pair.Card == context.Card);
+         if (index < 0)
+         {
+@@ -648,7 +651,8 @@ internal static class AfterCardPlayedMirrors
+         var clone = state.CardAndClones[index].Clone;
+         state.CardAndClones.RemoveAt(index);
+ 
+-        state.Amount--;
++        if (HookMirrors.ShouldPlay(context.Simulator, clone, out _, AutoPlayType.Default))
++            ((SimulatedCombatState)context.CombatState).SetPowerAmount(power, power.Amount - 1);
+         context.Simulator.AutoPlay(
+             clone,
+             nestedChoiceSourceId: power.Id.Entry);
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/BeforeCardPlayedMirrors.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/BeforeCardPlayedMirrors.cs
+index 5b6c76796dd508183068005ac030bc7ee0118e5e..f10d3044910bab4074bb9f3a1947024f289876a6 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/BeforeCardPlayedMirrors.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/BeforeCardPlayedMirrors.cs
+@@ -183,9 +183,9 @@ internal static class BeforeCardPlayedMirrors
+             return;
+         }
+ 
+-        var state = context.StateStore.Get(power, () => new ImitationLearningPredictionState(power));
+-        if (state.Amount > 0)
++        if (power.Amount > 0)
+         {
++            var state = context.StateStore.Get(power, static _ => new ImitationLearningPredictionState());
+             state.CardAndClones.Add((context.Card, context.Card.CreateCloneForPlayer(owner)));
+         }
+     }
+@@ -428,13 +428,11 @@ internal sealed class MusicBoxPredictionState(MusicBox relic) : IPredictionState
+     }
+ }
+ 
+-internal sealed class ImitationLearningPredictionState(ImitationLearningPower power)
++internal sealed class ImitationLearningPredictionState
+     : IPredictionStateForkable, IPredictionForkBoundary
+ {
+     public List<(PredictedCard Card, PredictedCard Clone)> CardAndClones = [];
+ 
+-    public int Amount { get; set; } = power.Amount;
+-
+     public object Fork(PredictionForkContext context)
+     {
+         AssertForkable();
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/CardPlayHookPredictionStates.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/CardPlayHookPredictionStates.cs
+index aad0a10d94abeada6de9e5bb0f1d74262993d24e..9af458556ad304c9deb15665db57238b59acb334 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/CardPlayHookPredictionStates.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Mirrors/Hooks/Card/CardPlayHookPredictionStates.cs
+@@ -25,15 +25,17 @@ internal sealed class ChainsOfBindingPredictionState : IPredictionStateForkable
+     private int _boundCardsAfflicted;
+ 
+     public static ChainsOfBindingPredictionState CaptureRoot(ChainsOfBindingPower power)
+-        => new()
++    {
++        int afflicted = CombatManager.Instance.History.Entries.OfType<CardAfflictedEntry>()
++            .Count(entry => entry.HappenedThisTurn(power.CombatState)
++                && entry.Actor == power.Owner && entry.Affliction is Bound);
++        return new()
+         {
+             BoundCardPlayed = power.GetInternalData<ChainsOfBindingPower.Data>().boundCardPlayed,
+-            _afflictionTurn = power.Owner.Player?.PlayerCombatState?.TurnNumber ?? 0,
+-            _boundCardsAfflicted = CombatManager.Instance.History.Entries
+-                .OfType<CardAfflictedEntry>()
+-                .Count(entry => entry.HappenedThisTurn(power.CombatState)
+-                    && entry.Actor == power.Owner && entry.Affliction is Bound)
++            _afflictionTurn = afflicted == 0 ? 0 : power.Owner.Player?.PlayerCombatState?.TurnNumber ?? 0,
++            _boundCardsAfflicted = afflicted
+         };
++    }
+ 
+     public int GetBoundCardsAfflictedThisTurn(int turn)
+         => _afflictionTurn == turn ? _boundCardsAfflicted : 0;
+diff --git a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.Attack.cs b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.Attack.cs
+index 84ed2a6749d61dbab98a6b025b8209b941a20cbb..680ed6313274025dd2c9be3064d0c2285f7f0f2f 100644
+--- a/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.Attack.cs
++++ b/src/CoopBots.Kernel/Vendor/Engine/InCombat/Simulation/CombatPredictionSimulator.Attack.cs
+@@ -62,16 +62,20 @@ internal sealed partial class CombatPredictionSimulator
+         return flattened;
+     }
+ 
+-    public void EndAttackContext(AttackCommand attackContext, bool completed = true)
++    public void EndAttackContext(AttackCommand attackContext, bool completed = true, bool recordAttack = true)
+     {
+         try
+         {
+             if (!completed) { HookMirrors.AbortAttack(this, attackContext); return; }
+-            Creature attacker = attackContext.Attacker
+-                ?? throw new InvalidOperationException("Attack context must have an attacker.");
+-            History.CreatureAttacked(attacker, FlattenAttackResults(attackContext));
+-            if (State.CombatState is ICombatPredictionCardEventSink eventSink)
+-                eventSink.RecordCreatureAttacked(attacker);
++            if (recordAttack)
++            {
++                Creature attacker = attackContext.Attacker
++                    ?? throw new InvalidOperationException("Attack context must have an attacker.");
++                History.CreatureAttacked(attacker, FlattenAttackResults(attackContext));
++                if (State.CombatState is ICombatPredictionCardEventSink eventSink)
++                    eventSink.RecordCreatureAttacked(attacker);
++            }
++
+             HookMirrors.AfterAttack(this, attackContext);
+         }
+         finally
+diff --git a/src/CoopBots.Kernel/Vendor/Prediction/CardEffectSpecRegistry.cs b/src/CoopBots.Kernel/Vendor/Prediction/CardEffectSpecRegistry.cs
+index 90708c0cdfaebf97c21bafd65307910493e0eae0..3fa696c27c3527a1e55f92b9ec3635d21781641a 100644
+--- a/src/CoopBots.Kernel/Vendor/Prediction/CardEffectSpecRegistry.cs
++++ b/src/CoopBots.Kernel/Vendor/Prediction/CardEffectSpecRegistry.cs
+@@ -78,7 +78,7 @@ internal static class CardEffectSpecRegistry
+         [typeof(Knockdown)] = [Target<KnockdownPower>("KnockdownPower")],
+         // CoopBots multiplayer port: FLANKING declares no variable; each
+         // application is one stack and the multiplier lives in the power hook.
+-        [typeof(Flanking)] = [Target<FlankingPower>(_ => 1)],
++        [typeof(Flanking)] = [Target<FlankingPower>(_ => 2)],
+         [typeof(LightningRod)] = [Owner<LightningRodPower>("LightningRodPower")],
+         [typeof(Mangle)] = [Target<ManglePower>("StrengthLoss")],
+         [typeof(NegativePulse)] = [AllEnemies<DoomPower>(card => card.DynamicVars.Doom.IntValue)],
+@@ -98,6 +98,7 @@ internal static class CardEffectSpecRegistry
+         // (AfterCardPlayed/AfterBlockGained), only the OnPlay application was missing.
+         [typeof(Sneaky)] = [Owner<SneakyPower>("SneakyPower")],
+         [typeof(BeaconOfHope)] = [Owner<BeaconOfHopePower>(_ => 1)],
++        [typeof(HammerTime)] = [Owner<HammerTimePower>(_ => 1)],
+         [typeof(Scourge)] = [Target<DoomPower>(card => card.DynamicVars.Doom.IntValue)],
+         [typeof(SetupStrike)] = [Owner<SetupStrikePower>(card => card.DynamicVars.Strength.IntValue)],
+         [typeof(SicEm)] = [Target<SicEmPower>("SicEmPower")],
+@@ -110,8 +111,7 @@ internal static class CardEffectSpecRegistry
+         // CoopBots multiplayer port: the power hooks already exist in this
+         // snapshot (AfterCardDrawn / FrostOrb / AfterCardGeneratedForCombat /
+         // AfterDamageGiven), so only the OnPlay application was missing.
+-        [typeof(Cacophony)] = [Owner<CacophonyPower>(card => card.DynamicVars.Cards.IntValue)],
+-        [typeof(Hibernate)] = [Owner<HibernatePower>(_ => 1)],
++        [typeof(Cacophony)] = [Owner<CacophonyPower>(card => card.DynamicVars.Damage.IntValue)],
+         [typeof(Soulbound)] = [Target<SoulboundPower>(_ => 1)],
+         [typeof(Underworld)] = [Owner<UnderworldPower>(_ => 1)],
+     };
+@@ -305,8 +305,10 @@ internal static class CardEffectSpecRegistry
+             case GlimpseBeyond:
+                 foreach (MegaCrit.Sts2.Core.Entities.Players.Player recipient in combat.Players)
+                 {
++                    if (simulator.State.GetCreature(recipient.Creature).CurrentHp <= 0)
++                        continue;
+                     simulator.CreateAndAddGeneratedCardsToCombat<Soul>(
+-                        recipient, PileType.Draw, card.DynamicVars.Cards.IntValue, card.Owner);
++                        recipient, PileType.Draw, card.DynamicVars.Cards.IntValue, card.Owner, CardPilePosition.Random);
+                     if (simulator.HasPendingChoice)
+                         return true;
+                 }
+diff --git a/src/CoopBots.Kernel/Vendor/Prediction/CardOnPlaySupport.Batch042.cs b/src/CoopBots.Kernel/Vendor/Prediction/CardOnPlaySupport.Batch042.cs
+index 389eb497e0016aa52694dfe6c44433adb0665712..52d04a7a78576b7c2847b1ec3c763c1d0cd7b44d 100644
+--- a/src/CoopBots.Kernel/Vendor/Prediction/CardOnPlaySupport.Batch042.cs
++++ b/src/CoopBots.Kernel/Vendor/Prediction/CardOnPlaySupport.Batch042.cs
+@@ -202,7 +202,8 @@ internal static partial class CardOnPlaySupport
+         }
+         finally
+         {
+-            simulator.EndAttackContext(attackContext, completed);
++            // Native AttackContext runs the hooks without adding a CreatureAttacked history entry.
++            simulator.EndAttackContext(attackContext, completed, recordAttack: false);
+         }
+     }
+ 
+@@ -308,7 +309,8 @@ internal static partial class CardOnPlaySupport
+         }
+         finally
+         {
+-            simulator.EndAttackContext(attackContext, completed);
++            // Native AttackContext runs the hooks without adding a CreatureAttacked history entry.
++            simulator.EndAttackContext(attackContext, completed, recordAttack: false);
+         }
+     }
+ 
+diff --git a/src/CoopBots.Kernel/Vendor/Prediction/CorePowerSupport.cs b/src/CoopBots.Kernel/Vendor/Prediction/CorePowerSupport.cs
+index 68d31f55d622a91a294b5620c7345872611793b8..513ff6663e5bd9a157e675b215e2755c4837e05e 100644
+--- a/src/CoopBots.Kernel/Vendor/Prediction/CorePowerSupport.cs
++++ b/src/CoopBots.Kernel/Vendor/Prediction/CorePowerSupport.cs
+@@ -256,6 +256,8 @@ internal static class CorePowerSupport
+                 break;
+             case DarkEmbrace:
+                 combat.Apply<DarkEmbracePower>(owner, 1, owner);
++                if (combat.GetPower<DarkEmbracePower>(owner) is { } darkEmbrace)
++                    PowerPredictionStateSupport.CaptureRootState(simulator, darkEmbrace, darkEmbrace);
+                 break;
+             case Defragment:
+                 combat.Apply<FocusPower>(owner, card.DynamicVars["FocusPower"].IntValue, owner);
+diff --git a/src/CoopBots.Kernel/Vendor/Prediction/MonsterMoveEffects.cs b/src/CoopBots.Kernel/Vendor/Prediction/MonsterMoveEffects.cs
+index 9c8d7d380224030329528d4965284aabf67d9f6d..02dde9fcf2dcc7d01230cd3eaefd57b34ee6ffbb 100644
+--- a/src/CoopBots.Kernel/Vendor/Prediction/MonsterMoveEffects.cs
++++ b/src/CoopBots.Kernel/Vendor/Prediction/MonsterMoveEffects.cs
+@@ -53,7 +53,7 @@ internal static partial class MonsterMoveEffects
+             ("Myte", "TOXIC_MOVE") or
+             ("Myte", "SUCK_MOVE") or
+             ("Nibbit", "SLICE_MOVE") or
+-            ("Chomper", "SCREECH_MOVE") or
++            ("Chomper", "CLAMP_MOVE" or "SCREECH_MOVE") or
+             ("MagiKnight", "POWER_SHIELD_MOVE") or
+             ("MagiKnight", "PREP_MOVE") or
+             ("MechaKnight", "FLAMETHROWER_MOVE") or
+@@ -529,6 +529,9 @@ internal static partial class MonsterMoveEffects
+             case ("Nibbit", "SLICE_MOVE"):
+                 GainBlock(simulator, move.Owner, combat.GetMonsterStaticInt(move.Owner, "SliceBlock"));
+                 return true;
++            // Damage is handled by the intent pass; Clamp has no other effect.
++            case ("Chomper", "CLAMP_MOVE"):
++                return true;
+             case ("Chomper", "SCREECH_MOVE"):
+                 foreach (var partyTarget in targets)
+                     simulator.AddToCombat<Dazed>(partyTarget, PileType.Discard, 3, null);
+diff --git a/src/CoopBots.Kernel/Vendor/Prediction/MonsterValueReader.cs b/src/CoopBots.Kernel/Vendor/Prediction/MonsterValueReader.cs
+index 7a6904e6c0d7d7ec21a37314e39ec5b33613ddb5..7d11d0e2e84f102147597861938f41c11581ed82 100644
+--- a/src/CoopBots.Kernel/Vendor/Prediction/MonsterValueReader.cs
++++ b/src/CoopBots.Kernel/Vendor/Prediction/MonsterValueReader.cs
+@@ -26,11 +26,21 @@ internal static class MonsterValueReader
+         const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+         ParameterExpression input = Expression.Parameter(typeof(MonsterModel), "monster");
+         UnaryExpression typed = Expression.Convert(input, type);
+-        MemberExpression member = type.GetProperty(name, flags) is PropertyInfo property
++        MemberExpression? member = type.GetProperty(name, flags) is PropertyInfo property
+             ? Expression.Property(typed, property)
+             : type.GetField(name, flags) is FieldInfo field
+                 ? Expression.Field(typed, field)
+-                : throw new MissingMemberException(type.FullName, name);
++                : null;
++        if (member == null)
++        {
++            // A game update can turn the same integer field into a constant.
++            const BindingFlags staticFlags = BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
++            if (type.GetField(name, staticFlags) is { IsLiteral: true } constant
++                && constant.GetRawConstantValue() is int literal)
++                return _ => literal;
++            throw new MissingMemberException(type.FullName, name);
++        }
++
+         Expression value = member.Type == typeof(int) ? member : Expression.Convert(member, typeof(int));
+         return Expression.Lambda<Func<MonsterModel, int>>(value, input).Compile();
+     }
+diff --git a/src/CoopBots.Kernel/Vendor/Prediction/PersistentPowerSupport.cs b/src/CoopBots.Kernel/Vendor/Prediction/PersistentPowerSupport.cs
+index 41c2c4ae2f3554e66f799b0877d602a53c9b10dd..2abaf62418454c03433a958f7ca72d20f963b443 100644
+--- a/src/CoopBots.Kernel/Vendor/Prediction/PersistentPowerSupport.cs
++++ b/src/CoopBots.Kernel/Vendor/Prediction/PersistentPowerSupport.cs
+@@ -277,6 +277,20 @@ internal static class PersistentPowerSupport
+         CombatPredictionSimulator simulator,
+         Player player,
+         int amount)
++    {
++        ForgeBlade(simulator, player, amount);
++        if (simulator.HasPendingChoice || simulator.State.CombatState is not SimulatedCombatState combat
++            || combat.GetAmount<HammerTimePower>(player.Creature) <= 0)
++            return;
++
++        // Native Hammer Time copies the same forge to other living players.
++        // Those copies carry Hammer Time as their source and cannot trigger it again.
++        foreach (Player ally in combat.Players)
++            if (!ReferenceEquals(ally, player) && simulator.State.GetCreature(ally.Creature).IsAlive)
++                ForgeBlade(simulator, ally, amount);
++    }
++
++    private static void ForgeBlade(CombatPredictionSimulator simulator, Player player, int amount)
+     {
+         if (simulator.HasPendingChoice)
+             return;
+diff --git a/src/CoopBots.Kernel/Vendor/Prediction/PowerPredictionStateSupport.cs b/src/CoopBots.Kernel/Vendor/Prediction/PowerPredictionStateSupport.cs
+index 677a89022aff95d6aeaf735de7fbdd2dd01f1cff..24a4091f0e4acd67cb618743d8b70fc5b1808b48 100644
+--- a/src/CoopBots.Kernel/Vendor/Prediction/PowerPredictionStateSupport.cs
++++ b/src/CoopBots.Kernel/Vendor/Prediction/PowerPredictionStateSupport.cs
+@@ -1,5 +1,6 @@
+ using MegaCrit.Sts2.Core.Models;
+ using MegaCrit.Sts2.Core.Models.Powers;
++using CoopBots.Kernel.Vendor.Engine.Common;
+ using CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Attack;
+ using CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Card;
+ using CoopBots.Kernel.Vendor.Engine.InCombat.Mirrors.Hooks.Damage;
+@@ -16,6 +17,23 @@ internal static class PowerPredictionStateSupport
+         CombatPredictionSimulator simulator,
+         PowerModel target,
+         PowerModel source)
++    {
++        CaptureOwnedState(simulator.StateStore, target, source, fresh: false);
++        // 上面这个 switch 按原版类型写死，第三方登记不进去。克隆会把 _internalData 重置成
++        // InitInternalData()，所以靠它保存状态的第三方 Power 同样必须在这里把实机实例的值搬进
++        // StateStore，否则模拟一开始读到的就是初值。
++        PowerHiddenStateMirrors.CaptureRootState(simulator, target, source);
++    }
++
++    // A newly created simulation power has owned initial data before its first hook runs.
++    // Never use this path to fill missing data for an existing live power.
++    internal static void CaptureFreshState(PredictionStateStore? store, PowerModel power)
++    {
++        if (store is not null)
++            CaptureOwnedState(store, power, power, fresh: true);
++    }
++
++    private static void CaptureOwnedState(PredictionStateStore store, PowerModel target, PowerModel source, bool fresh)
+     {
+         switch (target, source)
+         {
+@@ -27,51 +45,47 @@ internal static class PowerPredictionStateSupport
+             case (AfterimagePower value, AfterimagePower original):
+                 if (original.GetInternalData<AfterimagePower.Data>() is { } data
+                     && data.amountsForPlayedCards.Count == 0)
+-                    _ = simulator.StateStore.GetReadOnly(value, static () => new CardPlayPairPredictionState());
++                    _ = store.GetReadOnly(value, static () => new CardPlayPairPredictionState());
+                 break;
+             case (DarkEmbracePower value, DarkEmbracePower original):
+-                _ = simulator.StateStore.GetReadOnly(value, () => new DarkEmbracePredictionState(original));
++                _ = store.GetReadOnly(value, () => new DarkEmbracePredictionState(original));
+                 break;
+             case (SkittishPower value, SkittishPower original):
+-                _ = simulator.StateStore.GetReadOnly(value, () => new SkittishPredictionState(original));
++                _ = store.GetReadOnly(value, () => new SkittishPredictionState(original));
+                 break;
+             case (PanachePower value, PanachePower original):
+-                _ = simulator.StateStore.GetReadOnly(value, () => new PanachePredictionState(original));
++                _ = store.GetReadOnly(value, () => new PanachePredictionState(original));
+                 break;
+             case (SoulboundPower value, SoulboundPower original):
+-                _ = simulator.StateStore.GetReadOnly(value, () => new SoulboundPredictionState(original));
++                _ = store.GetReadOnly(value, () => new SoulboundPredictionState(original));
+                 break;
+             case (HellraiserPower value, HellraiserPower original):
+-                _ = simulator.StateStore.GetReadOnly(value, () => new HellraiserPredictionState(original));
++                _ = store.GetReadOnly(value, () => new HellraiserPredictionState(original));
+                 break;
+             case (CacophonyPower value, CacophonyPower original):
+-                _ = simulator.StateStore.GetReadOnly(value, () => new CacophonyPredictionState(original));
++                _ = store.GetReadOnly(value, () => new CacophonyPredictionState(original));
+                 break;
+             case (AutomationPower value, AutomationPower original):
+-                _ = simulator.StateStore.GetReadOnly(value, () => new AutomationPredictionState(original));
++                _ = store.GetReadOnly(value, () => new AutomationPredictionState(original));
+                 break;
+             case (JugglingPower value, JugglingPower original):
+-                _ = simulator.StateStore.GetReadOnly(value, () => new JugglingPredictionState(original));
++                _ = store.GetReadOnly(value, () => new JugglingPredictionState(original));
+                 break;
+             case (ChainsOfBindingPower value, ChainsOfBindingPower original):
+-                _ = simulator.StateStore.GetReadOnly(value, () => ChainsOfBindingPredictionState.CaptureRoot(original));
++                _ = store.GetReadOnly(value, () => fresh ? new ChainsOfBindingPredictionState() : ChainsOfBindingPredictionState.CaptureRoot(original));
+                 break;
+             case (SurroundedPower value, SurroundedPower original):
+-                _ = simulator.StateStore.GetReadOnly(value, () => new SurroundedPredictionState(original));
++                _ = store.GetReadOnly(value, () => new SurroundedPredictionState(original));
+                 break;
+             case (VoidFormPower value, VoidFormPower original):
+-                _ = simulator.StateStore.GetReadOnly(value, () => new VoidFormPredictionState(original));
++                _ = store.GetReadOnly(value, () => new VoidFormPredictionState(original));
+                 break;
+             case (FeralPower value, FeralPower original):
+-                _ = simulator.StateStore.GetReadOnly(value, () => new FeralPredictionState(original));
++                _ = store.GetReadOnly(value, () => new FeralPredictionState(original));
+                 break;
+             case (HardenedShellPower value, HardenedShellPower original):
+-                _ = simulator.StateStore.GetReadOnly(value, () => new HardenedShellPredictionState(original));
++                _ = store.GetReadOnly(value, () => new HardenedShellPredictionState(original));
+                 break;
+         }
+-        // 上面这个 switch 按原版类型写死，第三方登记不进去。克隆会把 _internalData 重置成
+-        // InitInternalData()，所以靠它保存状态的第三方 Power 同样必须在这里把实机实例的值搬进
+-        // StateStore，否则模拟一开始读到的就是初值。
+-        PowerHiddenStateMirrors.CaptureRootState(simulator, target, source);
+     }
+ }
+diff --git a/src/CoopBots.Kernel/Vendor/Runtime/ContinuationStamp.cs b/src/CoopBots.Kernel/Vendor/Runtime/ContinuationStamp.cs
+index c25ffd1ffd705c7b97038ea74f4ed4a0cfba0610..8e3d0feb6b7a8470b3990f9b76db3a4845dd463e 100644
+--- a/src/CoopBots.Kernel/Vendor/Runtime/ContinuationStamp.cs
++++ b/src/CoopBots.Kernel/Vendor/Runtime/ContinuationStamp.cs
+@@ -118,17 +118,34 @@ internal sealed record ContinuationStamp(string StateText)
+         return new ContinuationStamp(text.ToString());
+     }
+ 
+-    public static ContinuationStamp CapturePredicted(
+-        Player player,
+-        CombatPredictionSimulator simulator,
+-        int turn,
+-        IntentForecast forecast,
+-        int startTurnNumber)
++    public static ContinuationStamp CapturePredicted(Player player, CombatPredictionSimulator simulator,
++        int turn, IntentForecast forecast, int startTurnNumber)
++        => CapturePredicted(player, simulator, turn);
++
++    internal static ContinuationStamp CapturePredicted(Player player, CombatPredictionSimulator simulator, int turn)
++    {
++        var text = new StringBuilder();
++        AppendPredictedPlayer(text, player, simulator, turn);
++        return new ContinuationStamp(text.ToString());
++    }
++
++    internal static (string Enemies, string Mechanics) CapturePredictedPartyFields(CombatPredictionSimulator simulator)
++    {
++        var combat = (SimulatedCombatState)simulator.State.CombatState;
++        var enemies = new StringBuilder();
++        AppendPredictedEnemies(enemies, simulator, combat);
++        var mechanics = new StringBuilder();
++        AppendPredictedMechanics(mechanics, simulator, combat);
++        return (enemies.ToString(), mechanics.ToString());
++    }
++
++    internal static void AppendPredictedPlayer(StringBuilder text, Player player, CombatPredictionSimulator simulator,
++        int turn, (string Enemies, string Mechanics)? shared = null)
+     {
+         SimPlayerCombatState pcs = simulator.State.GetPlayerCombatState(player);
+         SimCreatureState simulatedPlayer = simulator.State.GetCreature(player.Creature);
+         SimulatedCombatState combat = (SimulatedCombatState)simulator.State.CombatState;
+-        StringBuilder text = Begin(
++        AppendBegin(text,
+             turn,
+             simulatedPlayer.CurrentHp,
+             simulatedPlayer.MaxHp,
+@@ -141,16 +158,8 @@ internal sealed record ContinuationStamp(string StateText)
+             combat.GetOsty(player),
+             combat.GetOsty(player) is { } osty ? simulator.State.GetCreature(osty).CurrentHp : 0,
+             combat.GetOstyMaxHp(simulator, player));
+-        IReadOnlyList<Creature> predictedEnemies = combat.Enemies;
+-        AppendEnemies(text, predictedEnemies,
+-            enemy => simulator.State.GetCreature(enemy).CurrentHp,
+-            enemy => simulator.State.GetCreature(enemy).MaxHp,
+-            enemy => simulator.State.GetCreature(enemy).Block,
+-            enemy => combat.TryGetForcedMoveId(enemy, out string forcedMove)
+-                ? forcedMove
+-                : combat.GetPredictedMoveId(enemy));
+-        combat.AppendPredictedMonsterAiContinuation(text);
+-        combat.AppendPredictedMonsterStateContinuation(text);
++        if (shared is { } fields) text.Append(fields.Enemies);
++        else AppendPredictedEnemies(text, simulator, combat);
+         AppendPredictedPile(text, pcs.Hand, 'H');
+         AppendPredictedPile(text, pcs.DrawPile, 'D');
+         AppendPredictedPile(text, pcs.DiscardPile, 'C');
+@@ -163,6 +172,26 @@ internal sealed record ContinuationStamp(string StateText)
+             text,
+             simulator,
+             combat.RelicsOf(player));
++        if (shared is { } tail) text.Append(tail.Mechanics);
++        else AppendPredictedMechanics(text, simulator, combat);
++    }
++
++    private static void AppendPredictedEnemies(StringBuilder text, CombatPredictionSimulator simulator, SimulatedCombatState combat)
++    {
++        IReadOnlyList<Creature> predictedEnemies = combat.Enemies;
++        AppendEnemies(text, predictedEnemies,
++            enemy => simulator.State.GetCreature(enemy).CurrentHp,
++            enemy => simulator.State.GetCreature(enemy).MaxHp,
++            enemy => simulator.State.GetCreature(enemy).Block,
++            enemy => combat.TryGetForcedMoveId(enemy, out string forcedMove)
++                ? forcedMove
++                : combat.GetPredictedMoveId(enemy));
++        combat.AppendPredictedMonsterAiContinuation(text);
++        combat.AppendPredictedMonsterStateContinuation(text);
++    }
++
++    private static void AppendPredictedMechanics(StringBuilder text, CombatPredictionSimulator simulator, SimulatedCombatState combat)
++    {
+         StateFingerprintBuilder adapterFingerprint = new();
+         ModelPredictionStateMirrors.AppendPredicted(ref adapterFingerprint, text, simulator, combat);
+         // CoopBots multiplayer port: always emit, same reason as the live branch above.
+@@ -180,11 +209,13 @@ internal sealed record ContinuationStamp(string StateText)
+             simulator.Rng.CombatOrbGenerationState,
+             simulator.Rng.MonsterAiState,
+             simulator.Rng.NicheState);
+-        return new ContinuationStamp(text.ToString());
+     }
+ 
+     private static StringBuilder Begin(int turn, int hp, int maxHp, int block, int energy, int stars, int gold)
+-        => new StringBuilder().Append("turn=").Append(turn)
++        => AppendBegin(new StringBuilder(), turn, hp, maxHp, block, energy, stars, gold);
++
++    private static StringBuilder AppendBegin(StringBuilder text, int turn, int hp, int maxHp, int block, int energy, int stars, int gold)
++        => text.Append("turn=").Append(turn)
+             .Append(";hp=").Append(hp).Append(";max_hp=").Append(maxHp).Append(";block=").Append(block)
+             .Append(";energy=").Append(energy).Append(";stars=").Append(stars)
+             .Append(";gold=").Append(gold);
+diff --git a/src/CoopBots.Kernel/Vendor/Search/CardChoiceSupport.cs b/src/CoopBots.Kernel/Vendor/Search/CardChoiceSupport.cs
+index cf5995cbd76452780e812687e5dcb07aa4c408db..119a719dcab33d9a5a14c42434a06e9b47ab36d4 100644
+--- a/src/CoopBots.Kernel/Vendor/Search/CardChoiceSupport.cs
++++ b/src/CoopBots.Kernel/Vendor/Search/CardChoiceSupport.cs
+@@ -54,14 +54,6 @@ internal static partial class CardChoiceSupport
+     /// <inheritdoc cref="BasicStrikeRemovalWeight" />
+     private const double BasicDefendRemovalWeight = 1.2d;
+ 
+-    private static readonly HashSet<string> UnsupportedExistingChoiceCards =
+-    [
+-        "Tutor"
+-    ];
+-
+-    public static bool RequiresUnsupportedExistingChoice(CardModel card)
+-        => UnsupportedExistingChoiceCards.Contains(card.GetType().Name);
+-
+     public static PlanCardChoice? BuildRequiredEmptyChoice(CardModel card)
+     {
+         return card switch
+@@ -841,11 +833,13 @@ internal static partial class CardChoiceSupport
+         PredictedCard playedCard,
+         SimPlayerCombatState owner)
+     {
+-        List<PredictedCard> options = owner.DrawPile.Cards
++        var sampled = owner.DrawPile.Cards
+             .ToList()
+             .StableShuffle(simulator.Rng.CombatCardSelection)
+             .Take(playedCard.Preview.DynamicVars.Cards.IntValue)
+-            .ToList();
++            .ToHashSet();
++        // Preserve the native menu's pile order for physical duplicates.
++        List<PredictedCard> options = owner.DrawPile.Cards.Where(sampled.Contains).ToList();
+         if (options.Count > 0)
+         {
+             simulator.History.CardsSelected(options);
+@@ -929,7 +923,7 @@ internal static partial class CardChoiceSupport
+         }
+     }
+ 
+-    private static IReadOnlyList<PlanCardToken> ToTokens(
++    internal static IReadOnlyList<PlanCardToken> ToTokens(
+         IReadOnlyList<PredictedCard> selected,
+         IReadOnlyList<PredictedCard> options,
+         IReadOnlyList<PredictedCard> source,
+diff --git a/src/CoopBots.Kernel/Vendor/Search/CombatBeamSolver.Expansion.cs b/src/CoopBots.Kernel/Vendor/Search/CombatBeamSolver.Expansion.cs
+index 9277275a8b0a2919c50d68cf23a256dd3ddd8632..11c3512d72334a8cd70b153462a47f777b406379 100644
+--- a/src/CoopBots.Kernel/Vendor/Search/CombatBeamSolver.Expansion.cs
++++ b/src/CoopBots.Kernel/Vendor/Search/CombatBeamSolver.Expansion.cs
+@@ -570,11 +570,6 @@ internal sealed partial class CombatBeamSolver
+                 SimulationSnapshot probeSnapshot = ReplayAction(node, action, cardChoiceCapture: cardCapture);
+ 
+                 CardChoiceSpec? choiceSpec = BuildPrimaryCardChoiceSpec(probeSnapshot);
+-                if (choiceSpec == null && CardChoiceSupport.RequiresUnsupportedExistingChoice(card.Preview))
+-                {
+-                    probeSnapshot.ReleaseSimulator();
+-                    continue;
+-                }
+                 PlanCardChoice? requiredEmptyChoice = CardChoiceSupport.BuildRequiredEmptyChoice(card.Preview);
+                 CardChoiceSpec? primaryChoiceSpec = choiceSpec
+                     ?? BuildRequiredEmptyChoiceSpec(requiredEmptyChoice);
+diff --git a/src/CoopBots.Kernel/Vendor/Search/CombatBeamSolver.ParallelExpansion.cs b/src/CoopBots.Kernel/Vendor/Search/CombatBeamSolver.ParallelExpansion.cs
+index 35b8bf32588c6287c23123f8bbbe60f2eb552463..18458ef1e970c566c1061298d017028d2aaea6d1 100644
+--- a/src/CoopBots.Kernel/Vendor/Search/CombatBeamSolver.ParallelExpansion.cs
++++ b/src/CoopBots.Kernel/Vendor/Search/CombatBeamSolver.ParallelExpansion.cs
+@@ -30,7 +30,6 @@ internal sealed partial class CombatBeamSolver
+         PlanAction Action,
+         CardType CardType,
+         uint? TargetCombatId,
+-        bool RequiresUnsupportedExistingChoice,
+         PlanCardChoice? RequiredEmptyChoice);
+ 
+     private readonly record struct PreparedPotionAction(PlanAction Action, PotionModel Potion);
+@@ -494,8 +493,6 @@ internal sealed partial class CombatBeamSolver
+             }
+             seenCards[seenCardCount++] = playableKey;
+             string cardStateKey = CardChoiceSupport.ChoiceCardKey(card);
+-            bool requiresUnsupportedExistingChoice =
+-                CardChoiceSupport.RequiresUnsupportedExistingChoice(card.Preview);
+             PlanCardChoice? requiredEmptyChoice =
+                 CardChoiceSupport.BuildRequiredEmptyChoice(card.Preview);
+             int cardStateOccurrence = 0;
+@@ -530,7 +527,6 @@ internal sealed partial class CombatBeamSolver
+                     planAction,
+                     card.Preview.Type,
+                     target?.CombatId,
+-                    requiresUnsupportedExistingChoice,
+                     requiredEmptyChoice));
+             }
+         }
+@@ -573,11 +569,6 @@ internal sealed partial class CombatBeamSolver
+                 }
+             }
+             CardChoiceSpec? choiceSpec = BuildPrimaryCardChoiceSpec(probeSnapshot);
+-            if (choiceSpec == null && action.RequiresUnsupportedExistingChoice)
+-            {
+-                probeSnapshot.ReleaseSimulator();
+-                return null;
+-            }
+             CardChoiceSpec? primaryChoiceSpec = choiceSpec
+                 ?? BuildRequiredEmptyChoiceSpec(action.RequiredEmptyChoice);
+             IEnumerable<(PlanAction Action, SimulationSnapshot Snapshot)> resolvedBranches =
+@@ -673,14 +664,6 @@ internal sealed partial class CombatBeamSolver
+         try
+         {
+             CardChoiceSpec? choiceSpec = BuildPrimaryCardChoiceSpec(snapshot);
+-            if (choiceSpec == null && preparedAction.RequiresUnsupportedExistingChoice)
+-            {
+-                snapshot.ReleaseSimulator();
+-                snapshot = null;
+-                RecordDeferredRoundChoiceLayer(width: 0);
+-                return null;
+-            }
+-
+             CardChoiceSpec? primaryChoiceSpec = choiceSpec
+                 ?? BuildRequiredEmptyChoiceSpec(preparedAction.RequiredEmptyChoice);
+             IEnumerable<(PlanAction Action, SimulationSnapshot Snapshot)> resolvedBranches;
+diff --git a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.ActionChoices.cs b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.ActionChoices.cs
+index 2951aa634a94143af3ba6f83df1c0b4716fc6db9..6fe557c6252453b73cdb3a1ac9654a661427499d 100644
+--- a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.ActionChoices.cs
++++ b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.ActionChoices.cs
+@@ -106,6 +106,29 @@ internal sealed partial class SimulatedCombatState :
+             maxBranches);
+     }
+ 
++    internal void ResolveTutor(CombatPredictionSimulator simulator, PredictedCard card, Player picker)
++    {
++        if (simulator.IsOverOrEnding || simulator.State.GetCreature(picker.Creature).IsDead)
++            return;
++
++        if (CurrentSide == MegaCrit.Sts2.Core.Combat.CombatSide.Player)
++            (_reopenedPlayerTurns ??= []).Add(picker.NetId);
++        var drawPile = simulator.State.GetPlayerCombatState(picker).DrawPile.Cards;
++        if (drawPile.Count == 0)
++            return;
++        if (drawPile.Count == 1)
++        {
++            simulator.AddToPile(drawPile[0], PileType.Hand);
++            return;
++        }
++
++        var cards = drawPile.ToArray();
++        CardChoiceSpec spec = new(PlanChoiceEffect.MoveToHand, PileType.Draw, 1, 1, cards, cards, 0d);
++        TurnStartChoiceRequest request = new(string.Empty, spec.Effect, spec.SourcePile, 1, spec,
++            Timing: ActiveActionChoiceTiming, MenuSource: card.Preview.Id.Entry);
++        TurnStartChoiceSupport.ResolveCapturedChoice(simulator, this, picker, _activeActionChoices, request);
++    }
++
+     private bool ResolveActionCardChoice(
+         CombatPredictionSimulator simulator,
+         PredictedCard playedCard,
+diff --git a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.CardLifecycle.cs b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.CardLifecycle.cs
+index 1d63180562d8c3f98e803a1ccdbb8409e75e4322..66c260e3cd10d2e93c0b9bd1d0fd46f600dc4920 100644
+--- a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.CardLifecycle.cs
++++ b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.CardLifecycle.cs
+@@ -18,7 +18,6 @@ internal sealed partial class SimulatedCombatState
+     private List<PowerModel>? _addedPowerInstances;
+     private Dictionary<NightmarePower, PredictedCard>? _nightmareSelections;
+     private ForkableDictionary<Player, Creature>? _simulatedOsties;
+-    private ForkableDictionary<Creature, int>? _simulatedOstyMaxHp;
+     private HashSet<PredictedCard>? _returnToHandNextTurn;
+     private ForkableDictionary<Creature, int>? _cardsPlayedThisTurn;
+     private ForkableDictionary<Creature, int>? _manualCardsPlayedThisTurn;
+@@ -54,6 +53,7 @@ internal sealed partial class SimulatedCombatState
+             ((MegaCrit.Sts2.Core.Localization.DynamicVars.StringVar)power.DynamicVars["Applier"]).StringValue = _playerNames[guardedApplier];
+         if (power is OrbitPower orbit)
+             InitializeOrbit(orbit, 0);
++        PowerPredictionStateSupport.CaptureFreshState(_stateStore, power);
+         (_addedPowerInstances ??= []).Add(power);
+         UpdatePowerListenerOrder(power, 0, amount);
+         InvalidateHookListeners();
+@@ -100,20 +100,16 @@ internal sealed partial class SimulatedCombatState
+             osty = existingOsty!;
+         }
+         SimCreatureState state = simulator.State.GetCreature(osty);
+-        int currentMax = _simulatedOstyMaxHp?.GetValueOrDefault(osty) ?? state.MaxHp;
+         if (!created && state.IsAlive)
+         {
+-            currentMax += amount;
+-            state.SetMaxHp(currentMax);
+-            state.CurrentHp = Math.Min(currentMax, state.CurrentHp + amount);
++            state.SetMaxHp(state.MaxHp + amount);
++            state.CurrentHp = Math.Min(state.MaxHp, state.CurrentHp + amount);
+         }
+         else
+         {
+-            currentMax = amount;
+-            state.SetMaxHp(currentMax);
+-            state.CurrentHp = amount;
++            state.SetMaxHp(amount);
++            state.CurrentHp = state.MaxHp;
+         }
+-        (_simulatedOstyMaxHp ??= [])[osty] = currentMax;
+     }
+ 
+     public void HealOsty(CombatPredictionSimulator simulator, Player player, int amount)
+@@ -121,8 +117,7 @@ internal sealed partial class SimulatedCombatState
+         Creature osty = GetOsty(player)
+             ?? throw new InvalidOperationException("治疗奥斯蒂时，玩家没有可供模拟的奥斯蒂实例。");
+         SimCreatureState state = simulator.State.GetCreature(osty);
+-        int maxHp = _simulatedOstyMaxHp?.GetValueOrDefault(osty) ?? state.MaxHp;
+-        state.CurrentHp = Math.Min(maxHp, state.CurrentHp + Math.Max(0, amount));
++        state.CurrentHp = Math.Min(state.MaxHp, state.CurrentHp + Math.Max(0, amount));
+     }
+ 
+     public int GetOstyMaxHp(CombatPredictionSimulator simulator, Player player)
+@@ -130,8 +125,7 @@ internal sealed partial class SimulatedCombatState
+         Creature? osty = GetOsty(player);
+         if (osty == null)
+             return 0;
+-        return _simulatedOstyMaxHp?.GetValueOrDefault(osty)
+-            ?? simulator.State.GetCreature(osty).MaxHp;
++        return simulator.State.GetCreature(osty).MaxHp;
+     }
+ 
+     public bool IsOstyHittable(CombatPredictionSimulator simulator, Player player)
+@@ -579,7 +573,6 @@ internal sealed partial class SimulatedCombatState
+     {
+         AddCreatureIntMap(ref fingerprint, 'c', _cardsPlayedThisTurn);
+         AddCreatureIntMap(ref fingerprint, 'm', _manualCardsPlayedThisTurn);
+-        AddCreatureIntMap(ref fingerprint, 'o', _simulatedOstyMaxHp);
+ 
+         ulong first = 0;
+         ulong second = 0;
+diff --git a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.Fork.cs b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.Fork.cs
+index 74aa0c516bb12d6d2db59133b93262917c10434a..fc2370f942b598e6d0f708eca0171ff876b2c825 100644
+--- a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.Fork.cs
++++ b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.Fork.cs
+@@ -79,7 +79,6 @@ internal sealed partial class SimulatedCombatState
+             _historyCourseAttackWindows = _historyCourseAttackWindows is null ? null : new(_historyCourseAttackWindows),
+             _statefulRelicStates = _statefulRelicStates?.Fork(),
+             _simulatedOsties = _simulatedOsties?.Fork(),
+-            _simulatedOstyMaxHp = _simulatedOstyMaxHp?.Fork(),
+             _cardsPlayedThisTurn = _cardsPlayedThisTurn?.Fork(),
+             _manualCardsPlayedThisTurn = _manualCardsPlayedThisTurn?.Fork(),
+             _fetchCardsPlayedThisTurn = _fetchCardsPlayedThisTurn?.Fork(),
+diff --git a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.Potions.cs b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.Potions.cs
+index f05beea46ac94cc7568e4f405326f79d90a4dc34..6ea19cae08187c0aa7498cccf6f91d8900593b6b 100644
+--- a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.Potions.cs
++++ b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.Potions.cs
+@@ -1,4 +1,5 @@
+ using MegaCrit.Sts2.Core.Entities.Players;
++using System.Runtime.CompilerServices;
+ using MegaCrit.Sts2.Core.Models;
+ using MegaCrit.Sts2.Core.Models.Potions;
+ using MegaCrit.Sts2.Core.Models.Relics;
+@@ -15,6 +16,11 @@ internal readonly record struct PredictedPotionUse(
+ 
+ internal sealed partial class SimulatedCombatState
+ {
++    private sealed record GeneratedPotion(int Slot);
++    private static readonly ConditionalWeakTable<PotionModel,GeneratedPotion> GeneratedPotions=new();
++    internal static int GeneratedPotionSlot(PotionModel potion)
++        => GeneratedPotions.TryGetValue(potion,out var entry)?entry.Slot:-1;
++
+     private ForkableDictionary<(Player Player, int Slot), PotionModel?>? _potionSlots;
+     private ForkableList<PredictedPotionUse>? _potionUses;
+ 
+@@ -120,6 +126,7 @@ internal sealed partial class SimulatedCombatState
+         {
+             if (GetPotionAtSlot(player, slot) != null)
+                 continue;
++            GeneratedPotions.Add(potion,new(slot));
+             (_potionSlots ??= [])[(player, slot)] = potion;
+             InvalidateBaseHookListeners();
+             TriggerRelicsAfterPotionProcured(player);
+diff --git a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.ReactiveRelics.cs b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.ReactiveRelics.cs
+index c97112370f02c64e5d9de6e7ea39bc8648d0763f..aa3d251d159f997eaef0740848d9154ddfc87a28 100644
+--- a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.ReactiveRelics.cs
++++ b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.ReactiveRelics.cs
+@@ -294,7 +294,8 @@ internal sealed partial class SimulatedCombatState
+         int historyEntryStart)
+     {
+         foreach (CombatPredictionHistoryEntry entry in simulator.History.EntriesFrom(historyEntryStart))
+-            RecordRelicDamageEntry(entry);
++            if (entry is CombatPredictionDamageReceivedEntry hit && hit.Receiver.Player == player)
++                RecordRelicDamageEntry(entry);
+         foreach (EmotionChip relic in RelicsOf(player).OfType<EmotionChip>().Where(static relic => !relic.IsMelted))
+         {
+             StatefulRelicState state = GetStatefulRelicState(relic);
+diff --git a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.cs b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.cs
+index 2b93efa3c4c98087e7de3fa77fdc391429e09955..cbc3a0bebb7cd10db6c70f8a90d7f3822ddc910f 100644
+--- a/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.cs
++++ b/src/CoopBots.Kernel/Vendor/Search/SimulatedCombatState.cs
+@@ -433,6 +433,14 @@ internal sealed partial class SimulatedCombatState
+         }
+     }
+ 
++    private HashSet<ulong>? _reopenedPlayerTurns;
++
++    internal bool WasPlayerTurnReopened(Player player) => _reopenedPlayerTurns?.Contains(player.NetId) == true;
++
++    internal void ClearReopenedPlayerTurn(Player player) => _reopenedPlayerTurns?.Remove(player.NetId);
++
++    internal void ClearReopenedPlayerTurns() => _reopenedPlayerTurns?.Clear();
++
+     private SimulatedCombatState(
+         SimulatedCombatState source,
+         ForkableList<Creature> allies,
+@@ -470,6 +478,8 @@ internal sealed partial class SimulatedCombatState
+         _playerNames = source._playerNames;
+         _rootFloatingCards = source._rootFloatingCards;
+         _rootDeadCreatures = source._rootDeadCreatures;
++        if (source._reopenedPlayerTurns is { Count: > 0 } reopened)
++            _reopenedPlayerTurns = new(reopened);
+         _allies = allies;
+         _enemies = enemies;
+         _knownEnemies = knownEnemies;
+@@ -631,6 +641,22 @@ internal sealed partial class SimulatedCombatState
+     public void Apply<T>(Creature target, int amount, Creature? applier = null) where T : PowerModel
+         => ApplyWithBeforeApplied<T>(target, amount, applier, null);
+ 
++    internal void ApplyImitationLearning(ImitationLearning card, Player target)
++    {
++        var owner = card.Owner.Creature;
++        int amount = (int)card.DynamicVars["ImitationLearningPower"].BaseValue;
++        var existing = EffectivePowers().OfType<ImitationLearningPower>()
++            .FirstOrDefault(power => power.Owner == owner && power._playerTarget == target);
++        if (existing is not null)
++        {
++            SetPowerAmount(existing, existing.Amount + amount);
++            return;
++        }
++
++        ApplyWithBeforeApplied<ImitationLearningPower>(owner, amount, owner, null,
++            (_, power) => ((ImitationLearningPower)power)._playerTarget = target);
++    }
++
+     private int ApplyWithBeforeApplied<T>(Creature target, int amount, Creature? applier, Action<int>? beforeApplied,
+         Action<int, PowerModel>? afterAmountChanged = null)
+         where T : PowerModel
+@@ -661,6 +687,7 @@ internal sealed partial class SimulatedCombatState
+         if (instanced)
+         {
+             simulated = incoming;
++            PowerPredictionStateSupport.CaptureFreshState(_stateStore, simulated);
+             (_addedPowerInstances ??= []).Add(simulated);
+             InvalidateHookListeners();
+         }
+@@ -936,6 +963,7 @@ internal sealed partial class SimulatedCombatState
+         if (incoming.InstanceType == MegaCrit.Sts2.Core.Entities.Powers.PowerInstanceType.Instanced)
+         {
+             simulated = incoming;
++            PowerPredictionStateSupport.CaptureFreshState(_stateStore, simulated);
+             (_addedPowerInstances ??= []).Add(simulated);
+             InvalidateHookListeners();
+         }
+@@ -1025,7 +1053,10 @@ internal sealed partial class SimulatedCombatState
+         simulated._target = existingPower != null ? existingPower.Target : prototype.Target;
+         simulated._amount = existingPower?.Amount ?? 0;
+         if (existingPower == null)
++        {
+             simulated.AmountOnTurnStart = 0;
++            PowerPredictionStateSupport.CaptureFreshState(_stateStore, simulated);
++        }
+         (_powers ??= [])[key] = simulated;
+         InvalidateHookListeners();
+         return simulated;
+@@ -2356,6 +2387,8 @@ internal sealed partial class SimulatedCombatState
+         item.Add(power.Owner.CombatId ?? uint.MaxValue);
+         item.Add(power.Applier?.CombatId ?? uint.MaxValue);
+         item.Add(power.Target?.CombatId ?? uint.MaxValue);
++        if (power is ImitationLearningPower imitation)
++            item.Add(imitation._playerTarget?.NetId ?? ulong.MaxValue);
+         item.Add(power.Id.Entry);
+         item.Add(power.Amount);
+         item.Add(PowerLifecycleSupport.SemanticallyRelevantAmountOnTurnStart(power));
+diff --git a/src/CoopBots.Kernel/Vendor/Testing/UnattendedTestRunner.ForkBoundaries.cs b/src/CoopBots.Kernel/Vendor/Testing/UnattendedTestRunner.ForkBoundaries.cs
+index d5e4392d02d9084e82debc791375b09e440902fc..94d396f0935626bfcff7ca13213d32a4550a5172 100644
+--- a/src/CoopBots.Kernel/Vendor/Testing/UnattendedTestRunner.ForkBoundaries.cs
++++ b/src/CoopBots.Kernel/Vendor/Testing/UnattendedTestRunner.ForkBoundaries.cs
+@@ -1508,7 +1508,7 @@ internal sealed partial class UnattendedTestRunner
+             player.Creature);
+         ImitationLearningPredictionState imitationState = simulator.StateStore.Get(
+             power,
+-            () => new ImitationLearningPredictionState(power));
++            static _ => new ImitationLearningPredictionState());
+         PanachePredictionState ordinarySentinelState = simulator.StateStore.Get(
+             ordinarySentinel,
+             () => new PanachePredictionState(ordinarySentinel));

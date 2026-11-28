@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using CoopBots.Kernel;
 using HarmonyLib;
 using MegaCrit.Sts2.Core.Combat;
+using MegaCrit.Sts2.Core.Entities.Actions;
 using MegaCrit.Sts2.Core.GameActions;
 using MegaCrit.Sts2.Core.GameActions.Multiplayer;
 using MegaCrit.Sts2.Core.Entities.Cards;
@@ -16,14 +17,14 @@ using MegaCrit.Sts2.Core.Nodes.Combat;
 namespace CoopSolver;
 internal sealed partial class Advisor
 {
-    private sealed record Played(ulong Seat,string Kind,string Id,uint? Target,int Slot,CardModel? Physical,CardCopy? Copy=null)
+    internal sealed record Played(ulong Seat,string Kind,string Id,uint? Target,int Slot,CardModel? Physical,CardCopy? Copy=null)
     {
         internal bool Matches(KernelTeamSearch.Action expected,KernelSession? origin)
         {
             if(expected.Player.NetId!=Seat || expected.Target?.CombatId!=Target)return false;
             // Matching inputs can propose a suffix; the new root must replay it before confirmation.
             if(Kind=="end")return expected.EndTurn;
-            if(Kind=="potion")return expected.Potion!=null && origin!=null && CapturedBelt.Slot(origin,expected.Potion)==Slot;
+            if(Kind=="potion")return expected.Potion is {} bottle && bottle.Id.Entry==Id && origin!=null && CapturedBelt.Slot(origin,bottle)==Slot;
             if(expected.Card?.Id.Entry!=Id)return false;
             if(Copy!=null)return expected.CardStateKey==Copy.Key;
             // When both physical copies exist in this hand, their different state can matter.
@@ -78,7 +79,7 @@ internal sealed partial class Advisor
     private readonly Dictionary<UsePotionAction,(string Id,uint? Target)> startedPotions=new();
     private static uint? NativePotionTarget(UsePotionAction action,PotionModel? potion)=>
         action.TargetId??(potion?.TargetType.IsSingleTarget()==true?potion.Owner.Creature.CombatId:null);
-    private readonly Dictionary<ulong,int> readyEnds=new();
+    private readonly Dictionary<ulong,int> endActionRounds=new();
     private sealed record ReadyCheckpoint(KernelSession Root,OpeningResult Result,InteractiveSearch.Line? Line,SimulationMeter? Meter);
     private readonly Dictionary<ulong,ReadyCheckpoint> beforeReady=new();
     private ActionExecutor? observedExecutor;
@@ -136,9 +137,14 @@ internal sealed partial class Advisor
         internal InteractiveSearch.Line? Rendered;
         internal HudPlan? Display;
         internal bool Waiting;
+        internal PotionModel? Potion;
+        internal readonly List<(ulong Owner,uint Id)> ObservedMenus=new();
+        internal KernelChoice[] ActiveRecommendations=System.Array.Empty<KernelChoice>();
     }
     private readonly Dictionary<GameAction,PendingHand> openChoices=new();
-    private IEnumerable<PendingHand> PendingChoices=>turnStartPending==null?openChoices.Values:openChoices.Values.Append(turnStartPending);
+    private IEnumerable<PendingHand> PendingChoices=>
+        openChoices.Values.Concat(nativeChoices.Values.Where(pending=>pending.Potion!=null)).Concat(potionHooks.Values)
+            .Concat(turnStartPending==null?System.Array.Empty<PendingHand>():new[]{turnStartPending}).Distinct();
     private IEnumerable<PendingHand> WaitingChoices=>PendingChoices.Where(s=>s.Waiting);
     private bool SelectingHand=>WaitingChoices.Any() || NPlayerHand.Instance?.IsInCardSelection==true;
     private void RecordInputGroup(TapeGroup group)
@@ -148,13 +154,20 @@ internal sealed partial class Advisor
     }
     private void OnNativeBegin(GameAction action)
     {
+        if(action is GenericHookGameAction hook && hook.ChoiceContext?.Source is PotionModel potion &&
+            nativeChoices.Values.FirstOrDefault(pending=>ReferenceEquals(pending.Potion,potion)) is {} queued &&
+            potionHooks.TryAdd(hook,queued))
+        {
+            hook.AfterFinished+=FinishPotionHook;
+            hook.BeforeCancelled+=FinishPotionHook;
+        }
         if(action is EndPlayerTurnAction end && hudRoom!=null)
         {
-            readyEnds[end.OwnerId]=hudRoom.RoundNumber;
+            endActionRounds[end.OwnerId]=hudRoom.RoundNumber;
             nextHud=0;share?.RefreshGraph();
         }
-        else if(action is UndoEndPlayerTurnAction undo && readyEnds.Remove(undo.OwnerId))
-        {nextHud=0;share?.RefreshGraph();}
+        else if(action is UndoEndPlayerTurnAction undo)
+        {endActionRounds.Remove(undo.OwnerId);nextHud=0;share?.RefreshGraph();}
 
         // This observer runs inside the game's ActionExecutor. An optional
         // preview failing must not interrupt the actual multiplayer action.
@@ -193,7 +206,7 @@ internal sealed partial class Advisor
                 same=slot>=0 && planned!=null && played?.Matches(planned,source)==true &&
                     planned.CardStateKey==move!.Key;
             }
-            else if(seat>=0 && action is UsePotionAction use && CapturedBelt.At(source,source.Party[seat],checked((int)use.PotionIndex)) is {} potion && (KernelSession.CanModelPotion(potion) || ExactPotionChoices.Supports(potion)))
+            else if(seat>=0 && action is UsePotionAction use && CapturedBelt.At(source,source.Party[seat],checked((int)use.PotionIndex)) is {} potion && (KernelSession.CanModelPotion(potion) || KernelSession.SupportsPotionSelection(potion)))
             {
                 var target=NativePotionTarget(use,potion);
                 move=new(seat,MoveKind.Potion,(int)use.PotionIndex,potion.Id.Entry,target);
@@ -205,14 +218,16 @@ internal sealed partial class Advisor
                 same=planned?.EndTurn==true && planned.Player.NetId==action.OwnerId;
             }
         }
+        PotionModel? nativePotion=null;
         if(action is UsePotionAction bottleAction)
         {
             var native=CombatManager.Instance.DebugOnlyGetState()?.Players.FirstOrDefault(p=>p.NetId==bottleAction.OwnerId);
-            var bottle=native?.GetPotionAtSlotIndex(checked((int)bottleAction.PotionIndex));
-            var id=move?.Key??bottle?.Id.Entry;
-            if(id!=null)startedPotions[bottleAction]=(id,move?.Target??NativePotionTarget(bottleAction,bottle));
+            nativePotion=native?.GetPotionAtSlotIndex(checked((int)bottleAction.PotionIndex));
+            var id=move?.Key??nativePotion?.Id.Entry;
+            if(id!=null)startedPotions[bottleAction]=(id,move?.Target??NativePotionTarget(bottleAction,nativePotion));
         }
         var pending=new PendingHand(action,source,move,same && ReferenceEquals(source,view.root)?HandChoiceProbe.Choices(planned):System.Array.Empty<KernelChoice>());
+        pending.Potion=nativePotion;
         pending.Battle=exchange;
         pending.Incumbent=view.displayedPotion?.Result.Seed??view.savedResult?.Seed;
         if(same && ReferenceEquals(source,view.root) && previous?.Ending is {Verified:true} &&
@@ -248,16 +263,11 @@ internal sealed partial class Advisor
     }
     private void OnChoiceWaiting(PendingHand s)
     {
-        var action=s.Action;
         if(s.Waiting)return;
         s.Waiting=true;nextChoicePaint=0;nextHud=0;
-        s.Probe?.SetPaused(!searchEnabled);
-        if(s.Root!=null)s.Before=s.Battle?.Current(SlCache.Witness(s.Root));
-        if(System.Environment.GetEnvironmentVariable("STS2_TRANSFIGURE")!=null)
-            Godot.GD.Print($"[ChoiceCheck] waiting {(s.Action as PlayCardAction)?.CardModelId.Entry} source={s.Root!=null} move={s.Move!=null} planned={s.Choices.Length}");
-        if(searchEnabled && SearchCapacity.OpeningPercent<100 && !manuallyPaused && s.Root!=null && s.Move!=null && s.Probe==null)
-            s.StartProbe(Memory,SeedDirectory,evaluation);
-        RefreshChoice();
+        // Native choice callbacks only record lifecycle. Formatting, archived
+        // route reconstruction and starting a new probe happen on the next tick.
+        s.ActiveRecommendations=s.Rendered?.Ending?.Verified==true?s.Choices:System.Array.Empty<KernelChoice>();
     }
     private long nextChoicePaint;
     private void RefreshChoice()
@@ -268,8 +278,13 @@ internal sealed partial class Advisor
         var messages=new List<string>();
         foreach(var s in WaitingChoices)
         {
-            if(searchEnabled && SearchCapacity.OpeningPercent<100 && !manuallyPaused && s.Probe==null && s.Root!=null && s.Move!=null)s.StartProbe(Memory,SeedDirectory,evaluation);
-            s.Probe?.Pump();
+            bool wantProbe=searchEnabled && SearchCapacity.OpeningPercent<100 && !manuallyPaused;
+            if(wantProbe && s.Probe==null && s.Root!=null && s.Move!=null)
+            {
+                s.Before=s.Battle?.Current(SlCache.Witness(s.Root));
+                s.StartProbe(Memory,SeedDirectory,evaluation);
+            }
+            s.Probe?.SetPaused(!wantProbe);
             var answer=s.Probe?.Latest;
             var menuSide=sharedOpening?this:liveAdvisor!;
             var offers=s.Probe?.Options??System.Array.Empty<PotionRoute<InteractiveSearch.Line>>();
@@ -309,6 +324,7 @@ internal sealed partial class Advisor
                     old,kept.Steps.Length,answer.Route.Rounds,kept.Rounds)<0))
                 answer=new(HandChoiceProbe.FirstChoices(kept),kept);
             var choices=answer?.Route?.Ending?.Verified==true?answer.Choices:s.Rendered?.Ending?.Verified==true?s.Choices:System.Array.Empty<KernelChoice>();
+            s.ActiveRecommendations=choices;
             var players=CombatManager.Instance.DebugOnlyGetState()?.Players;
             string left=players?.FirstOrDefault(p=>p.NetId==s.Action.OwnerId)?.Character.Title.GetFormattedText()+" · ";
             if(choices.Length==0)continue;
@@ -317,13 +333,9 @@ internal sealed partial class Advisor
             var checkedOwners=new HashSet<ulong>();
             foreach(var c in choices)
             {
-                if(checkedOwners.Add(c.Owner) && c.Pile==MegaCrit.Sts2.Core.Entities.Cards.PileType.Hand && c.Owner==RunManager.Instance.NetService.NetId &&
-                    NPlayerHand.Instance is {IsInCardSelection:true} hand && players?.FirstOrDefault(p=>p.NetId==c.Owner)?.PlayerCombatState is {} pcs)
+                if(checkedOwners.Add(c.Owner) && !MatchesVisibleHand(c))
                 {
-                    var filter=AccessTools.Field(typeof(NPlayerHand),"_currentSelectionFilter").GetValue(hand) as System.Func<CardModel,bool>;
-                    var options=KernelChoice.MenuTokens(pcs.Hand.Cards.Where(card=>filter==null || filter(card)).ToArray());
-                    if((c.Options!=null && !c.Options.SequenceEqual(options)) || c.Cards.Any(pick=>CardPresentation.MenuIndex(c,pick,options)<0))
-                    {valid=false;s.Display=null;s.Rendered=null;continue;}
+                    valid=false;s.Display=null;s.Rendered=null;continue;
                 }
                 string verb=c.Effect switch {"Discard"=>"弃掉","Exhaust"=>"消耗","MoveToHand"=>"取回","Modify" when (s.Action as PlayCardAction)?.CardModelId.Entry=="TRANSFIGURE"=>"添加重放",_=>"选择"};
                 int seat=CombatManager.Instance.DebugOnlyGetState()?.Players.ToList().FindIndex(p=>p.NetId==c.Owner)??-1;
@@ -346,10 +358,14 @@ internal sealed partial class Advisor
     {
         if(!openChoices.Remove(action,out var s))return;
         action.BeforePausedForPlayerChoice-=OnChoiceWaiting;action.AfterFinished-=FinishChoice;action.BeforeCancelled-=FinishChoice;
-        foreach(var key in nativeChoices.Where(p=>ReferenceEquals(p.Value,s)).Select(p=>p.Key).ToArray())nativeChoices.Remove(key);
-        s.Probe?.Cancel();
+        // Cross-player potion choices can outlive the throwing player's action.
+        bool branched=s.Potion!=null && action.State==GameActionState.Finished;
+        foreach(var key in nativeChoices.Where(p=>ReferenceEquals(p.Value,s) && (!branched || p.Key.Owner==action.OwnerId))
+            .Select(p=>p.Key).ToArray())nativeChoices.Remove(key);
+        if(!nativeChoices.Values.Contains(s))s.Probe?.Cancel();
         nextChoicePaint=0;
-        if(!WaitingChoices.Any())SetPinned("");else RefreshChoice();
+        nextHud=0;share?.RefreshGraph();
+        if(!WaitingChoices.Any())SetPinned("");
     }
     private void OnNativeAction(GameAction action)
     {
@@ -377,7 +393,7 @@ internal sealed partial class Advisor
             if(sharedOpening || showLive || liveAdvisor?.running==true || manuallyPaused && SearchCapacity.OpeningPercent<100)liveAdvisor!.completedInputs.Add(observed);
             if(exchange!=null)
             {
-                int round=observed.Kind=="end"?readyEnds.GetValueOrDefault(observed.Seat):
+                int round=observed.Kind=="end"?endActionRounds.GetValueOrDefault(observed.Seat):
                     observed.Kind=="undo"?hudRoom?.RoundNumber??0:0;
                 tapeInputs.Add(new(observed.Seat,observed.Kind,observed.Id,observed.Slot,observed.Target,observed.Copy,round));
             }

@@ -54,7 +54,7 @@ internal sealed partial class Advisor
             guestPauseReason=pauseReason;
         }
         guestLocal=enabled;
-        if(!enabled){dependencyGraphs.Clear();share?.ChooseGraphs(RequestedGraphRounds());}
+        if(!enabled){dependencyGraphs.CancelPending();share?.ChooseGraphs(RequestedGraphRounds());}
         hudFrame=null;nextHud=nextCheck=0;requested=switchRequested=false;
         searchEnabled=enabled && resumeGuestSearch;
         manuallyPaused=!searchEnabled;
@@ -118,13 +118,7 @@ internal sealed partial class Advisor
         var moves=line.Steps.Select(action=>
         {
             var potion=action.Potion;
-            int? slot=null;
-            if(potion!=null && (origin==null?action.Player.Potions.Count(b=>b.Id==potion.Id):
-                origin.CapturedPotions(action.Player).Count(b=>b.Id==potion.Id))>1)
-            {
-                int index=origin==null?action.Player.GetPotionSlotIndex(potion):CapturedBelt.Slot(origin,potion);
-                if(index>=0)slot=index+1;
-            }
+            int? slot=potion==null?null:CapturedBelt.DisplaySlot(origin,potion);
             var target=action.Target;
             var transition=action.TurnStartChoices;
             return new HudMove(actors[action.Player.NetId],action.EndTurn?HudMoveKind.EndTurn:action.Card!=null?
@@ -144,11 +138,24 @@ internal sealed partial class Advisor
     {
         private object? position;
         private TerminalRecord? best;
+        private int? departedLoss;
         private long revision;
-        internal long Observe(object? scope,TerminalRecord? result)
+        internal bool Increased {get;private set;}
+        internal void Depart(int? loss)=>departedLoss??=loss;
+        internal void Reset()
+        {
+            position=null;best=null;departedLoss=null;
+        }
+        internal long Observe(object? scope,TerminalRecord? result,int? wholeLoss=null)
         {
             if(!ReferenceEquals(scope,position)){position=scope;best=null;}
             if(scope==null || result is not {Verified:true} || ReferenceEquals(best,result))return revision;
+            if(departedLoss is int before && wholeLoss is int after)
+            {
+                departedLoss=null;
+                if(after!=before){Increased=after>before;revision++;}
+                best=result;return revision;
+            }
             if(best==null){best=result;return revision;}
             if(AnytimeSearch.Compare(result,best)<=0)return revision;
             // Even two defeats can be ordered by enemy HP or by turns survived.
@@ -156,7 +163,7 @@ internal sealed partial class Advisor
             if(result.IrreversibleLoss<best.IrreversibleLoss || result.OutstandingStolenResource<best.OutstandingStolenResource ||
                 AnytimeSearch.HealthValue(result)>AnytimeSearch.HealthValue(best) ||
                 result.Victory && best.Victory && result.ResourcesConsumed<best.ResourcesConsumed)
-                revision++;
+            {Increased=false;revision++;}
             best=result;return revision;
         }
     }
@@ -234,13 +241,14 @@ internal sealed partial class Advisor
         bool waiting=searchEnabled && !exhausted && side.running && Memory.Waiting();
         bool sameLoss=sameRoot && best is {Ending:{Victory:true,Verified:true} displayed} &&
             snapshot!.Result?.Ending is {Victory:true} evaluated && AnytimeSearch.Compare(displayed,evaluated)==0;
+        bool supportedLoss=sameLoss && plan is {Risks.Length:0};
         return new(work,pv,current && side.CurrentWorkerError==null && !exhausted && !waiting?side.meter.Rate(now,side.running):0,
             room.RoundNumber,plan?.End,party,
             best?.Ending is {} end?(end.Victory?"胜":"败"):side.pendingCheckVisible?"核对中":"",
             plan==null?null:System.Text.RegularExpressions.Regex.Match(plan.Result,@"发现时(?:搜索|模拟|计算) ([0-9.]+[kMB]?) 次").Groups[1].Value,
             side.Follow && side.CurrentWorkerError==null && !sharedOpening && searchEnabled && SearchCapacity.OpeningPercent<100 &&
             (!current || side.engine?.Latest?.Generation!=side.generation),Exhausted:exhausted,
-            MinimumLossProven:sameLoss && snapshot!.MinimumLossProven,ZeroLossProven:HasZeroLossWin(ending,plan),
+            MinimumLossProven:supportedLoss && snapshot!.MinimumLossProven,ZeroLossProven:HasZeroLossWin(ending,plan),
             ProofPercent:sameLoss?snapshot!.ProofPercent:null,MemoryWaiting:waiting,ProofDone:sameLoss?snapshot!.ProofDone:0,ProofTotal:sameLoss?snapshot!.ProofTotal:0,ProofBlocked:sameLoss && snapshot!.ProofBlocked,ProofCoverage:sameLoss?snapshot!.ProofCoverage:null);
     }
 
@@ -249,7 +257,7 @@ internal sealed partial class Advisor
     internal static bool HasZeroLossWin(TerminalRecord? ending,HudPlan? plan)
     {
         if(ending is not {Verified:true,Victory:true} ||
-            plan is not {Goal:null,Party.Length:>0,Rounds:{Length:>0} rounds})return false;
+            plan is not {Goal:null,Risks.Length:0,Party.Length:>0,Rounds:{Length:>0} rounds})return false;
         int expected=plan.Start;
         foreach(var round in rounds)
         {
@@ -272,11 +280,12 @@ internal sealed partial class Advisor
         ()=>OpenRoute(),ToggleResults,SetGuestLocal,RestartSearch,SelectPotion,TogglePlayback,nativeWindow,SetBroadcast,round=>SelectGraphRound(round,nativeWindow!=null),RefreshHistory);
     private HudFrame WithReadyEnds(HudFrame frame)
     {
-        int round=Math.Max(frame.ReadyRound,readyEnds.Values.DefaultIfEmpty(0).Max());
-        var ready=readyEnds.Where(pair=>pair.Value==round).Select(pair=>pair.Key);
-        if(frame.ReadyRound==round && frame.ReadyEnds is {} sharedReady)ready=ready.Concat(sharedReady);
-        var players=ready.Distinct().OrderBy(id=>id).ToArray();
-        return frame with {ReadyRound=round,ReadyEnds=players.Length>0?players:null};
+        if(hudRoom is not {} room)return frame;
+        // The native queue can reopen a turn without a separate Undo action.
+        // An older shared frame must not overwrite the locally resolved flag.
+        var players=room.Players.Where(CombatManager.Instance.IsPlayerReadyToEndTurn)
+            .Select(player=>player.NetId).OrderBy(id=>id).ToArray();
+        return frame with {ReadyRound=room.RoundNumber,ReadyEnds=players.Length>0?players:null};
     }
 
     private bool TickHud()
@@ -304,10 +313,10 @@ internal sealed partial class Advisor
         {
             if(!ReferenceEquals(net,hudNet) && (guestLocal || net?.Type==NetGameType.Client))
                 SetGuestLocal(false);
-            ResetNativeChoices();dependencyGraphs.Clear();readyEnds.Clear();beforeReady.Clear();presentedRoute=null;
+            ResetNativeChoices();dependencyGraphs.Clear();endActionRounds.Clear();beforeReady.Clear();presentedRoute=null;
             openingHistory.Clear();ClearLiveHistory();guestOpeningHistory.Clear();guestLiveHistory.Clear();remoteHistoryRevision=-1;remoteDiverged=false;
             StopPlayback();ClearCaptureWarnings();tickError=null;archiveError=null;liveAdvisor!.archiveError=null;
-            openingChanges.Observe(null,null);liveChanges.Observe(null,null);
+            openingChanges.Reset();liveChanges.Reset();
             openingPotion.Manual=livePotion.Manual=null;hudRoom=room;hudNet=net;hudFrame=null;pauseReason=null;nextHud=0;hud?.Hide();
             window?.Panel.ResetLiveDisplay();
             string battle=room==null?"":$"{room.RunState.Rng.StringSeed}/{room.RunState.TotalFloor}/{room.Encounter?.Id.Entry}/{string.Join(",",room.Players.Select(p=>p.NetId))}";
@@ -345,7 +354,10 @@ internal sealed partial class Advisor
                 else livePlan??=liveSide.transitionPlan;
                 object? liveScope=sharedOpening?root:liveAdvisor!.root;
                 opening=opening with {LossRevision=openingChanges.Observe(root,openingEnd)};
-                realtime=realtime with {LossRevision=liveChanges.Observe(choice??liveScope,choice==null?liveEnd:choice.Rendered?.Ending)};
+                int? liveLoss=choice==null && realtime.Party.Length>0 && realtime.Party.All(seat=>seat.ToEnd.HasValue)?
+                    realtime.Party.Sum(seat=>seat.ToEnd!.Value):null;
+                realtime=realtime with {LossRevision=liveChanges.Observe(choice??liveScope,
+                    choice==null?liveEnd:choice.Rendered?.Ending,liveLoss),LossIncreased=liveChanges.Increased};
                 string state=a.waitingForStable?"等待实战结算":a.running?"搜索中":a.savedResult!=null?"已保留路线":"等待搜索";
                 if(a.Follow && a.liveMessage.Length!=0)state+=" · "+a.liveMessage;
                 var selected=showLive?realtime:opening;
@@ -372,7 +384,7 @@ internal sealed partial class Advisor
                     if(!sharedOpening && other!=null)hudFrame=AddWarnings(hudFrame,new[]{(ReferenceEquals(a,this)?"实战搜索出错：":"开局搜索出错：")+other});
                 }
                 hudFrame=AddWarnings(hudFrame,captureWarnings,tickError,playbackNotice);
-                var raw=hudFrame;
+                var raw=resultsHidden?hudFrame:hudFrame with {PotionMenu=PotionMenu(room)};
                 bool liveGraphSettled=liveSide.rootRound==room.RoundNumber && !liveSide.waitingForStable &&
                     liveSide.completedInputs.Count==0 && !liveSide.pendingCheckVisible;
                 if(root!=null && ReferenceEquals(board,room))
@@ -399,6 +411,12 @@ internal sealed partial class Advisor
                         frame=frame with {Realtime=liveRow,Plan=live?display:frame.Plan,State=live?"正在评估当前选牌":frame.State};
                     }
                     frame=PotionView(frame,live,first,second,local,pending);
+                    if(live && pending?.Root is {} choiceRoot && frame.Plan is {} menuPlan)
+                    {
+                        var line=ReferenceEquals(menuPlan,pending.Display)?pending.Rendered:
+                            pending.PotionRows.FirstOrDefault(option=>ReferenceEquals(option.Value.Result.Hud,menuPlan))?.Value.Line;
+                        if(line is {Ending.Verified:true})dependencyGraphs.Track(menuPlan,choiceRoot,line);
+                    }
                     bool diverged=liveSide.routeDiverged && livePlan==null && pending==null;
                     if(diverged && frame.Realtime is {} departed)
                         frame=frame with {Plan=live?null:frame.Plan,Realtime=departed.WithoutRoute()};
@@ -411,18 +429,20 @@ internal sealed partial class Advisor
                             settled:!live || pending!=null || liveGraphSettled);
                         bool restoring=archivedRoute is {} cached && ReferenceEquals(frame.Plan,cached.Saved.Hud);
                         bool updating=waiting || restoring && graph==null;
-                        string? error=graph==null && !updating && frame.Plan is {} selectedPlan && selectedPlan.Party.Length>1
+                        var failure=graph==null && !updating && frame.Plan is {} selectedPlan && selectedPlan.Party.Length>1
                             ?dependencyGraphs.Failure(selectedPlan,round):null;
-                        graphs[slot]=new(round,graph,updating,error);
+                        graphs[slot]=new(round,graph,updating,failure?.Reason,failure?.OriginalOrderVerified==true);
                         if(live && liveGraphSettled && pending==null && round==room.RoundNumber &&
                             graph!=null && frame.Plan is {} publishedPlan)
                             liveSide.RememberDisplayedRound(publishedPlan,graph);
-                        if(error!=null)frame=AddWarnings(frame,new[]{$"第{round}回合分列图生成失败：{error}"});
+                        if(failure!=null)frame=AddWarnings(frame,new[]{failure.OriginalOrderVerified
+                            ?$"第{round}回合仅支持原顺序：{failure.Reason}"
+                            :$"第{round}回合分列图生成失败：{failure.Reason}"});
                     }
                     for(int slot=rounds.Length;slot<2;slot++)dependencyGraphs.Cancel(viewer,slot);
                     var trace=history && !frame.Hidden?(live?liveHistory:openingHistory).Snapshot(SearchCapacity.MemoryLimitMb):null;
                     return WithReadyEnds(frame with {Graphs=graphs,History=trace,RouteDiverged=diverged,LiveHistoryRevision=liveHistoryRevision,
-                        Executed=live && pending==null?PresentedSteps(frame.Plan):null,LiveSettling=!diverged && !liveGraphSettled});
+                        Executed=live?PresentedSteps(frame.Plan):null,LiveSettling=!diverged && !liveGraphSettled});
                 }
                 hudFrame=ForViewer(net.NetId,showLive,openingPotion,livePotion,true,RequestedGraphRounds(),WantsHistory);
                 // Verify the live turn for recognizing equivalent input even in list mode.
@@ -430,7 +450,11 @@ internal sealed partial class Advisor
                     dependencyGraphs.Request(LiveGraphWorker,showLive?hudFrame.Plan:livePlan,room.RoundNumber,out _,
                         settled:liveGraphSettled);
                 if(net is NetHostGameService server)share?.Host(server,hudFrame,now,(viewer,h)=>
-                    ForViewer(viewer,showLive,new(){Manual=h.Opening},new(){Manual=h.Live},false,h.GraphRounds,h.History),broadcastRoutes);
+                    ForViewer(viewer,showLive,new(){Manual=openingPotion.Manual},new(){Manual=livePotion.Manual},
+                        false,h.GraphRounds,h.History),broadcastRoutes,viewer=>{
+                            dependencyGraphs.Cancel(viewer);
+                            dependencyGraphs.Cancel(viewer,1);
+                        });
             }
             else
             {

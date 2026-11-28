@@ -74,7 +74,12 @@ internal sealed partial class Advisor
 
     private void RejectLiveRoute()
     {
-        if(transitionPlan!=null)(owner??this).ClearLiveHistory();
+        if(transitionPlan is {} prior)
+        {
+            var controller=owner??this;
+            if(prior.Outcome is "胜" or "败")controller.liveChanges.Depart(prior.TeamLoss);
+            controller.ClearLiveHistory();
+        }
         routeDiverged|=transitionPlan!=null;
         transitionPlan=null;pendingCheckVisible=false;shownLine=pendingSuffix=null;orderedMove=null;savedResult=null;
         liveMessage="实战偏离原路线";
@@ -217,7 +222,8 @@ internal sealed partial class Advisor
             shownLine=pendingSuffix=chosen;savedResult=null;pendingCheckVisible=true;
             liveMessage="正在核对选牌后的余线";return;
         }
-        if(previousRoot!=null && PrepareOrderedMove(fresh,previousRoot,earlierPlan,activeOrder))return;
+        if(previousRoot!=null && (TryReadyBeforeVictory(fresh,previousRoot,earlierPlan) ||
+            PrepareOrderedMove(fresh,previousRoot,earlierPlan,activeOrder)))return;
         int used=0;
         if(shownLine!=null && activeOrder==null)
             for(int i=0;i<shownLine.Trail.Length && i+1<shownLine.Steps.Length;i++)
@@ -283,6 +289,58 @@ internal sealed partial class Advisor
         RejectLiveRoute();
     }
 
+    private bool TryReadyBeforeVictory(KernelSession fresh,KernelSession previous,HudPlan? plan)
+    {
+        if(shownLine is not {} line || !completedInputs.Any(input=>input.Kind=="end"))return false;
+        RouteGraphBook.VerifiedRound? round=null;
+        if(plan!=null && (owner??this).dependencyGraphs.TryGet(plan,previous,line,previous.TurnNumber,out var found) &&
+            found is {Entry:{Graph:{Verified:true},Round:{Start:0}}})round=found;
+        if(ReadyBeforeVictoryContinuation(line,previous,fresh,completedInputs,round) is not {} tail)return false;
+        ClearRecommendations();
+        shownLine=pendingSuffix=tail;savedResult=null;pendingCheckVisible=true;
+        lastTrim=liveMessage="提前结束回合 · 正在复核余线";
+        return true;
+    }
+
+    internal static InteractiveSearch.Line? ReadyBeforeVictoryContinuation(InteractiveSearch.Line line,
+        KernelSession previous,KernelSession now,IReadOnlyList<Played> inputs,RouteGraphBook.VerifiedRound? round=null)
+    {
+        if(line.Ending is not {Verified:true,Victory:true} || line.EndTurn!=previous.TurnNumber ||
+            now.TurnNumber!=previous.TurnNumber || line.Steps.Any(StartsTurn))return null;
+        var remaining=Enumerable.Range(0,line.Steps.Length).ToList();
+        var voluntaryReady=new HashSet<ulong>();
+        var played=new List<KernelTeamSearch.Action>();
+        var recipes=new List<TreeStep?>();
+        var copies=new List<InteractiveSearch.PlayedCopy?>();
+        foreach(var input in inputs)
+        {
+            int seatStep=remaining.FindIndex(i=>line.Steps[i].Player.NetId==input.Seat);
+            if(input.Kind=="end" && seatStep<0)
+            {
+                var player=previous.Party.FirstOrDefault(p=>p.NetId==input.Seat);
+                if(player==null || previous.IsReady(player) || !now.IsReady(player) ||
+                    !voluntaryReady.Add(input.Seat))return null;
+                played.Add(new(player,null,null,EndTurn:true));recipes.Add(null);copies.Add(null);
+                continue;
+            }
+            int next=round==null?0:seatStep;
+            if(next<0 || next>=remaining.Count)return null;
+            int step=remaining[next];
+            if(!input.Matches(line.Steps[step],previous) ||
+                round?.Entry.Graph.Dependencies.Any(edge=>edge.After==step && remaining.Contains(edge.Before))==true)
+                return null;
+            played.Add(line.Steps[step]);recipes.Add(line.Recipes.ElementAtOrDefault(step));
+            copies.Add(input.Kind=="card"?new(input.Physical,input.Copy):null);
+            remaining.RemoveAt(next);
+        }
+        if(voluntaryReady.Count==0 || remaining.Count==0)return null;
+        return line with {Steps=remaining.Select(i=>line.Steps[i]).ToArray(),
+            Recipes=remaining.Select(i=>line.Recipes.ElementAtOrDefault(i)).ToArray(),
+            OrderProof=new(previous,played.ToArray(),recipes.ToArray(),copies.ToArray()),
+            Trail=Array.Empty<KernelPlanningState>(),Kills=null,Rounds=null,FirstHp=null,
+            BridgeAfter=0,JoinProof=null,RequireJoin=false,RequireSameEnding=played.Count==voluntaryReady.Count};
+    }
+
     private bool TryEarlyEnd(KernelSession fresh,KernelSession previous)
     {
         if(shownLine==null || completedInputs.Count!=1 || completedInputs[0].Kind!="end" ||
@@ -341,6 +399,7 @@ internal sealed partial class Advisor
         if(battleKey==null)return;
         var weights=evaluation.Weights;
         localRoutes=LocalRouteSlots.ClearRoutes(LocalRouteSlots.FilePath,routeRole,battleKey,runKey,weights);
+        archiveError=null;
         lastWrittenWeights=weights;clearSavedRoutesOnWrite=false;
     }
 
@@ -352,7 +411,7 @@ internal sealed partial class Advisor
         StopPlayback();CancelArchivedRoute();beforeReady.Clear();dependencyGraphs.Clear();
         presentedRoute=null;
         openingHistory.Clear();ClearLiveHistory();
-        openingChanges.Observe(null,null);liveChanges.Observe(null,null);
+        openingChanges.Reset();liveChanges.Reset();
         openingPotion.Manual=livePotion.Manual=null;playbackCandidate=null;
         hud?.ResetLiveDisplay();window?.Panel.ResetLiveDisplay();
         reuseSavedSearch=false;localRoutes=null;
@@ -380,6 +439,7 @@ internal sealed partial class Advisor
             slot.Display=null;slot.Incumbent=null;slot.LastOptions=null;
             slot.PotionRows=Array.Empty<PotionRoute<DisplayedPotion>>();
             slot.Choices=Array.Empty<KernelChoice>();
+            slot.ActiveRecommendations=Array.Empty<KernelChoice>();
         }
         retainedOpening=null;var battle=exchange;var budget=Memory;
         InteractiveSearch.Dispatcher.Split(false);

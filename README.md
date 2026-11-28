@@ -61,15 +61,11 @@
 当前支持的游戏版本：**0.111.x / 0.114.x**
 
 1. 从 [Releases](https://github.com/SiyeW/sts2-coop-solver/releases/latest) 下载最新版本的 CoopSolver。
-2. 下载前置 Mod [RitsuLib 0.6.16](https://github.com/BAKAOLC/STS2-RitsuLib/releases/download/v0.6.16/STS2-RitsuLib.0.6.16.variant-pack.zip)。
-3. 在 Steam 库中右键点击《杀戮尖塔 2》，选择［管理］→［浏览本地文件］，打开游戏安装目录。
-4. 将两个 Mod 分别解压至游戏安装目录下的 `mods/` 文件夹中。
-5. 启动游戏，在模组列表中启用 CoopSolver 和 RitsuLib。
+2. 在 Steam 库中右键点击《杀戮尖塔 2》，选择［管理］→［浏览本地文件］，打开游戏安装目录。
+3. 将 CoopSolver 解压至游戏安装目录下的 `mods/` 文件夹中。
+4. 启动游戏，在模组列表中启用 CoopSolver。
 
-安装完成后，请确认以下文件位于对应目录中：
-
-- `mods/CoopSolver/CoopSolver.json`
-- `mods/STS2-RitsuLib/mod_manifest.json`
+安装完成后，模组清单位于 `mods/CoopSolver/CoopSolver.json`。
 
 ### 使用方法
 
@@ -163,15 +159,11 @@ Given the enormous number of possible action combinations, the solver may not al
 Currently supported game versions: **0.111.x / 0.114.x**
 
 1. Download the latest version of CoopSolver from [Releases](https://github.com/SiyeW/sts2-coop-solver/releases/latest).
-2. Download the required dependency, [RitsuLib 0.6.16](https://github.com/BAKAOLC/STS2-RitsuLib/releases/download/v0.6.16/STS2-RitsuLib.0.6.16.variant-pack.zip).
-3. Right-click Slay the Spire 2 in your Steam library and select **Manage → Browse local files** to open the game installation directory.
-4. Extract both mods into the `mods/` directory inside the game installation folder.
-5. Launch the game and enable both CoopSolver and RitsuLib in the mod list.
+2. Right-click Slay the Spire 2 in your Steam library and select **Manage → Browse local files** to open the game installation directory.
+3. Extract CoopSolver into the `mods/` directory inside the game installation folder.
+4. Launch the game and enable CoopSolver in the mod list.
 
-After installation, make sure the following files are in their respective locations:
-
-- `mods/CoopSolver/CoopSolver.json`
-- `mods/STS2-RitsuLib/mod_manifest.json`
+After installation, the mod manifest should be at `mods/CoopSolver/CoopSolver.json`.
 
 ### Usage
 

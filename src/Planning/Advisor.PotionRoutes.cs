@@ -118,7 +118,7 @@ internal sealed partial class Advisor
             bool comparable=picked.Cost.Goal!=null?row.Exhausted:reference is {Victory:true,Verified:true} &&
                 AnytimeSearch.Compare(entry.Result.Ending!,reference)==0;
             row=row with {Outcome=hud.Outcome,Party=party,End=hud.End,Pv=same?row.Pv:entry.Line?.Steps.Length>0 && source.root!=null && choice==null?source.meter.BranchVisits(source.root,entry.Line.Steps[0]):null,Discovered=entry.Line is {FoundAt:>=0}?Compact(entry.Line.FoundAt):same?row.Discovered:null,
-                MinimumLossProven=comparable && row.MinimumLossProven,ZeroLossProven=HasZeroLossWin(entry.Result.Ending,hud),
+                MinimumLossProven=comparable && hud is {Risks.Length:0} && row.MinimumLossProven,ZeroLossProven=HasZeroLossWin(entry.Result.Ending,hud),
                 ProofCoverage=comparable?row.ProofCoverage:null,
                 ProofPercent=comparable?row.ProofPercent:null,ProofBlocked=comparable && row.ProofBlocked,
                 Options=rows.Select(r=>r.Cost with {SeatLoss=r.Value.Result.Hud!.Party.Select(s=>(s.ToEnd??0)+(suffix?PastLoss(s.Id):0)).ToArray()}).ToArray(),PotionKey=selection.Manual?.Key,Goal=picked.Cost.Goal};
@@ -126,13 +126,13 @@ internal sealed partial class Advisor
         }
         Apply(false,this,first,ref opening);Apply(true,liveSource,second,ref realtime);
         if(sharedOpening && choice==null && opening!=null && realtime!=null && first.Manual?.Key==second.Manual?.Key)
-            realtime=opening with {LossRevision=realtime.LossRevision};
+            realtime=opening with {LossRevision=realtime.LossRevision,LossIncreased=realtime.LossIncreased};
         var visible=live?realtime:opening;
         return frame with {Opening=opening,Realtime=realtime,Live=live,Plan=plan,Pv=visible?.Pv,Visits=visible?.Visits??frame.Visits,Rate=visible?.Rate??frame.Rate};
     }
     private void SelectPotion(bool live,PotionCost? cost)
     {
-        if(FollowingHost){share?.Choose(live,cost);nextHud=0;return;}
+        if(FollowingHost)return;
         if(live && playback!=null)StopPlayback();
         (live?livePotion:openingPotion).Manual=cost;
         if(showLive!=live){showLive=live;switchRequested=true;}
